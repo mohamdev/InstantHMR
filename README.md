@@ -1,5 +1,7 @@
 # InstantHMR
 
+![InstantHMR demo](models/instanthmr.gif)
+
 A lightweight, ONNX-exportable distillation of
 [`facebook/sam-3d-body-dinov3`](https://huggingface.co/facebook/sam-3d-body-dinov3)
 for **3D human pose estimation and mesh recovery**: a RepViT-M1.5 backbone + a 9-token

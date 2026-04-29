@@ -1,4 +1,24 @@
+---
+license: other
+license_name: sam-license
+license_link: https://github.com/facebookresearch/sam-3d-body/blob/main/LICENSE
+library_name: onnx
+pipeline_tag: keypoint-detection
+tags:
+  - human-pose-estimation
+  - human-mesh-recovery
+  - 3d-pose-estimation
+  - onnx
+  - distillation
+  - sam3d
+  - repvit
+  - cliff
+base_model: facebook/sam-3d-body-dinov3
+---
+
 # InstantHMR — model weights
+
+![InstantHMR demo](instanthmr.gif)
 
 A lightweight, ONNX-exportable distillation of
 [`facebook/sam-3d-body-dinov3`](https://huggingface.co/facebook/sam-3d-body-dinov3)
@@ -8,7 +28,7 @@ Trained to mimic the SAM3D teacher's per-person 70-keypoint outputs from
 a single 224×224 crop.
 
 Demo, training, and inference code live at the main InstantHMR
-repository.
+repository: <https://github.com/mohamdev/InstantHMR>.
 
 ## Files
 

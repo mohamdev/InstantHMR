@@ -21,6 +21,7 @@ rf-detr*.pth
 *.pth.lock
 *.onnx
 *.pth
+*.mp4
 
 # Rerun recordings
 *.rrd

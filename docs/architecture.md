@@ -75,7 +75,7 @@ The DINOv3-based teacher is excellent but heavy: its tokenizer + decoder runs
 at <20 FPS on a desktop GPU and doesn't fit comfortably on edge hardware.
 Distillation gives us InstantHMR — a model that:
 
-- runs at ~150 FPS on a single RTX 4070,
+- runs at ~200 FPS on a single RTX 4070, 
 - exports to ONNX / TFLite / QNN, and
 - preserves the SAM3D 70-keypoint & MHR outputs, so any downstream code that
   consumed `pred_keypoints_3d` keeps working.
