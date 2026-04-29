@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# RF-DETR auto-downloaded weights
+rf-detr*.pth
+*.pth.lock
+*.onnx
+*.pth
+
+# Rerun recordings
+*.rrd
+
+# Annotation outputs
+data/
+annotations/
+images/
+
+# Model weights — too large for git, use Git LFS or release artifacts
+models/*.onnx
+models/*.pt
+models/*.pth
+!models/README.md
+
+# Notebook checkpoints
+.ipynb_checkpoints/

@@ -1,0 +1,24 @@
+# ----- inference + viz (required by demo.py) -----
+numpy>=1.24
+opencv-python>=4.8
+pillow>=10
+onnxruntime-gpu>=1.19 ; platform_system != "Darwin"
+onnxruntime>=1.19    ; platform_system == "Darwin"
+rfdetr>=1.0
+rerun-sdk>=0.21
+
+# ----- CUDA runtime libs for onnxruntime-gpu -----
+# onnxruntime-gpu wheels are built against CUDA 12 + cuDNN 9 but do NOT
+# bundle them.  These pip packages provide the .so files so you don't need
+# a system CUDA install.  Instaharm calls onnxruntime.preload_dlls() at
+# session creation, which finds them automatically (ORT >= 1.19).
+nvidia-cudnn-cu12>=9.0,<10 ; platform_system != "Darwin"
+nvidia-cuda-runtime-cu12   ; platform_system != "Darwin"
+nvidia-cublas-cu12         ; platform_system != "Darwin"
+
+# ----- training / annotation (optional, for reproduction) -----
+# torch>=2.2
+# timm>=1.0
+# tqdm
+# loguru
+# (For annotation: install Meta's sam-3d-body separately — see docs/annotation.md)
