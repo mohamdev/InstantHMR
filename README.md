@@ -16,8 +16,22 @@ you always know where the latency is going.
 - **Outputs:** `mhr_params (204)`, `shape_params (45)`, `cam_trans (3)`,
   `joints_2d (70, 2)` (normalised crop coords),
   `joints_3d (70, 3)` (body-centred metres, Y-down).
-- **Speed:** ~5 ms / frame (~200 FPS) on a single RTX 4070 with the fp16
-  ONNX (CUDA EP); CPU works too (~25 FPS, depending on hardware).
+- **Speed (InstantHMR ONNX alone):** ~5 ms / frame (~200 FPS) on a single
+  RTX 4070 with the fp16 ONNX (CUDA EP); CPU works too (~25 FPS, depending
+  on hardware). On Apple Silicon, pass `--device coreml` to use
+  `CoreMLExecutionProvider`.
+- **Speed (full demo, end-to-end):** the demo also runs **RF-DETR** for
+  person detection on every frame, and on most hardware the detector —
+  not InstantHMR — is the bottleneck. Expect roughly 30–60 FPS on a
+  recent NVIDIA GPU with `--detector-variant medium`, and notably less
+  on CPU / Apple Silicon. If you're CPU-bound or on a Mac, use
+  `--detector-variant nano` for a large speed-up at a small accuracy
+  cost.
+- **Note for RTX 50-series (Blackwell, sm_120):** the CUDA wheels pinned
+  in `requirements.txt` (CUDA 12 / cuDNN 9) and a stock Torch install
+  may not ship sm_120 kernels and will fall back to slower paths,
+  particularly for RF-DETR. Install Torch built for CUDA 12.8+ and a
+  matching `onnxruntime-gpu` to get the expected throughput.
 
 > **Note on the body mesh.** InstantHMR does **not** run the MHR mesh
 > decoder — rendering the full body mesh is expensive and we want the

@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--device", type=str, default="cuda",
-        help="Inference device for InstantHMR: 'cuda' or 'cpu' (default: cuda).",
+        help="Inference device for InstantHMR: 'cuda', 'coreml', or 'cpu' (default: cuda).",
     )
     p.add_argument(
         "--detector-variant", type=str, default="medium",

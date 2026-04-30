@@ -250,6 +250,14 @@ class InstantHMR:
     def _default_providers(device: str) -> list[str]:
         """Pick ORT execution providers based on the requested *device*.
 
+        Recognised values:
+            ``"cuda"``    → ``CUDAExecutionProvider`` (NVIDIA).
+            ``"coreml"``  → ``CoreMLExecutionProvider`` (Apple Silicon / macOS).
+            ``"cpu"`` / anything else → CPU only.
+
+        ``CPUExecutionProvider`` is always appended as a fallback so a
+        partially-supported model still loads.
+
         TensorRT is intentionally **not** requested by default: the wheel
         distinction between ``onnxruntime-gpu`` and the ``tensorrt`` system
         libraries is fiddly, and asking for an EP whose runtime libraries
@@ -260,8 +268,10 @@ class InstantHMR:
 
         available = set(ort.get_available_providers())
         wanted: list[str] = []
-        if "cuda" in device.lower():
-            if "CUDAExecutionProvider" in available:
-                wanted.append("CUDAExecutionProvider")
+        device_l = device.lower()
+        if "cuda" in device_l and "CUDAExecutionProvider" in available:
+            wanted.append("CUDAExecutionProvider")
+        elif "coreml" in device_l and "CoreMLExecutionProvider" in available:
+            wanted.append("CoreMLExecutionProvider")
         wanted.append("CPUExecutionProvider")
         return wanted
