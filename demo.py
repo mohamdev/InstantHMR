@@ -75,6 +75,16 @@ def parse_args() -> argparse.Namespace:
         help="Process every Nth video frame (default: 1).",
     )
     p.add_argument(
+        "--detector-stride", type=int, default=1,
+        help="Run RF-DETR every Nth processed frame; reuse the previous bbox in "
+             "between (default: 1). The detector is the dominant cost — stride "
+             "2-3 typically doubles end-to-end FPS with negligible quality loss.",
+    )
+    p.add_argument(
+        "--no-batch-persons", action="store_true",
+        help="Disable batched multi-person HMR (one ONNX call per person).",
+    )
+    p.add_argument(
         "--save-rrd", type=str, default=None,
         help="Optional path to save the Rerun recording as a .rrd file.",
     )
@@ -102,6 +112,8 @@ def build_pipeline(args: argparse.Namespace) -> PosePipeline:
         detector_variant=args.detector_variant,
         det_confidence=args.det_confidence,
         max_persons=args.max_persons,
+        detector_stride=args.detector_stride,
+        batch_persons=not args.no_batch_persons,
     )
 
 

@@ -103,7 +103,15 @@ class InstantHMR:
         if providers is None:
             providers = self._default_providers(device)
 
-        self.session = ort.InferenceSession(str(onnx_path), providers=providers)
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # 0 == let ORT pick. We don't override threading on CUDA (compute
+        # is on-device); on CPU/CoreML, ORT's defaults are saner than ours.
+
+        self.session = ort.InferenceSession(
+            str(onnx_path), sess_options=sess_options, providers=providers,
+        )
         self.active_provider = self.session.get_providers()[0]
 
         in_names = [i.name for i in self.session.get_inputs()]
@@ -183,6 +191,82 @@ class InstantHMR:
             mhr_params=mhr_params,
             shape_params=shape_params,
         )
+
+    def predict_batch(
+        self,
+        image_rgb: np.ndarray,
+        detections: list[dict],
+    ) -> list[HMRPrediction]:
+        """Run InstantHMR on multiple persons in a single ONNX call.
+
+        Args:
+            image_rgb: (H, W, 3) uint8 RGB full-frame image.
+            detections: list of ``{"bbox": [x1,y1,x2,y2], "confidence": f}``.
+
+        Returns:
+            One ``HMRPrediction`` per input detection, in the same order.
+        """
+        if not detections:
+            return []
+
+        image_rgb = np.ascontiguousarray(image_rgb)
+        h, w = image_rgb.shape[:2]
+        n = len(detections)
+
+        crops = np.empty((n, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
+        cliffs = np.empty((n, 3), dtype=np.float32)
+        sq_meta = []  # per-person (sq_x1, sq_y1, sq_size, bbox)
+        for i, det in enumerate(detections):
+            bbox_arr = np.asarray(det["bbox"], dtype=np.float32).reshape(4)
+            crop, sq_x1, sq_y1, sq_size, cliff = self._preprocess(
+                image_rgb, bbox_arr, h, w,
+            )
+            crops[i] = crop
+            cliffs[i] = cliff
+            sq_meta.append((sq_x1, sq_y1, sq_size, bbox_arr))
+
+        outs = self.session.run(
+            None,
+            {self._in_image: crops, self._in_cliff: cliffs},
+        )
+        mhr_params_b = outs[0].astype(np.float32, copy=False)
+        shape_params_b = outs[1].astype(np.float32, copy=False)
+        cam_trans_b = outs[2].astype(np.float32, copy=False)
+        joints_2d_norm_b = outs[3].astype(np.float32, copy=False)
+        joints_3d_local_b = outs[4].astype(np.float32, copy=False)
+
+        f = math.sqrt(h * h + w * w)
+        focal_length = np.array([f, f], dtype=np.float32)
+        principal_point = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+
+        results: list[HMRPrediction] = []
+        for i, det in enumerate(detections):
+            sq_x1, sq_y1, sq_size, bbox_arr = sq_meta[i]
+            joints_2d_norm = joints_2d_norm_b[i]
+            joints_3d_local = joints_3d_local_b[i]
+            cam_trans = cam_trans_b[i]
+
+            crop_px = (joints_2d_norm + 1.0) * 0.5 * INPUT_SIZE
+            scale = sq_size / INPUT_SIZE
+            joints_2d = np.stack(
+                [crop_px[:, 0] * scale + sq_x1, crop_px[:, 1] * scale + sq_y1],
+                axis=-1,
+            ).astype(np.float32)
+
+            results.append(HMRPrediction(
+                bbox=bbox_arr,
+                confidence=float(det.get("confidence", 1.0)),
+                joints_3d_local=joints_3d_local,
+                joints_3d_cam=joints_3d_local + cam_trans,
+                joints_2d=joints_2d,
+                cam_trans=cam_trans,
+                focal_length=focal_length,
+                principal_point=principal_point,
+                image_shape=(h, w),
+                mhr_params=mhr_params_b[i],
+                shape_params=shape_params_b[i],
+            ))
+        return results
 
     # ------------------------------------------------------------------
     # Preprocessing

@@ -20,18 +20,15 @@ you always know where the latency is going.
   RTX 4070 with the fp16 ONNX (CUDA EP); CPU works too (~25 FPS, depending
   on hardware). On Apple Silicon, pass `--device coreml` to use
   `CoreMLExecutionProvider`.
-- **Speed (full demo, end-to-end):** the demo also runs **RF-DETR** for
-  person detection on every frame, and on most hardware the detector —
-  not InstantHMR — is the bottleneck. Expect roughly 30–60 FPS on a
-  recent NVIDIA GPU with `--detector-variant medium`, and notably less
-  on CPU / Apple Silicon. If you're CPU-bound or on a Mac, use
-  `--detector-variant nano` for a large speed-up at a small accuracy
-  cost.
-- **Note for RTX 50-series (Blackwell, sm_120):** the CUDA wheels pinned
-  in `requirements.txt` (CUDA 12 / cuDNN 9) and a stock Torch install
-  may not ship sm_120 kernels and will fall back to slower paths,
-  particularly for RF-DETR. Install Torch built for CUDA 12.8+ and a
-  matching `onnxruntime-gpu` to get the expected throughput.
+- **Speed (full demo, end-to-end):** the demo also runs **RF-DETR** every
+  frame, and on most hardware the detector — not InstantHMR — is the
+  bottleneck. Use `--detector-stride N` to run RF-DETR only every Nth
+  frame and reuse the previous bbox in between (see *Performance tuning*
+  below).
+- **Note for RTX 50-series (Blackwell, sm_120):** stock Torch with
+  CUDA 12.4 wheels does not ship sm_120 kernels and falls back to slow
+  paths. Use `python install.py` which automatically pulls Torch
+  cu128 (>=2.7) on Blackwell GPUs.
 
 > **Note on the body mesh.** InstantHMR does **not** run the MHR mesh
 > decoder — rendering the full body mesh is expensive and we want the
@@ -50,8 +47,18 @@ cd instanthmr
 conda create -n instanthmr python=3.11 -y
 conda activate instanthmr
 
-pip install -r requirements.txt
+# Picks the right torch + onnxruntime wheels for your machine:
+#   - Linux + NVIDIA GPU → cu128 (Blackwell, RTX 50-series) or cu124 (Ada/Ampere/Hopper)
+#                          + onnxruntime-gpu + bundled CUDA / cuDNN runtime libs
+#   - macOS              → stock torch + onnxruntime (CoreML EP included)
+#   - Linux without GPU  → CPU torch + onnxruntime
+python install.py
 ```
+
+`python install.py --dry-run` prints the pip commands without running
+them. `python install.py --force-cpu` skips GPU detection on Linux. If
+you'd rather manage wheels yourself, `pip install -r requirements.txt`
+still works — it gets the CPU torch + onnxruntime path.
 
 The first run downloads the RF-DETR (medium) checkpoint into the rfdetr
 cache directory automatically. The InstantHMR ONNX weights are released
@@ -76,6 +83,38 @@ variant, confidence, max persons, frame skip, `.rrd` recording, …).
 The demo opens a Rerun viewer with the source image + 2D skeleton, a live
 detector / HMR / total-latency plot, and the 3D scene with the predicted
 camera frustum.
+
+## Performance tuning
+
+On every machine we've measured, RF-DETR (the detector) costs ~5–10× more
+per frame than InstantHMR. The two flags below target that bottleneck.
+
+| Flag | Effect |
+| --- | --- |
+| `--detector-stride N` | Run RF-DETR every Nth frame; reuse the previous bbox (slightly expanded) on the in-between frames. Stride 2–3 is the single biggest knob — typically 2–3× end-to-end FPS for slow movement, with negligible quality loss. |
+| `--detector-variant nano` | Use the smallest RF-DETR; biggest win on CPU / Apple Silicon where the detector is doing all the work. |
+| `--device coreml` | On macOS, route the InstantHMR ONNX through `CoreMLExecutionProvider`. |
+| `--no-batch-persons` | Disable batched multi-person HMR (one ONNX call per person). The default is batched. |
+
+Measured on RTX 4070 + torch 2.5 cu121 + ORT 1.25 (1080p video, 1 person, 150 frames after warm-up):
+
+| `--detector-stride` | RF-DETR ms | HMR ms | total ms | FPS |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 27.1 | 5.3 | 32.4 | **30.9** |
+| 2 | 13.3 | 5.3 | 18.6 | **53.8** |
+| 3 |  8.7 | 5.5 | 14.2 | **70.4** |
+| 4 |  6.6 | 5.3 | 11.9 | **83.9** |
+
+CPU path on the same box (Linux + ORT CPU EP): 7.9 FPS at stride 1 →
+13.3 FPS with `--detector-variant nano --detector-stride 3`. Apple
+Silicon and RTX 5070 numbers are not measured by us — please report
+back.
+
+You can re-run the benchmark on your own hardware with:
+
+```bash
+python tools/bench.py --video vid1.mp4 --max-frames 150 --detector-stride 3
+```
 
 ## Use it from Python
 

@@ -24,10 +24,12 @@ class FrameResult:
 
     Attributes:
         persons: Per-person ``HMRPrediction``s (possibly empty).
-        detector_ms: Wall-clock time for the detector forward pass.
+        detector_ms: Wall-clock time for the detector forward pass (0 on
+            frames where the detector was skipped via ``detector_stride``).
         hmr_ms: Wall-clock time for InstantHMR across all persons in the
-            frame (sum, not average).
-        total_ms: ``detector_ms + hmr_ms`` plus any pipeline overhead.
+            frame (sum, not average — or one batched call when
+            ``batch_persons=True``).
+        total_ms: ``detector_ms + hmr_ms`` plus pipeline overhead.
     """
 
     persons: list[HMRPrediction]
@@ -36,21 +38,41 @@ class FrameResult:
     total_ms: float
 
 
+def _expand_bbox(bbox: np.ndarray, w: int, h: int, expand: float) -> np.ndarray:
+    bw = bbox[2] - bbox[0]
+    bh = bbox[3] - bbox[1]
+    return np.array([
+        max(0.0, bbox[0] - bw * expand),
+        max(0.0, bbox[1] - bh * expand),
+        min(float(w), bbox[2] + bw * expand),
+        min(float(h), bbox[3] + bh * expand),
+    ], dtype=np.float32)
+
+
 class PosePipeline:
     """Full RF-DETR → InstantHMR pipeline.
 
     Args:
         onnx_path: Path to ``instanthmr.onnx``.
-        device: ``"cuda"`` or ``"cpu"`` for InstantHMR (RF-DETR auto-selects).
+        device: ``"cuda"``, ``"coreml"`` or ``"cpu"`` for InstantHMR.
         detector_variant: ``"nano" | "small" | "medium" | "base" | "large"``.
         det_confidence: RF-DETR confidence threshold.
         max_persons: Maximum number of persons returned per frame.
+        detector_stride: Run the detector every ``N`` frames; on the
+            in-between frames, reuse the previous frame's detections
+            (slightly expanded) to drive InstantHMR. ``1`` reproduces the
+            original "detect every frame" behaviour. The detector is by
+            far the dominant cost on most hardware, so stride 2–3 is the
+            single biggest knob for end-to-end FPS.
+        batch_persons: When ``True`` (default), all detected persons in a
+            frame are batched into a single InstantHMR ONNX call instead
+            of looping. This is a meaningful win for multi-person frames
+            and free for single-person frames.
 
     Example
     -------
-        pipeline = PosePipeline("models/instanthmr.onnx")
+        pipeline = PosePipeline("models/instanthmr.onnx", detector_stride=2)
         result = pipeline.predict(image_rgb)
-        print(f"det {result.detector_ms:.1f} ms / hmr {result.hmr_ms:.1f} ms")
         for p in result.persons:
             print(p.joints_3d_cam.shape)   # (70, 3)
     """
@@ -62,54 +84,72 @@ class PosePipeline:
         detector_variant: str = "medium",
         det_confidence: float = 0.5,
         max_persons: int = 5,
+        detector_stride: int = 1,
+        batch_persons: bool = True,
     ):
+        if detector_stride < 1:
+            raise ValueError("detector_stride must be >= 1")
+
         self.hmr = InstantHMR(onnx_path, device=device)
         self.detector = RFDETRDetector(
             variant=detector_variant,
             confidence=det_confidence,
             max_persons=max_persons,
         )
+
+        self._detector_stride = detector_stride
+        self._batch_persons = batch_persons
+        self._frame_idx = 0
+        self._last_detections: list[dict] = []
         self._last_bbox: Optional[np.ndarray] = None
 
     def predict(self, image_rgb: np.ndarray) -> FrameResult:
-        """Detect all persons in *image_rgb* and run InstantHMR on each.
-
-        Returns a :class:`FrameResult` with per-stage timings so callers
-        can display detector vs HMR cost separately.
-        """
+        """Detect all persons in *image_rgb* and run InstantHMR on each."""
         t_total_start = time.perf_counter()
+        h, w = image_rgb.shape[:2]
 
-        # ---- Detector ----
-        t0 = time.perf_counter()
-        detections = self.detector.detect(image_rgb)
-        detector_ms = (time.perf_counter() - t0) * 1000.0
+        # ---- Detector (with optional stride) ----
+        run_detector = (self._frame_idx % self._detector_stride) == 0
+        if run_detector:
+            t0 = time.perf_counter()
+            detections = self.detector.detect(image_rgb)
+            detector_ms = (time.perf_counter() - t0) * 1000.0
+            if detections:
+                self._last_detections = detections
+        else:
+            detections = []
+            detector_ms = 0.0
 
-        # Single-frame fallback: reuse the last bbox if the detector drops
-        # a frame.  Useful for live camera mode where a transient miss is
-        # common.
-        if not detections and self._last_bbox is not None:
-            h, w = image_rgb.shape[:2]
-            lb = self._last_bbox
-            bw, bh = lb[2] - lb[0], lb[3] - lb[1]
-            expand = 0.1
-            fb = np.array([
-                max(0, lb[0] - bw * expand),
-                max(0, lb[1] - bh * expand),
-                min(w, lb[2] + bw * expand),
-                min(h, lb[3] + bh * expand),
-            ], dtype=np.float32)
+        # If the detector skipped or missed this frame, reuse the previous
+        # detections (slightly expanded to absorb small motion). This is a
+        # cheap form of tracking that keeps HMR fed with a plausible bbox.
+        if not detections and self._last_detections:
+            detections = [
+                {
+                    "bbox": _expand_bbox(d["bbox"], w, h, expand=0.1),
+                    "confidence": float(d["confidence"]) * 0.9,
+                }
+                for d in self._last_detections
+            ]
+        elif not detections and self._last_bbox is not None:
+            # Backwards-compatible single-bbox fallback (used when no prior
+            # multi-person detections exist).
+            fb = _expand_bbox(self._last_bbox, w, h, expand=0.1)
             detections = [{"bbox": fb, "confidence": 0.0}]
 
-        # ---- InstantHMR (sum across all persons) ----
+        # ---- InstantHMR ----
         outputs: list[HMRPrediction] = []
         t1 = time.perf_counter()
-        for det in detections:
-            out = self.hmr.predict(
-                image_rgb,
-                bbox=det["bbox"],
-                confidence=det["confidence"],
-            )
-            outputs.append(out)
+        if detections:
+            if self._batch_persons and len(detections) > 1:
+                outputs = self.hmr.predict_batch(image_rgb, detections)
+            else:
+                for det in detections:
+                    outputs.append(self.hmr.predict(
+                        image_rgb,
+                        bbox=det["bbox"],
+                        confidence=det["confidence"],
+                    ))
         hmr_ms = (time.perf_counter() - t1) * 1000.0
 
         if outputs:
@@ -117,6 +157,7 @@ class PosePipeline:
             self._last_bbox = best.bbox.copy()
 
         total_ms = (time.perf_counter() - t_total_start) * 1000.0
+        self._frame_idx += 1
 
         return FrameResult(
             persons=outputs,
