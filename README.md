@@ -105,11 +105,6 @@ Measured on RTX 4070 + torch 2.5 cu121 + ORT 1.25 (1080p video, 1 person, 150 fr
 | 3 |  8.7 | 5.5 | 14.2 | **70.4** |
 | 4 |  6.6 | 5.3 | 11.9 | **83.9** |
 
-CPU path on the same box (Linux + ORT CPU EP): 7.9 FPS at stride 1 →
-13.3 FPS with `--detector-variant nano --detector-stride 3`. Apple
-Silicon and RTX 5070 numbers are not measured by us — please report
-back.
-
 You can re-run the benchmark on your own hardware with:
 
 ```bash
