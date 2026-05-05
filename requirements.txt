@@ -16,9 +16,12 @@ rerun-sdk>=0.21
 torch>=2.2
 torchvision
 
-# Mac ships CoreML EP inside plain onnxruntime; Linux GPU wants
-# onnxruntime-gpu (which install.py picks). The CPU wheel below is the
-# safe fallback.
+# Mac ships CoreML EP inside plain onnxruntime; Linux + NVIDIA needs
+# onnxruntime-gpu (see install.py). Do **not** install ``onnxruntime`` and
+# ``onnxruntime-gpu`` in the same env — they overwrite each other's files
+# and you can end up with a broken import or CPU-only providers. If that
+# happens: ``pip uninstall -y onnxruntime onnxruntime-gpu`` then reinstall
+# one of them (``onnxruntime-gpu`` for GPU).
 onnxruntime>=1.19
 
 # ----- MHR body mesh rendering -----
