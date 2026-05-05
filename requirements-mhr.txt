@@ -1,0 +1,43 @@
+# MHR body mesh rendering — install TOGETHER with requirements.txt
+#
+# IMPORTANT: always install both files in a single pip call so the resolver
+# can pick a torch version compatible with rfdetr, torchvision, AND
+# pymomentum-gpu at once.  Installing them separately causes pip to first
+# choose a torch version for rfdetr and then downgrade it for pymomentum,
+# leaving torchvision broken.
+#
+#   pip install -r requirements.txt -r requirements-mhr.txt
+#
+# Prerequisites
+# -------------
+#  * Python >= 3.12  (pymomentum has no Python 3.11 wheels; recreate the
+#    conda env if needed: conda create -n instanthmr python=3.12 -y)
+#  * CUDA toolkit on the system path (recommended for real-time use)
+#
+# After installing, also download the MHR body-model assets:
+#
+#   curl -OL https://github.com/facebookresearch/MHR/releases/download/v1.0.0/assets.zip
+#   unzip assets.zip -d models/mhr_assets
+#
+# Then run:
+#
+#   python demo.py --image photo.jpg --mhr-assets models/mhr_assets
+
+# pymomentum — Meta's momentum geometry library (C++ Python bindings).
+# This package brings its own torch constraint; do NOT add a separate
+# torch>=X line here or pip will resolve torch twice and downgrade it.
+#
+# WARNING: "pip install pymomentum" installs an UNRELATED legacy SMS library
+# (pyMomentum v0.1.x by MomentumAS).  The correct package names are below.
+#
+# Platform markers handle the selection automatically:
+#   Linux / Windows  →  pymomentum-gpu  (NVIDIA GPU)
+#   macOS            →  pymomentum-cpu  (Apple Silicon / Intel)
+pymomentum-gpu ; platform_system != "Darwin"
+pymomentum-cpu ; platform_system == "Darwin"
+#
+# CPU-only Linux / Windows: comment out pymomentum-gpu above and uncomment:
+# pymomentum-cpu ; platform_system != "Darwin"
+
+# MHR body model (Meta's Momentum Human Rig)
+mhr @ git+https://github.com/facebookresearch/MHR.git

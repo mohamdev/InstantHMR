@@ -2,12 +2,15 @@
 
 Logs, per frame:
   - ``camera/image``        : annotated RGB frame (2D skeleton + bbox + a
-                              text panel showing detector / HMR / total ms).
+                              text panel showing detector / HMR / render / total ms).
   - ``camera``              : pinhole intrinsics so the image becomes a
                               proper frustum in the 3D scene.
   - ``world/persons/...``   : 3D joints + skeleton lines per person.
+  - ``world/persons/.../mesh``: full MHR body mesh when an MHRRenderer is
+                              provided (vertices from a true MHR forward pass).
   - ``timing/detector_ms``  : scalar plot of RF-DETR latency.
   - ``timing/hmr_ms``       : scalar plot of InstantHMR latency.
+  - ``timing/render_ms``    : scalar plot of MHR mesh rendering latency.
   - ``timing/total_ms``     : scalar plot of full pipeline latency.
   - ``timing/fps``          : scalar plot of effective frames-per-second.
 
@@ -17,13 +20,17 @@ on construction (pass ``spawn_viewer=False`` to suppress).
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import time
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import cv2
 import numpy as np
 
 from .inference import HMRPrediction
 from .skeleton import edges_for
+
+if TYPE_CHECKING:
+    from .mhr_renderer import MHRRenderer
 
 
 class RerunVisualizer:
@@ -32,10 +39,12 @@ class RerunVisualizer:
         application_id: str = "instanthmr_demo",
         spawn_viewer: bool = True,
         save_path: str | None = None,
+        mhr_renderer: "MHRRenderer | None" = None,
     ):
         import rerun as rr
 
         self._rr = rr
+        self._mhr_renderer = mhr_renderer
         rr.init(application_id, spawn=spawn_viewer)
 
         # SAM3D / MHR convention: right-handed, Y-down camera frame.
@@ -60,7 +69,7 @@ class RerunVisualizer:
         detector_ms: Optional[float] = None,
         hmr_ms: Optional[float] = None,
         total_ms: Optional[float] = None,
-    ) -> None:
+    ) -> float:
         """Log one frame of the pipeline to Rerun.
 
         Args:
@@ -72,6 +81,10 @@ class RerunVisualizer:
             hmr_ms: InstantHMR latency for this frame, summed across
                 persons (ms).
             total_ms: full pipeline latency for this frame (ms).
+
+        Returns:
+            render_ms: time spent running MHR forward passes + Rerun mesh
+                logging for this frame (0.0 when no MHRRenderer is set).
         """
         rr = self._rr
         rr.set_time("frame", sequence=frame_idx)
@@ -98,16 +111,27 @@ class RerunVisualizer:
 
         # Always log the image — even when no person was detected — so the
         # viewer keeps showing the camera feed and the timing HUD.
+        render_ms = 0.0
         if not persons:
-            blank = self._draw_overlay(image_rgb, [], detector_ms, hmr_ms, total_ms)
+            blank = self._draw_overlay(image_rgb, [], detector_ms, hmr_ms, render_ms, total_ms)
             rr.log("camera/image", rr.Image(blank))
-            return
+            rr.log("timing/render_ms", rr.Scalars(0.0))
+            return render_ms
+
+        # --- MHR mesh rendering (timed) ----------------------------------
+        if self._mhr_renderer is not None:
+            t0 = time.perf_counter()
+            for idx, person in enumerate(persons):
+                self._log_person_mesh(idx, person)
+            render_ms = (time.perf_counter() - t0) * 1000.0
+
+        rr.log("timing/render_ms", rr.Scalars(render_ms))
 
         for idx, person in enumerate(persons):
             self._log_person(idx, person)
 
         annotated = self._draw_overlay(
-            image_rgb, persons, detector_ms, hmr_ms, total_ms,
+            image_rgb, persons, detector_ms, hmr_ms, render_ms, total_ms,
         )
         rr.log("camera/image", rr.Image(annotated))
 
@@ -134,6 +158,8 @@ class RerunVisualizer:
             self._send_blueprint(first)
             self._blueprint_sent = True
 
+        return render_ms
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -159,12 +185,39 @@ class RerunVisualizer:
                 rr.LineStrips3D(lines, colors=[255, 230, 0], radii=0.004),
             )
 
+    def _log_person_mesh(self, idx: int, person: HMRPrediction) -> None:
+        """Run MHR forward pass and log the resulting mesh vertices via Rerun."""
+        assert self._mhr_renderer is not None
+
+        # Decode mhr_params + shape_params → body-space vertices.
+        verts_local = self._mhr_renderer.forward(
+            person.mhr_params, person.shape_params,
+        )  # (V, 3), body-centred
+
+        # Shift from body space to camera space using InstantHMR's cam_trans.
+        verts_cam = verts_local + person.cam_trans  # (V, 3) broadcast
+
+        faces = self._mhr_renderer.faces  # (F, 3) int32, shared across frames
+
+        n = len(verts_cam)
+        skin = np.tile(np.array([[200, 160, 130, 140]], dtype=np.uint8), (n, 1))
+
+        self._rr.log(
+            f"world/persons/person_{idx}/mesh",
+            self._rr.Mesh3D(
+                vertex_positions=verts_cam,
+                triangle_indices=faces,
+                vertex_colors=skin,
+            ),
+        )
+
     @staticmethod
     def _draw_overlay(
         image_rgb: np.ndarray,
         persons: Sequence[HMRPrediction],
         detector_ms: Optional[float],
         hmr_ms: Optional[float],
+        render_ms: float,
         total_ms: Optional[float],
     ) -> np.ndarray:
         """Draw per-person bbox + 2D skeleton + a timing HUD onto the frame."""
@@ -201,12 +254,14 @@ class RerunVisualizer:
         # ---- Timing HUD (top-left, semi-transparent black panel) ----
         lines: list[str] = []
         if detector_ms is not None:
-            lines.append(f"RF-DETR : {detector_ms:6.1f} ms")
+            lines.append(f"RF-DETR   : {detector_ms:6.1f} ms")
         if hmr_ms is not None:
             lines.append(f"InstantHMR: {hmr_ms:6.1f} ms")
+        if render_ms > 0.0:
+            lines.append(f"MHR mesh  : {render_ms:6.1f} ms")
         if total_ms is not None:
             fps = 1000.0 / total_ms if total_ms > 0 else 0.0
-            lines.append(f"Total   : {total_ms:6.1f} ms ({fps:5.1f} fps)")
+            lines.append(f"Total     : {total_ms:6.1f} ms ({fps:5.1f} fps)")
         if lines:
             font = cv2.FONT_HERSHEY_SIMPLEX
             scale = max(0.5, min(w, h) / 1500.0)

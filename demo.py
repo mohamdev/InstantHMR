@@ -4,13 +4,25 @@
 Detects persons in a video / image / live camera stream with RF-DETR, runs
 InstantHMR on each, and visualises the results in Rerun: 3D joints, camera
 pose as a pinhole frustum, the source image with the projected 2D skeleton
-drawn on top, and a live latency plot showing RF-DETR vs InstantHMR cost
-separately.
+drawn on top, and live latency plots for RF-DETR, InstantHMR, MHR mesh
+rendering, and total pipeline cost.
+
+Optionally renders a full MHR body mesh per person by decoding the
+``mhr_params`` and ``shape_params`` outputs through Meta's MHR model:
+
+    python demo.py --image photo.jpg \\
+        --mhr-assets models/mhr_assets
+
+See ``instanthmr/mhr_renderer.py`` for setup instructions (assets download,
+MHR package installation).
 
 Usage
 -----
-    # Single image
+    # Single image (skeleton only)
     python demo.py --image path/to/photo.jpg
+
+    # Single image with MHR mesh
+    python demo.py --image path/to/photo.jpg --mhr-assets models/mhr_assets
 
     # Video file
     python demo.py --video path/to/clip.mp4
@@ -92,6 +104,22 @@ def parse_args() -> argparse.Namespace:
         "--no-spawn", action="store_true",
         help="Don't spawn the Rerun viewer GUI (useful when only saving .rrd).",
     )
+    p.add_argument(
+        "--mhr-assets", type=str, default=None, metavar="DIR",
+        help=(
+            "Path to the unpacked MHR assets folder. When provided, runs a "
+            "full MHR forward pass per person and renders the body mesh in "
+            "the 3D scene. See instanthmr/mhr_renderer.py for setup."
+        ),
+    )
+    p.add_argument(
+        "--mhr-lod", type=int, default=3, metavar="N",
+        choices=range(7),
+        help=(
+            "MHR level-of-detail (0=73 639 verts … 6=595 verts). "
+            "Default: 3 (4 899 verts)."
+        ),
+    )
 
     return p.parse_args()
 
@@ -117,11 +145,51 @@ def build_pipeline(args: argparse.Namespace) -> PosePipeline:
     )
 
 
-def build_visualizer(args: argparse.Namespace) -> RerunVisualizer:
+def build_mhr_renderer(args: argparse.Namespace):
+    if args.mhr_assets is None:
+        return None
+
+    assets_path = Path(args.mhr_assets)
+    if not assets_path.exists():
+        sys.stderr.write(
+            f"\n[error] MHR assets folder not found: {assets_path}\n"
+            "        See instanthmr/mhr_renderer.py for download instructions.\n\n"
+        )
+        sys.exit(1)
+
+    try:
+        from instanthmr.mhr_renderer import MHRRenderer
+    except ImportError as e:
+        sys.stderr.write(
+            f"\n[error] Cannot import MHRRenderer: {e}\n"
+            "\n"
+            "  MHR mesh rendering requires Python >= 3.12 and:\n"
+            "    pip install -r requirements-mhr.txt\n"
+            "\n"
+            "  If you see 'No module named pymomentum', make sure you installed\n"
+            "  the CORRECT package (NOT the legacy pyMomentum SMS library):\n"
+            "    pip uninstall pymomentum           # remove wrong package\n"
+            "    pip install pymomentum-gpu          # NVIDIA GPU\n"
+            "    pip install pymomentum-cpu          # macOS / CPU-only\n"
+            "\n"
+            "  See README.md §'MHR body mesh' for full setup instructions.\n\n"
+        )
+        sys.exit(1)
+
+    print(f"Loading MHR body model (LOD {args.mhr_lod}) from {assets_path} …")
+    return MHRRenderer(
+        assets_folder=assets_path,
+        device=args.device,
+        lod=args.mhr_lod,
+    )
+
+
+def build_visualizer(args: argparse.Namespace, mhr_renderer=None) -> RerunVisualizer:
     return RerunVisualizer(
         application_id="instanthmr_demo",
         spawn_viewer=not args.no_spawn,
         save_path=args.save_rrd,
+        mhr_renderer=mhr_renderer,
     )
 
 
@@ -129,15 +197,18 @@ def _print_timings(
     prefix: str,
     detector_ms: float,
     hmr_ms: float,
+    render_ms: float,
     total_ms: float,
     n_persons: int,
 ) -> None:
     fps = 1000.0 / total_ms if total_ms > 0 else 0.0
+    render_part = f"  MHR={render_ms:6.1f} ms" if render_ms > 0.0 else ""
     print(
         f"{prefix} "
         f"persons={n_persons:>2d}  "
         f"RF-DETR={detector_ms:6.1f} ms  "
-        f"InstantHMR={hmr_ms:6.1f} ms  "
+        f"InstantHMR={hmr_ms:6.1f} ms"
+        f"{render_part}  "
         f"total={total_ms:6.1f} ms ({fps:5.1f} fps)"
     )
 
@@ -158,21 +229,26 @@ def run_image(args: argparse.Namespace) -> None:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     pipeline = build_pipeline(args)
-    viz = build_visualizer(args)
+    mhr = build_mhr_renderer(args)
+    viz = build_visualizer(args, mhr)
 
     # Warm-up: first call includes lazy CUDA / ORT initialisation, so a real
     # latency reading is much more useful from the second call onwards.
     _ = pipeline.predict(rgb)
     result = pipeline.predict(rgb)
 
-    viz.log_frame(
+    render_ms = viz.log_frame(
         rgb, result.persons,
         frame_idx=0, timestamp=0.0,
         detector_ms=result.detector_ms,
         hmr_ms=result.hmr_ms,
         total_ms=result.total_ms,
     )
-    _print_timings("image:", result.detector_ms, result.hmr_ms, result.total_ms, len(result.persons))
+    _print_timings(
+        "image:",
+        result.detector_ms, result.hmr_ms, render_ms, result.total_ms,
+        len(result.persons),
+    )
 
 
 def run_video(args: argparse.Namespace) -> None:
@@ -189,12 +265,14 @@ def run_video(args: argparse.Namespace) -> None:
     print(f"video: {video_path.name}, {total} frames @ {fps:.1f} fps")
 
     pipeline = build_pipeline(args)
-    viz = build_visualizer(args)
+    mhr = build_mhr_renderer(args)
+    viz = build_visualizer(args, mhr)
 
     frame_idx = 0
     sent = 0
     det_times: list[float] = []
     hmr_times: list[float] = []
+    render_times: list[float] = []
     tot_times: list[float] = []
     try:
         while True:
@@ -213,7 +291,7 @@ def run_video(args: argparse.Namespace) -> None:
             hmr_times.append(result.hmr_ms)
             tot_times.append(result.total_ms)
 
-            viz.log_frame(
+            render_ms = viz.log_frame(
                 rgb, result.persons,
                 frame_idx=frame_idx,
                 timestamp=frame_idx / fps,
@@ -221,6 +299,7 @@ def run_video(args: argparse.Namespace) -> None:
                 hmr_ms=result.hmr_ms,
                 total_ms=result.total_ms,
             )
+            render_times.append(render_ms)
 
             sent += 1
             frame_idx += 1
@@ -230,6 +309,7 @@ def run_video(args: argparse.Namespace) -> None:
                     f"  frame {frame_idx:>5d}/{total:<5d}",
                     float(np.mean(det_times[-30:])),
                     float(np.mean(hmr_times[-30:])),
+                    float(np.mean(render_times[-30:])),
                     float(np.mean(tot_times[-30:])),
                     len(result.persons),
                 )
@@ -241,11 +321,14 @@ def run_video(args: argparse.Namespace) -> None:
     if tot_times:
         # Skip the first frame from the average — it bears the warm-up cost.
         warm = slice(1, None) if len(tot_times) > 1 else slice(None)
+        render_avg = float(np.mean(render_times[warm])) if render_times else 0.0
+        render_part = f"  MHR={render_avg:.1f} ms" if render_avg > 0 else ""
         print(
             "\nsummary "
             f"frames={sent:d}  "
             f"RF-DETR={float(np.mean(det_times[warm])):.1f} ms  "
-            f"InstantHMR={float(np.mean(hmr_times[warm])):.1f} ms  "
+            f"InstantHMR={float(np.mean(hmr_times[warm])):.1f} ms"
+            f"{render_part}  "
             f"total={float(np.mean(tot_times[warm])):.1f} ms "
             f"({1000.0 / float(np.mean(tot_times[warm])):.1f} fps)"
         )
@@ -262,11 +345,13 @@ def run_camera(args: argparse.Namespace) -> None:
     print(f"camera {args.camera}: {width}x{height} @ {fps:.1f} fps — Ctrl+C to stop")
 
     pipeline = build_pipeline(args)
-    viz = build_visualizer(args)
+    mhr = build_mhr_renderer(args)
+    viz = build_visualizer(args, mhr)
 
     frame_idx = 0
     det_times: list[float] = []
     hmr_times: list[float] = []
+    render_times: list[float] = []
     tot_times: list[float] = []
     try:
         while True:
@@ -281,7 +366,7 @@ def run_camera(args: argparse.Namespace) -> None:
             hmr_times.append(result.hmr_ms)
             tot_times.append(result.total_ms)
 
-            viz.log_frame(
+            render_ms = viz.log_frame(
                 rgb, result.persons,
                 frame_idx=frame_idx,
                 timestamp=frame_idx / fps,
@@ -289,12 +374,14 @@ def run_camera(args: argparse.Namespace) -> None:
                 hmr_ms=result.hmr_ms,
                 total_ms=result.total_ms,
             )
+            render_times.append(render_ms)
 
             if frame_idx and frame_idx % 30 == 0:
                 _print_timings(
                     f"  frame {frame_idx:>5d}",
                     float(np.mean(det_times[-30:])),
                     float(np.mean(hmr_times[-30:])),
+                    float(np.mean(render_times[-30:])),
                     float(np.mean(tot_times[-30:])),
                     len(result.persons),
                 )

@@ -43,14 +43,12 @@ class HMRPrediction:
         focal_length: (2,) [fx, fy] full-frame virtual focal = sqrt(H^2+W^2).
         principal_point: (2,) [cx, cy] = full-frame centre.
         image_shape: (H, W) of the source frame.
-        mhr_params: (204,) raw MHR pose+scale parameters. InstantHMR does
-            not run the MHR mesh decoder itself (it is resource-heavy and
-            kept out of the default pipeline); these params are exposed so
-            you can feed them into Meta's MHR TorchScript module from the
-            original SAM 3D Body release if you want a body mesh —
-            https://github.com/facebookresearch/sam-3d-body.
-        shape_params: (45,) MHR identity shape blendshapes. Same use as
-            ``mhr_params`` — pair them and run them through MHR.
+        mhr_params: (204,) MHR pose parameters (34 joints × 6-D rotation).
+            Pass to ``instanthmr.mhr_renderer.MHRRenderer.forward()``
+            together with ``shape_params`` to obtain a full body mesh.
+        shape_params: (45,) MHR identity blend-shape coefficients
+            (20 body + 20 head + 5 hand). Pair with ``mhr_params`` and
+            feed both into ``MHRRenderer.forward()``.
     """
 
     bbox: np.ndarray

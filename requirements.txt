@@ -21,6 +21,10 @@ torchvision
 # safe fallback.
 onnxruntime>=1.19
 
+# ----- MHR body mesh rendering -----
+# Optional.  Requires Python >= 3.12 and a separate setup step.
+# See requirements-mhr.txt and the "MHR body mesh" section of README.md.
+
 # ----- training / annotation (optional, for reproduction) -----
 # timm>=1.0
 # tqdm
