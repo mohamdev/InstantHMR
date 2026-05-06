@@ -14,7 +14,7 @@ from typing import Optional
 
 import numpy as np
 
-from .detector import RFDETRDetector
+from .detector import RFDetrONNXDetector, RFDETRDetector
 from .inference import InstantHMR, HMRPrediction
 
 
@@ -56,6 +56,10 @@ class PosePipeline:
         onnx_path: Path to ``instanthmr.onnx``.
         device: ``"cuda"``, ``"coreml"`` or ``"cpu"`` for InstantHMR.
         detector_variant: ``"nano" | "small" | "medium" | "base" | "large"``.
+            Ignored when *detector_onnx* is set.
+        detector_onnx: Optional path to an RF-DETR **detection** ONNX model
+            (``pred_boxes`` / ``pred_logits`` outputs). When set, runs the
+            detector in ONNXRuntime instead of PyTorch ``rfdetr``.
         det_confidence: RF-DETR confidence threshold.
         max_persons: Maximum number of persons returned per frame.
         detector_stride: Run the detector every ``N`` frames; on the
@@ -86,22 +90,58 @@ class PosePipeline:
         max_persons: int = 5,
         detector_stride: int = 1,
         batch_persons: bool = True,
+        detector_onnx: str | Path | None = None,
     ):
         if detector_stride < 1:
             raise ValueError("detector_stride must be >= 1")
 
         self.hmr = InstantHMR(onnx_path, device=device)
-        self.detector = RFDETRDetector(
-            variant=detector_variant,
-            confidence=det_confidence,
-            max_persons=max_persons,
-        )
+        if detector_onnx is not None:
+            self.detector = RFDetrONNXDetector(
+                onnx_path=detector_onnx,
+                device=device,
+                confidence=det_confidence,
+                max_persons=max_persons,
+            )
+        else:
+            self.detector = RFDETRDetector(
+                variant=detector_variant,
+                confidence=det_confidence,
+                max_persons=max_persons,
+            )
 
         self._detector_stride = detector_stride
         self._batch_persons = batch_persons
         self._frame_idx = 0
         self._last_detections: list[dict] = []
         self._last_bbox: Optional[np.ndarray] = None
+
+    def warmup(self, image_rgb: np.ndarray, *, runs: int = 2) -> None:
+        """Compile GPU / ONNXRuntime kernels before timed inference.
+
+        Runs the full detector + HMR path *runs* times (default 2). If no
+        person is detected, performs one extra InstantHMR forward with a
+        synthetic centre crop bbox so the HMR ONNX graph still executes —
+        otherwise cold-start cost would hit the first real detection frame.
+
+        Resets stride state (``_frame_idx`` and cached bboxes) afterwards so
+        video/camera timing aligns with frame 0.
+        """
+        image_rgb = np.ascontiguousarray(image_rgb)
+        last: FrameResult | None = None
+        for _ in range(max(1, runs)):
+            last = self.predict(image_rgb)
+        if last is None or not last.persons:
+            h, w = image_rgb.shape[:2]
+            fb = np.array(
+                [w * 0.25, h * 0.25, w * 0.75, h * 0.75],
+                dtype=np.float32,
+            )
+            self.hmr.predict(image_rgb, bbox=fb, confidence=1.0)
+
+        self._frame_idx = 0
+        self._last_detections = []
+        self._last_bbox = None
 
     def predict(self, image_rgb: np.ndarray) -> FrameResult:
         """Detect all persons in *image_rgb* and run InstantHMR on each."""

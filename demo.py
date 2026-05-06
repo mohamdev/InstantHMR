@@ -72,7 +72,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--detector-variant", type=str, default="medium",
         choices=["nano", "small", "medium", "base", "large"],
-        help="RF-DETR size variant (default: medium).",
+        help="RF-DETR size variant when using PyTorch rfdetr (default: medium). Ignored if --detector-onnx is set.",
+    )
+    p.add_argument(
+        "--detector-onnx", type=str, default=None, metavar="PATH",
+        help=(
+            "Run RF-DETR from this ONNX file via ONNXRuntime instead of PyTorch. "
+            "Must expose outputs pred_boxes and pred_logits (Roboflow RF-DETR export). "
+            "Example: models/rf-detr-medium.onnx"
+        ),
     )
     p.add_argument(
         "--det-confidence", type=float, default=0.5,
@@ -134,7 +142,16 @@ def build_pipeline(args: argparse.Namespace) -> PosePipeline:
         )
         sys.exit(1)
 
-    return PosePipeline(
+    det_onnx: Path | None = None
+    if args.detector_onnx:
+        det_onnx = Path(args.detector_onnx)
+        if not det_onnx.exists():
+            sys.stderr.write(
+                f"\n[error] RF-DETR ONNX not found: {det_onnx}\n\n"
+            )
+            sys.exit(1)
+
+    pipeline = PosePipeline(
         onnx_path=model_path,
         device=args.device,
         detector_variant=args.detector_variant,
@@ -142,7 +159,12 @@ def build_pipeline(args: argparse.Namespace) -> PosePipeline:
         max_persons=args.max_persons,
         detector_stride=args.detector_stride,
         batch_persons=not args.no_batch_persons,
+        detector_onnx=det_onnx,
     )
+    prov = getattr(pipeline.detector, "active_provider", None)
+    if prov is not None:
+        print(f"RF-DETR ONNX ({det_onnx.name}): {prov}")
+    return pipeline
 
 
 def build_mhr_renderer(args: argparse.Namespace):
@@ -232,9 +254,9 @@ def run_image(args: argparse.Namespace) -> None:
     mhr = build_mhr_renderer(args)
     viz = build_visualizer(args, mhr)
 
-    # Warm-up: first call includes lazy CUDA / ORT initialisation, so a real
-    # latency reading is much more useful from the second call onwards.
-    _ = pipeline.predict(rgb)
+    print("Warming up inference …", flush=True)
+    pipeline.warmup(rgb)
+
     result = pipeline.predict(rgb)
 
     render_ms = viz.log_frame(
@@ -267,6 +289,13 @@ def run_video(args: argparse.Namespace) -> None:
     pipeline = build_pipeline(args)
     mhr = build_mhr_renderer(args)
     viz = build_visualizer(args, mhr)
+
+    ret_warm, bgr_warm = cap.read()
+    if ret_warm:
+        rgb_warm = cv2.cvtColor(bgr_warm, cv2.COLOR_BGR2RGB)
+        print("Warming up inference …", flush=True)
+        pipeline.warmup(rgb_warm)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     frame_idx = 0
     sent = 0
@@ -347,6 +376,9 @@ def run_camera(args: argparse.Namespace) -> None:
     pipeline = build_pipeline(args)
     mhr = build_mhr_renderer(args)
     viz = build_visualizer(args, mhr)
+
+    print("Warming up inference …", flush=True)
+    pipeline.warmup(np.zeros((height, width, 3), dtype=np.uint8))
 
     frame_idx = 0
     det_times: list[float] = []

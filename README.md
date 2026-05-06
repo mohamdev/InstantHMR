@@ -88,6 +88,60 @@ The demo opens a Rerun viewer with the source image + 2D skeleton, a live
 RF-DETR / InstantHMR / total-latency plot, and the 3D scene with the
 predicted camera frustum.
 
+## Recent improvements (RF-DETR ONNX, GPU ORT, warm-up)
+
+These options sit on top of the default PyTorch RF-DETR + InstantHMR stack.
+
+### RF-DETR via ONNX (`--detector-onnx`)
+
+You can run the **person detector** through ONNXRuntime instead of PyTorch
+`rfdetr` — useful when you already have an RF-DETR detection export or want
+the detector on the same ORT path as InstantHMR:
+
+```bash
+python demo.py --video clip.mp4 --detector-onnx models/rf-detr-medium.onnx
+```
+
+Pre-exported RF-DETR ONNX checkpoints (nano through xxlarge, COCO/O365, segmentation variants) are available at **[PierreMarieCurie/rf-detr-onnx](https://huggingface.co/PierreMarieCurie/rf-detr-onnx/tree/main)** on Hugging Face — download the `.onnx` you want and pass its path to `--detector-onnx`.
+
+The ONNX graph must expose a **single** float32 image input (`NCHW`,
+ImageNet-normalised RGB at the export resolution, typically square **576×576**)
+and outputs named **`pred_boxes`** (cxcywh) and **`pred_logits`**, as in
+Roboflow’s RF-DETR ONNX export. **`--detector-variant` is ignored** when this
+flag is set.
+
+### ONNX Runtime on NVIDIA GPUs
+
+For InstantHMR and the optional RF-DETR ONNX detector to use the GPU, you need
+the **`onnxruntime-gpu`** wheel (Linux + NVIDIA: `python install.py` installs
+it together with the matching Torch CUDA stack). **Do not install** the plain
+CPU package **`onnxruntime`** in the same environment as **`onnxruntime-gpu`**
+— they overwrite shared files and you may end up on CPU-only providers or a
+broken install. If that happens: `pip uninstall -y onnxruntime onnxruntime-gpu`
+then reinstall **`onnxruntime-gpu`** (see also the comment above `onnxruntime`
+in `requirements.txt`).
+
+Verify GPU execution providers:
+
+```bash
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+You should see **`CUDAExecutionProvider`** when CUDA libraries are available.
+
+### Warm-up before inference (`PosePipeline.warmup`)
+
+The first ONNXRuntime **CUDA** run often pays a large one-off cost (kernel
+scheduling, allocator warm-up). **`PosePipeline.warmup(image_rgb, runs=2)`**
+runs the full detector + HMR path before timed frames, resets internal
+stride/caching state, and — if no person is detected on the warm-up frame —
+runs one extra InstantHMR forward with a **synthetic centre crop** so the HMR
+graph always executes once.
+
+The **`demo.py`** runner calls this automatically (you will see
+`Warming up inference …`); **`tools/bench.py`** warm-ups on the first video
+frame and rewinds the capture so benchmarks are not dominated by cold start.
+
 ## MHR body mesh rendering
 
 The demo can render a full dense body mesh for each detected person by
@@ -224,6 +278,10 @@ pipeline = PosePipeline(
     device="cuda",
     detector_variant="medium",
 )
+
+# Optional: RF-DETR ONNX + explicit GPU warm-up before latency-sensitive loops.
+# pipeline = PosePipeline(..., detector_onnx="models/rf-detr-medium.onnx")
+# pipeline.warmup(image_rgb)
 
 result = pipeline.predict(image_rgb)
 for r in result.persons:

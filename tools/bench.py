@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", type=str, default="models/instanthmr.onnx")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--detector-variant", type=str, default="medium",
-                   choices=["nano", "small", "medium", "base", "large"])
+                   choices=["nano", "small", "medium", "base", "large"],
+                   help="PyTorch RF-DETR variant (ignored when --detector-onnx is set).")
+    p.add_argument(
+        "--detector-onnx", type=str, default=None, metavar="PATH",
+        help="RF-DETR detection ONNX (pred_boxes, pred_logits); ONNXRuntime.",
+    )
     p.add_argument("--det-confidence", type=float, default=0.5)
     p.add_argument("--max-persons", type=int, default=5)
     p.add_argument("--detector-stride", type=int, default=1,
@@ -74,6 +79,10 @@ def main() -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"video: {args.video}  {width}x{height}  {total} frames @ {src_fps:.1f} fps")
 
+    det_onnx = Path(args.detector_onnx) if args.detector_onnx else None
+    if det_onnx is not None and not det_onnx.exists():
+        sys.exit(f"[error] RF-DETR ONNX not found: {det_onnx}")
+
     pipeline = PosePipeline(
         onnx_path=args.model,
         device=args.device,
@@ -82,9 +91,21 @@ def main() -> None:
         max_persons=args.max_persons,
         detector_stride=args.detector_stride,
         batch_persons=not args.no_batch_persons,
+        detector_onnx=det_onnx,
     )
     print(f"InstantHMR EP: {pipeline.hmr.active_provider}")
-    print(f"detector variant: {args.detector_variant}")
+    dprov = getattr(pipeline.detector, "active_provider", None)
+    if dprov is not None:
+        print(f"RF-DETR ONNX EP: {dprov}  ({det_onnx})")
+    else:
+        print(f"detector variant: {args.detector_variant}")
+
+    ret0, bgr0 = cap.read()
+    if ret0:
+        rgb0 = cv2.cvtColor(bgr0, cv2.COLOR_BGR2RGB)
+        print("GPU warmup …", flush=True)
+        pipeline.warmup(rgb0)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     det: list[float] = []
     hmr: list[float] = []
