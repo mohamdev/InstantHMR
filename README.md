@@ -5,7 +5,7 @@
 A lightweight, ONNX-exportable distillation of
 [`facebook/sam-3d-body-dinov3`](https://huggingface.co/facebook/sam-3d-body-dinov3)
 for **3D human pose estimation and mesh recovery**: a RepViT-M1.5 backbone + a 9-token
-cross-attention decoder + CLIFF camera conditioning. Trained to mimic the
+cross-attention decoder + CLIFF camera conditioning. The model released by [`NaturalPad`](https://www.naturalpad.fr/) was trained to mimic the
 SAM3D teacher's per-person 70-keypoint outputs from a single 224×224 crop.
 
 InstantHMR ships as a single `.onnx` file. The demo pipeline pairs it with
