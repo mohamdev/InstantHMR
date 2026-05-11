@@ -64,6 +64,11 @@ class RFDETRDetector:
         self._max_persons = max_persons
         self._variant = variant
 
+    def warmup(self) -> None:
+        """Run one silent forward pass to pre-compile PyTorch/CUDA kernels."""
+        dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+        self.detect(dummy)
+
     @property
     def variant(self) -> str:
         return self._variant

@@ -194,12 +194,17 @@ class InstantHMR:
         self,
         image_rgb: np.ndarray,
         detections: list[dict],
+        padded_to: int | None = None,
     ) -> list[HMRPrediction]:
         """Run InstantHMR on multiple persons in a single ONNX call.
 
         Args:
             image_rgb: (H, W, 3) uint8 RGB full-frame image.
             detections: list of ``{"bbox": [x1,y1,x2,y2], "confidence": f}``.
+            padded_to: when set, the ONNX batch dimension is always this size
+                (zero-padded if fewer detections).  Keeping a constant batch
+                size prevents CUDA from re-compiling kernels each time the
+                person count changes.
 
         Returns:
             One ``HMRPrediction`` per input detection, in the same order.
@@ -210,9 +215,11 @@ class InstantHMR:
         image_rgb = np.ascontiguousarray(image_rgb)
         h, w = image_rgb.shape[:2]
         n = len(detections)
+        batch = max(padded_to or n, n)  # always >= n; zero-pad the rest
 
-        crops = np.empty((n, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
-        cliffs = np.empty((n, 3), dtype=np.float32)
+        # Use zeros so padded slots produce deterministic (discarded) outputs.
+        crops = np.zeros((batch, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
+        cliffs = np.zeros((batch, 3), dtype=np.float32)
         sq_meta = []  # per-person (sq_x1, sq_y1, sq_size, bbox)
         for i, det in enumerate(detections):
             bbox_arr = np.asarray(det["bbox"], dtype=np.float32).reshape(4)
@@ -265,6 +272,28 @@ class InstantHMR:
                 shape_params=shape_params_b[i],
             ))
         return results
+
+    def warmup(self, max_batch_size: int = 1) -> None:
+        """Pre-warm the ONNX session for the two batch sizes used at runtime.
+
+        With the padded-batch strategy the pipeline only ever calls the session
+        with batch=1 (single person) or batch=max_batch_size (multi-person,
+        zero-padded to a fixed size).  Two runs here compile all CUDA kernels
+        upfront so no mid-demo stall occurs when persons first appear.
+        """
+        dummy_image = np.zeros(
+            (max_batch_size, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32
+        )
+        dummy_cliff = np.zeros((max_batch_size, 3), dtype=np.float32)
+        # Large batch first — allocates the most memory; batch=1 reuses the plan.
+        self.session.run(
+            None, {self._in_image: dummy_image, self._in_cliff: dummy_cliff}
+        )
+        if max_batch_size > 1:
+            self.session.run(
+                None,
+                {self._in_image: dummy_image[:1], self._in_cliff: dummy_cliff[:1]},
+            )
 
     # ------------------------------------------------------------------
     # Preprocessing

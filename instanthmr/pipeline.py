@@ -83,7 +83,7 @@ class PosePipeline:
         device: str = "cuda",
         detector_variant: str = "medium",
         det_confidence: float = 0.5,
-        max_persons: int = 5,
+        max_persons: int = 2,
         detector_stride: int = 1,
         batch_persons: bool = True,
     ):
@@ -97,6 +97,18 @@ class PosePipeline:
             max_persons=max_persons,
         )
 
+        # Warm up both models before the first real frame.
+        # - RF-DETR (PyTorch): first call triggers CUDA JIT for transformer ops.
+        # - InstantHMR (ONNX/CUDA EP): first call at a new batch size triggers
+        #   kernel compilation and GPU memory allocation.
+        # With padded-batch inference the session only ever sees two shapes:
+        # batch=1 and batch=max_persons — two warm-up calls covers everything.
+        print(f"Warming up models (max_persons={max_persons})…", flush=True)
+        self.detector.warmup()
+        self.hmr.warmup(max_batch_size=max_persons)
+        print("Ready.", flush=True)
+
+        self._max_persons = max_persons
         self._detector_stride = detector_stride
         self._batch_persons = batch_persons
         self._frame_idx = 0
@@ -138,11 +150,17 @@ class PosePipeline:
             detections = [{"bbox": fb, "confidence": 0.0}]
 
         # ---- InstantHMR ----
+        # Hard-cap so we never exceed the pre-warmed batch size.
+        detections = detections[: self._max_persons]
         outputs: list[HMRPrediction] = []
         t1 = time.perf_counter()
         if detections:
             if self._batch_persons and len(detections) > 1:
-                outputs = self.hmr.predict_batch(image_rgb, detections)
+                # Always pad to _max_persons so ONNX sees a constant batch
+                # shape and never triggers a mid-demo recompilation.
+                outputs = self.hmr.predict_batch(
+                    image_rgb, detections, padded_to=self._max_persons
+                )
             else:
                 for det in detections:
                     outputs.append(self.hmr.predict(

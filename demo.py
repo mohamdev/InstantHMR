@@ -79,8 +79,8 @@ def parse_args() -> argparse.Namespace:
         help="RF-DETR detection confidence threshold (default: 0.5).",
     )
     p.add_argument(
-        "--max-persons", type=int, default=5,
-        help="Max persons processed per frame (default: 5).",
+        "--max-persons", type=int, default=2,
+        help="Max persons processed per frame (default: 2).",
     )
     p.add_argument(
         "--frame-skip", type=int, default=1,
@@ -232,9 +232,6 @@ def run_image(args: argparse.Namespace) -> None:
     mhr = build_mhr_renderer(args)
     viz = build_visualizer(args, mhr)
 
-    # Warm-up: first call includes lazy CUDA / ORT initialisation, so a real
-    # latency reading is much more useful from the second call onwards.
-    _ = pipeline.predict(rgb)
     result = pipeline.predict(rgb)
 
     render_ms = viz.log_frame(

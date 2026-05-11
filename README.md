@@ -197,7 +197,42 @@ per frame than InstantHMR. The two flags below target that bottleneck.
 | `--detector-stride N` | Run RF-DETR every Nth frame; reuse the previous bbox (slightly expanded) on the in-between frames. Stride 2–3 is the single biggest knob — typically 2–3× end-to-end FPS for slow movement, with negligible quality loss. |
 | `--detector-variant nano` | Use the smallest RF-DETR; biggest win on CPU / Apple Silicon where the detector is doing all the work. |
 | `--device coreml` | On macOS, route the InstantHMR ONNX through `CoreMLExecutionProvider`. |
+| `--max-persons N` | Maximum number of persons processed per frame (default: **2**). See below. |
 | `--no-batch-persons` | Disable batched multi-person HMR (one ONNX call per person). The default is batched. |
+
+### `--max-persons` and why it matters
+
+`--max-persons` does two things at once:
+
+1. **Caps detections** — RF-DETR may find more people than you need. Setting `N`
+   keeps only the `N` highest-confidence detections per frame.
+
+2. **Fixes the ONNX batch size** — CUDA / ONNX Runtime compiles GPU kernels the
+   first time a model runs at a new input shape. Because the batch dimension
+   counts as part of the shape, switching from 1 person to 2 persons mid-demo
+   would normally trigger a multi-second stall. The pipeline avoids this by
+   **always** padding the input to exactly `N` crops (zero-filling unused slots)
+   so the session always sees `batch = N`, regardless of how many people are
+   actually in frame.
+
+**Startup:** during `PosePipeline.__init__` the pipeline runs two warm-up passes
+— `batch = N` and `batch = 1` (the single-person path) — so all CUDA kernels
+are compiled before the first real frame. Startup cost is roughly `2 ×`
+one-inference time and does **not** scale with `N`.
+
+**Choosing `N`:**
+
+| Scene | Recommended `--max-persons` |
+|-------|----------------------------|
+| Single person / portrait | 1 |
+| Two people, couples, sparring | **2 (default)** |
+| Small group, team sport | 4–6 |
+| Crowd / many people visible | raise `N`; also consider `--detector-stride` |
+
+Raising `N` does not slow down single-person frames at inference time (the
+padded slots run on GPU in parallel), but it does proportionally increase
+the memory footprint of the batch buffer and may slightly increase latency
+when `N` is large and the GPU can no longer fully parallelise the extra crops.
 
 Measured on RTX 4070 + torch 2.5 cu121 + ORT 1.25 (1080p video, 1 person, 150 frames after warm-up):
 
