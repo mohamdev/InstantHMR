@@ -373,6 +373,12 @@ class SAM3DStudentDataset(Dataset):
             if aug_flip > 0.5:
                 joints_3d[:, 0] = -joints_3d[:, 0]
                 joints_3d = joints_3d[FLIP_PERM]
+                # joints_2d was already mirrored geometrically by M_total, but a
+                # mirrored image LOOKS like the opposite-handed person, so the
+                # left/right labels must be swapped too - exactly as for joints_3d.
+                # Without this the 2D head gets contradictory left/right supervision
+                # and collapses symmetric joints toward the body midline.
+                joints_2d = joints_2d[FLIP_PERM]
                 cam_trans[0] = -cam_trans[0]
                 cx = orig_w - cx                  
             rad = math.radians(angle)
