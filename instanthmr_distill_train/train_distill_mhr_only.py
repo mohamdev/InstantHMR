@@ -173,6 +173,10 @@ class DistillConfig:
     batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-4
+    # Exclude depthwise-conv kernels, norm params and biases from weight decay
+    # (see build_param_groups). Off by default so existing runs are unchanged;
+    # enable with --split-wd. Applies to every backbone, not just MobileNet.
+    split_weight_decay: bool = False
     epochs: int = 400
     warmup_epochs: int = 3
     grad_clip: float = 1.0          
@@ -297,7 +301,11 @@ class SAM3DStudentDataset(Dataset):
                 if img_path.exists():
                     sub_pairs.append((img_path, npz_path))
 
-            cap = caps.get(sub_name)
+            # "*" is a default cap applied to every sub-folder that has no
+            # explicit entry — used to build a *balanced* subset for small-scale
+            # ablations. (max_images can't: it slices a path-sorted list, so it
+            # would return a single dataset.)
+            cap = caps.get(sub_name, caps.get("*"))
             if cap is not None and len(sub_pairs) > cap:
                 n_before = len(sub_pairs)
                 sub_pairs.sort(key=lambda p: (str(p[1]), str(p[0])))
@@ -893,6 +901,57 @@ def evaluate_hmr_batch(preds, targets, cfg, mhr_module):
 # ============================================================
 # Cell 11 — Full Distillation Training Loop
 # ============================================================
+def build_param_groups(model, weight_decay, split_wd=True):
+    """AdamW param groups with weight decay removed from the params that should
+    never see it.
+
+    Applying a single weight_decay to `model.parameters()` penalises every
+    tensor equally, which is wrong for three families:
+
+      * **norm parameters** (BatchNorm/LayerNorm weight and bias) — decaying a
+        BN gamma toward 0 shrinks the layer's output scale, which the following
+        layer has to keep re-learning.
+      * **biases** — a bias is an offset, not a capacity knob; decay just
+        re-centres it toward 0 for no regularisation benefit.
+      * **depthwise convolution kernels** — a depthwise filter has only
+        k*k weights per channel (9 for 3x3) instead of C_in*k*k, so an L2
+        penalty of the same magnitude is a far larger *relative* pull on it.
+        MobileNet-family backbones are mostly depthwise, so uniform wd hits
+        them much harder than it hits a conventional/hybrid backbone.
+
+    This is a general recipe fix, not a MobileNet-specific hack -- the same
+    exclusions are standard for RepViT too (both are BN-heavy and RepViT's
+    token mixer is itself depthwise). Use it for every backbone or none, or
+    the comparison just moves the bias to the other side.
+
+    Returns the two-group list AdamW expects.
+    """
+    if not split_wd:
+        return [{"params": list(model.parameters()), "weight_decay": weight_decay}]
+
+    # Names of depthwise conv weights: groups == in_channels (and > 1).
+    depthwise = set()
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, nn.modules.conv._ConvNd) and mod.groups > 1 \
+                and mod.groups == mod.in_channels:
+            depthwise.add(f"{mod_name}.weight" if mod_name else "weight")
+
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in depthwise or name.endswith(".bias") or param.ndim <= 1:
+            # ndim <= 1 catches every BN/LayerNorm weight and every bias,
+            # including the ones inside nn.TransformerDecoderLayer.
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay,    "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def make_ema_avg_fn(max_decay):
     @torch.no_grad()
     def avg_fn(ema_params, model_params, num_averaged):
@@ -915,7 +974,14 @@ def train_instant_hmr():
 
     model = InstantHMRStudent(cfg, pretrained=True).to(device)
     criterion = DistillationLoss(cfg, mhr_module)
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    split_wd = getattr(cfg, "split_weight_decay", False)
+    param_groups = build_param_groups(model, cfg.weight_decay, split_wd=split_wd)
+    optimizer = optim.AdamW(param_groups, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    if split_wd:
+        n_dec = sum(p.numel() for p in param_groups[0]["params"])
+        n_nod = sum(p.numel() for p in param_groups[1]["params"])
+        print(f"   param groups: wd={cfg.weight_decay} on {n_dec/1e6:.2f} M params | "
+              f"wd=0 on {n_nod/1e6:.2f} M (depthwise kernels, norms, biases)")
     scaler = torch.amp.GradScaler(device='cuda', enabled=cfg.use_amp)
 
     steps_per_epoch = len(train_loader)
@@ -1629,6 +1695,10 @@ def parse_args():
     p.add_argument("--max_images", type=int, default=None)
     p.add_argument("--harmony4d_cap", type=int, default=None,
                    help="Max Harmony4D crops kept (randomly sampled). 0 = uncapped/use all.")
+    p.add_argument("--cap_all", type=int, default=None,
+                   help="Cap EVERY sub-dataset to this many crops (seeded, reproducible). "
+                        "Gives a domain-balanced subset for small-scale ablations, unlike "
+                        "--max_images, which slices a path-sorted list.")
     p.add_argument("--no-resume", dest="no_resume", action="store_true",
                    help="Ignore any existing checkpoint and train from scratch.")
     p.add_argument("--self-test", dest="self_test", action="store_true",
@@ -1648,6 +1718,15 @@ def parse_args():
                    help="Weight of the MHR-derived 3D keypoint loss (FK path).")
     p.add_argument("--seed", type=int, default=None,
                    help="Seed torch/numpy/random (for reproducible sanity runs).")
+    p.add_argument("--split-wd", dest="split_wd", action="store_true",
+                   help="Exclude depthwise-conv weights, norm params and biases from "
+                        "weight decay (standard for BN/depthwise-heavy backbones).")
+    p.add_argument("--backbone", type=str, default=None,
+                   help="timm backbone name. Any model whose forward_features() returns a "
+                        "stride-32 (B,C,H,W) map works unchanged (the channel count is read "
+                        "from .num_features). Tested: repvit_m2_3, repvit_m1_5, "
+                        "mobilenetv4_conv_medium, mobilenetv4_hybrid_medium, "
+                        "mobilenetv4_conv_large.")
     args, unknown = p.parse_known_args()
     if unknown:
         print(f"⚠️ Ignoring unrecognized arguments: {unknown}")
@@ -1673,6 +1752,8 @@ def main():
     if args.lr is not None:             cfg.lr = args.lr
     if args.num_workers is not None:    cfg.num_workers = args.num_workers
     if args.max_images is not None:     cfg.max_images = args.max_images
+    if args.cap_all is not None:
+        cfg.per_dataset_caps = {"*": args.cap_all}
     if args.harmony4d_cap is not None:
         if args.harmony4d_cap <= 0:
             cfg.per_dataset_caps.pop("sam3d_gt_harmony4d", None)
@@ -1681,6 +1762,17 @@ def main():
     if args.no_resume:                  cfg.resume = False
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
     if args.w_keypoints3d is not None:   cfg.w_keypoints3d = args.w_keypoints3d
+    if args.split_wd:                   cfg.split_weight_decay = True
+    if args.backbone is not None:
+        cfg.backbone = args.backbone
+        # backbone_feat_dim is informational only: InstantHMRStudent reads the real
+        # width from backbone.num_features. Keep it in sync so the printout is honest.
+        try:
+            import timm as _timm
+            cfg.backbone_feat_dim = _timm.create_model(
+                cfg.backbone, pretrained=False, num_classes=0).num_features
+        except Exception:
+            pass
     if args.seed is not None:
         random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
@@ -1692,6 +1784,8 @@ def main():
     print(f"Output dir   : {cfg.log_dir}")
     print(f"MHR model    : {cfg.mhr_model_path}")
     print(f"Backbone     : {cfg.backbone} | epochs={cfg.epochs} | batch={cfg.batch_size} | lr={cfg.lr}")
+    print(f"weight decay : {cfg.weight_decay} | "
+          f"{'split (no wd on depthwise/norm/bias)' if cfg.split_weight_decay else 'uniform on all params'}")
     print(f"max_images   : {cfg.max_images if cfg.max_images is not None else 'unlimited (all crops)'}")
     print(f"dataset caps : {cfg.per_dataset_caps if cfg.per_dataset_caps else 'none'}")
     print(f"geom aug     : p={cfg.geom_p} rot±{cfg.geom_rot_deg}° scale±{cfg.geom_scale_range} "
