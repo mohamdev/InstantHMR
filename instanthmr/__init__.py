@@ -1,6 +1,6 @@
 """InstantHMR — standalone 3D human pose inference + Rerun visualization."""
 
-from .inference import InstantHMR, HMRPrediction
+from .inference import InstantHMR, HMRPrediction, onnx_output_names
 from .detector import RFDETRDetector
 from .pipeline import PosePipeline, FrameResult
 from .skeleton import JOINT_NAMES, SKELETON_EDGES, NUM_JOINTS, edges_for
@@ -8,6 +8,7 @@ from .skeleton import JOINT_NAMES, SKELETON_EDGES, NUM_JOINTS, edges_for
 __all__ = [
     "InstantHMR",
     "HMRPrediction",
+    "onnx_output_names",
     "RFDETRDetector",
     "PosePipeline",
     "FrameResult",

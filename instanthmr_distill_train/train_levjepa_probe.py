@@ -162,7 +162,17 @@ class ProbeConfig:
 # ============================================================
 # Clip index + dataset
 # ============================================================
-TRACK_RE = re.compile(r"^(.*)_(\d{5})_p(\d+)$")
+# Non-greedy prefix + open-ended index: hardcoding \d{5} silently dropped every
+# family numbering frames with 6 digits (pilates/workout/dance inside
+# sam3d_distill_mix -- ~25k frames of real video).
+TRACK_RE = re.compile(r"^(.+?)_(\d+)_p(\d+)$")
+
+# Families that sit inside a "video" folder but are STILL IMAGES. With the
+# looser regex above they would otherwise chain consecutive COCO image ids into
+# fake tracks, feeding the model 16 unrelated photos as one clip. They are also
+# already in sam3d_gt_coco (8,514 of 10,656 crop ids identical), so skipping
+# them here loses no data.
+STATIC_IN_VIDEO_PREFIXES = ("train2014_COCO",)
 
 
 def build_clip_index(pairs, frame_stride, clip_len, clip_stride, datasets=None):
@@ -174,6 +184,8 @@ def build_clip_index(pairs, frame_stride, clip_len, clip_stride, datasets=None):
     for i, (img_path, npz_path) in enumerate(pairs):
         sub = npz_path.parent.parent.name
         if datasets is not None and sub not in datasets:
+            continue
+        if npz_path.stem.startswith(STATIC_IN_VIDEO_PREFIXES):
             continue
         m = TRACK_RE.match(npz_path.stem)
         if not m:
@@ -200,12 +212,19 @@ class ClipDataset(Dataset):
     here is byte-identical to a sample in the single-image pipeline.
     """
 
-    def __init__(self, cfg: ProbeConfig, datasets, max_clips=None, augment=False):
+    def __init__(self, cfg: ProbeConfig, datasets, max_clips=None, augment=False,
+                 base_ds=None):
         self.cfg = cfg
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.base = base.SAM3DStudentDataset(
-                cfg.data_root, augment=augment, image_size=cfg.image_size,
-                max_images=None, per_dataset_caps=None)
+        # base_ds lets callers share ONE scan of the corpus. Building a second
+        # SAM3DStudentDataset costs another ~1.6 GB of resident Path objects,
+        # which every forked DataLoader worker then copies.
+        if base_ds is not None:
+            self.base = base_ds
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.base = base.SAM3DStudentDataset(
+                    cfg.data_root, augment=augment, image_size=cfg.image_size,
+                    max_images=None, per_dataset_caps=None)
         self.clips = build_clip_index(
             self.base.pairs, cfg.frame_stride, cfg.clip_len, cfg.clip_stride,
             datasets=set(datasets))
@@ -424,7 +443,10 @@ class ClipPoseDecoder(nn.Module):
         mem = self.feat_proj(patch_tokens)                       # (B,T,N,d)
 
         q = self.query_embed.expand(B * T, -1, -1)
-        q = q + self.temporal_embed.expand(B, -1, -1, -1).reshape(B * T, 1, -1)
+        # slice, don't assume T == cfg.clip_len: still images are encoded as
+        # T=1 clips, which costs 197 tokens instead of 3137 for the same single
+        # label -- 16x cheaper than repeating the frame to fill the clip.
+        q = q + self.temporal_embed[:, :T].expand(B, -1, -1, -1).reshape(B * T, 1, -1)
         q = q + self.cond_proj(cliff_cond).reshape(B * T, 1, -1)
 
         if self.mode == "perframe":

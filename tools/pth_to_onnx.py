@@ -8,18 +8,25 @@ script that produced the checkpoint, plus the FP32 export recipe from notebook
 Cell 15, so the graph I/O matches ``instanthmr/inference.py``:
 
     inputs : image (N, 3, 224, 224), cliff_cond (N, 3)
-    outputs: mhr_params, shape_params, cam_trans, joints_2d, joints_3d   (in this order)
+    outputs: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
 
 Architecture selection
 ----------------------
-The student head changed between training scripts: ``train_distill.py``
-regresses 2D joints directly (``head_2d_xy``), while the optimized/correctives
-scripts predict them with a SimCC classification head (``head_2d_logits`` +
-``kp2d_bin_centers``). Exporting a SimCC checkpoint through the old architecture
-silently leaves ``head_2d_xy`` at its near-zero init, which collapses every 2D
-keypoint onto the centre of the bbox. ``--arch auto`` (the default) picks the
-right module by inspecting the checkpoint, and a missing-key check makes any
-future mismatch a hard error instead of a silent one.
+The student head changed twice across training scripts:
+
+  * ``train_distill.py`` regresses 2D joints directly (``head_2d_xy``);
+  * the optimized / correctives scripts predict them with a SimCC
+    classification head (``head_2d_logits`` + ``kp2d_bin_centers``);
+  * ``train_distill_mhr_only.py`` additionally **deletes the 3D head**
+    (``head_3d``) — the 70 keypoints are derived from the MHR forward pass by
+    the consumer, so its graph has FOUR outputs instead of five.
+
+Exporting a SimCC checkpoint through the old architecture silently leaves
+``head_2d_xy`` at its near-zero init, which collapses every 2D keypoint onto
+the centre of the bbox. ``--arch auto`` (the default) picks the right module by
+inspecting the checkpoint, and a missing-key check makes any future mismatch a
+hard error instead of a silent one. The output list is read off the deploy
+wrapper itself, so a 4- vs 5-output graph never has to be configured by hand.
 
 Usage
 -----
@@ -28,8 +35,8 @@ Usage
 
     # or point at a specific checkpoint / output
     python tools/pth_to_onnx.py \
-        --ckpt   instanthmr_distill_train/runs/distill_optimized_v2/best_student_model_ema.pth \
-        --output models/instanthmr.onnx
+        --ckpt   instanthmr_distill_train/runs/distill_mhr_only/distill_mhr_only/best_student_model_ema.pth \
+        --output models/instanthmr_mhr_only.onnx
 """
 import argparse
 import importlib
@@ -46,15 +53,26 @@ sys.path.insert(0, str(TRAIN_DIR))
 
 # arch name -> training module that defines the matching InstantHMRStudent.
 ARCH_MODULES = {
+    "mhr_only": "train_distill_mhr_only",                  # SimCC 2D head, NO 3D head
     "correctives": "train_distill_optimized_correctives",  # SimCC 2D head (head_2d_logits)
     "optimized": "train_distill_optimized",                # SimCC 2D head, identical weights
     "legacy": "train_distill",                             # direct 2D regression (head_2d_xy)
 }
 
+# Canonical ONNX output order. The MHR-only graph stops after `joints_2d`.
+ALL_OUTPUT_KEYS = ["mhr_params", "shape_params", "cam_trans", "joints_2d", "joints_3d"]
+
 
 def detect_arch(state: dict) -> str:
-    """Pick the architecture that matches the checkpoint's 2D head."""
-    if "head_2d_logits.weight" in state:
+    """Pick the architecture that matches the checkpoint's prediction heads."""
+    has_3d = any(k.startswith("head_3d.") for k in state)
+    has_simcc = "head_2d_logits.weight" in state
+
+    if has_simcc and not has_3d:
+        # train_distill_mhr_only.py: the 3D coordinate head was removed and the
+        # decoder shrank from 141 to 71 queries.
+        return "mhr_only"
+    if has_simcc:
         # `optimized` and `correctives` share identical parameters (they differ
         # only by an fp32 softmax cast), so either module loads such a
         # checkpoint; prefer the newer one.
@@ -126,9 +144,22 @@ def main() -> None:
     deploy = T.HMRDeployWrapper(model).eval()
 
     # --- Export FP32 ONNX (Cell 15 recipe) ---
-    output_keys = ["mhr_params", "shape_params", "cam_trans", "joints_2d", "joints_3d"]
     dummy_img = torch.randn(1, 3, cfg.image_size, cfg.image_size, device=device)
     dummy_cliff = torch.randn(1, 3, device=device)
+
+    # Ask the wrapper how many tensors it returns instead of hard-coding five:
+    # train_distill_mhr_only.py drops `joints_3d` from the tuple.
+    with torch.no_grad():
+        n_out = len(deploy(dummy_img, dummy_cliff))
+    if n_out not in (4, 5):
+        sys.exit(f"[error] unexpected deploy wrapper output count: {n_out} (expected 4 or 5)")
+    output_keys = ALL_OUTPUT_KEYS[:n_out]
+    print(f"  graph outputs: {n_out} -> {output_keys}")
+    if n_out == 4:
+        print("  note: no 'joints_3d' output — the 70 keypoints are derived from the\n"
+              "        MHR forward pass at inference time (needs --mhr-model / --mhr-assets\n"
+              "        in demo.py).")
+
     dynamic_axes = {"image": {0: "batch"}, "cliff_cond": {0: "batch"}}
     for k in output_keys:
         dynamic_axes[k] = {0: "batch"}

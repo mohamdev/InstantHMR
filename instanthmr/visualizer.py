@@ -5,9 +5,13 @@ Logs, per frame:
                               text panel showing detector / HMR / render / total ms).
   - ``camera``              : pinhole intrinsics so the image becomes a
                               proper frustum in the 3D scene.
-  - ``world/persons/...``   : 3D joints + skeleton lines per person.
-  - ``world/persons/.../mesh``: full MHR body mesh when an MHRRenderer is
+  - ``world/persons/...``   : the 70 3D keypoints + skeleton lines per person.
+                              For an MHR-only student these come from the MHR
+                              forward pass itself (see ``instanthmr.inference``).
+  - ``world/persons/.../mesh``: full MHR body mesh when an MHR backend is
                               provided (vertices from a true MHR forward pass).
+                              Rendered semi-transparent via ``albedo_factor``
+                              so the keypoints inside the body stay visible.
   - ``timing/detector_ms``  : scalar plot of RF-DETR latency.
   - ``timing/hmr_ms``       : scalar plot of InstantHMR latency.
   - ``timing/render_ms``    : scalar plot of MHR mesh rendering latency.
@@ -32,19 +36,44 @@ from .skeleton import edges_for
 if TYPE_CHECKING:
     from .mhr_renderer import MHRRenderer
 
+#: Base skin tone of the body mesh, before the transparency factor is applied.
+MESH_COLOR = (200, 160, 130)
+#: Default mesh opacity. Low enough that the 70 keypoints read through the
+#: body, high enough that the silhouette is still legible.
+MESH_ALPHA = 0.35
+
 
 class RerunVisualizer:
+    """Rerun logger for the demo.
+
+    Args:
+        application_id: Rerun application id.
+        spawn_viewer: open the viewer GUI on construction.
+        save_path: optional ``.rrd`` recording path.
+        mhr_renderer: MHR backend used to skin the body mesh. Any object with
+            ``.forward(mhr_params, shape_params)`` and ``.faces`` works; see
+            :mod:`instanthmr.mhr_renderer`.
+        mesh_alpha: body-mesh opacity in ``[0, 1]``. Applied through Rerun's
+            ``albedo_factor`` rather than per-vertex alpha, so one scalar
+            controls the whole surface.
+    """
+
     def __init__(
         self,
         application_id: str = "instanthmr_demo",
         spawn_viewer: bool = True,
         save_path: str | None = None,
         mhr_renderer: "MHRRenderer | None" = None,
+        mesh_alpha: float = MESH_ALPHA,
     ):
         import rerun as rr
 
         self._rr = rr
         self._mhr_renderer = mhr_renderer
+        self._mesh_albedo = (
+            *MESH_COLOR,
+            int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
+        )
         rr.init(application_id, spawn=spawn_viewer)
 
         # SAM3D / MHR convention: right-handed, Y-down camera frame.
@@ -165,6 +194,12 @@ class RerunVisualizer:
     # ------------------------------------------------------------------
 
     def _log_person(self, idx: int, person: HMRPrediction) -> None:
+        """Log the 70 3D keypoints and the skeleton wiring for one person.
+
+        For an MHR-only student ``joints_3d_cam`` was regressed from the MHR
+        skeleton that also produced the mesh, so the points sit exactly inside
+        the surface logged by :meth:`_log_person_mesh`.
+        """
         rr = self._rr
         path = f"world/persons/person_{idx}"
 
@@ -199,15 +234,16 @@ class RerunVisualizer:
 
         faces = self._mhr_renderer.faces  # (F, 3) int32, shared across frames
 
-        n = len(verts_cam)
-        skin = np.tile(np.array([[200, 160, 130, 140]], dtype=np.uint8), (n, 1))
-
+        # Tint + transparency come from `albedo_factor`, a single RGBA multiplier
+        # for the whole surface. Per-vertex colours would work too, but the
+        # viewer multiplies the two, so keeping the alpha in one place makes the
+        # `mesh_alpha` knob mean exactly what it says.
         self._rr.log(
             f"world/persons/person_{idx}/mesh",
             self._rr.Mesh3D(
                 vertex_positions=verts_cam,
                 triangle_indices=faces,
-                vertex_colors=skin,
+                albedo_factor=self._mesh_albedo,
             ),
         )
 

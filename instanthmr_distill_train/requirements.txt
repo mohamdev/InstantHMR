@@ -17,6 +17,15 @@ numpy>=1.24
 pillow>=10
 opencv-python>=4.8
 
+# --- LeVJEPA encoder (train_levjepa_*.py) ---
+# THIS is what was missing when the perelha job died with
+# "ModuleNotFoundError: No module named 'transformers'".
+# The weights ship their own modeling code, hence trust_remote_code=True, which
+# needs `transformers` itself plus safetensors to read the checkpoint.
+transformers>=4.44
+safetensors>=0.4
+huggingface_hub>=0.24
+
 # --- utilities / logging ---
 tqdm>=4.65
 matplotlib>=3.7

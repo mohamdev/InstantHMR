@@ -12,7 +12,7 @@ GPU_REQUIRED=true
 # --data_root points at the dataset synced by datasynch_perso (see below).
 # It is synced next to this project folder, i.e. ../instanthmr_data once we
 # cd into instanthmr_distill_train.
-EXEC="python3 -u train_distill_mhr_only.py --data_root /datasets/instanthmr_data --num_workers 8 --batch_size 128 $useropt"
+EXEC="python3 -u train_distill_mhr_only.py --data_root /datasets/instanthmr_data --num_workers 8 --batch_size 128 --w_keypoints3d 1.0 $useropt"
 
 # SBATCH --output/--error paths are relative to the submission directory, so
 # create the log folder before submitting.
@@ -28,10 +28,9 @@ sbatch ${sbatchopt} << eof
 #SBATCH --mail-type=ALL
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --output=instanthmr_distill_mhr_only/stdout_dolcino.txt
-#SBATCH --error=instanthmr_distill_mhr_only/stderr_dolcino.txt
-#SBATCH --account=dept_rob
-#SBATCH --partition=robgpu
+#SBATCH --output=instanthmr_distill_mhr_only/stdout_perelha.txt
+#SBATCH --error=instanthmr_distill_mhr_only/stderr_perelha.txt
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem-per-gpu=50000
 #SBATCH --time=4-00:00:00

@@ -68,6 +68,10 @@ class PosePipeline:
             frame are batched into a single InstantHMR ONNX call instead
             of looping. This is a meaningful win for multi-person frames
             and free for single-person frames.
+        mhr: Optional MHR backend (see :mod:`instanthmr.mhr_renderer`).
+            Required for MHR-only graphs, whose 3D keypoints are derived
+            from the predicted MHR parameters instead of a 3D head; ignored
+            by graphs that carry a ``joints_3d`` output.
 
     Example
     -------
@@ -86,11 +90,19 @@ class PosePipeline:
         max_persons: int = 2,
         detector_stride: int = 1,
         batch_persons: bool = True,
+        mhr: object | None = None,
     ):
         if detector_stride < 1:
             raise ValueError("detector_stride must be >= 1")
 
-        self.hmr = InstantHMR(onnx_path, device=device)
+        self.hmr = InstantHMR(onnx_path, device=device, mhr=mhr)
+        if self.hmr.derives_joints_3d and mhr is None:
+            raise ValueError(
+                f"{Path(onnx_path).name} has no 'joints_3d' output (MHR-only student): "
+                "its 3D keypoints come from an MHR forward pass, so an MHR backend is "
+                "required. Pass mhr=build_mhr(...), or run demo.py with --mhr-model / "
+                "--mhr-assets."
+            )
         self.detector = RFDETRDetector(
             variant=detector_variant,
             confidence=det_confidence,
@@ -106,6 +118,8 @@ class PosePipeline:
         print(f"Warming up models (max_persons={max_persons})…", flush=True)
         self.detector.warmup()
         self.hmr.warmup(max_batch_size=max_persons)
+        if mhr is not None:
+            self._warmup_mhr(mhr, max_persons)
         print("Ready.", flush=True)
 
         self._max_persons = max_persons
@@ -114,6 +128,24 @@ class PosePipeline:
         self._frame_idx = 0
         self._last_detections: list[dict] = []
         self._last_bbox: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _warmup_mhr(mhr, max_persons: int) -> None:
+        """Run the MHR rig once per batch shape the demo will actually use.
+
+        TorchScript specialises on input shapes over the first few calls, so an
+        un-warmed rig costs hundreds of ms on frame 1 instead of ~1 ms. Three
+        passes is what it takes for the profiling executor to settle: the first
+        records shapes, the second triggers the fusion compile, the third runs
+        the compiled kernels.
+        """
+        pose = np.zeros((max_persons, 204), dtype=np.float32)
+        shape = np.zeros((max_persons, 45), dtype=np.float32)
+        for _ in range(3):
+            mhr.forward(pose[0], shape[0])          # mesh: always single-person
+            if getattr(mhr, "has_keypoints", False):
+                for n in sorted({1, max_persons}):  # keypoints: 1 and the padded batch
+                    mhr.keypoints(pose[:n], shape[:n])
 
     def predict(self, image_rgb: np.ndarray) -> FrameResult:
         """Detect all persons in *image_rgb* and run InstantHMR on each."""

@@ -1,0 +1,354 @@
+{
+  "model": "models/instanthmr_mhr_only_ckpt90.onnx",
+  "dataset": "3DPW",
+  "split": "test",
+  "stride": 1,
+  "bbox_scale": 1.2,
+  "num_sequences": 24,
+  "sequences": [
+    "downtown_arguing_00",
+    "downtown_bar_00",
+    "downtown_bus_00",
+    "downtown_cafe_00",
+    "downtown_car_00",
+    "downtown_crossStreets_00",
+    "downtown_downstairs_00",
+    "downtown_enterShop_00",
+    "downtown_rampAndStairs_00",
+    "downtown_runForBus_00",
+    "downtown_runForBus_01",
+    "downtown_sitOnStairs_00",
+    "downtown_stairs_00",
+    "downtown_upstairs_00",
+    "downtown_walkBridge_01",
+    "downtown_walkUphill_00",
+    "downtown_walking_00",
+    "downtown_warmWelcome_00",
+    "downtown_weeklyMarket_00",
+    "downtown_windowShopping_00",
+    "flat_guitar_01",
+    "flat_packBags_00",
+    "office_phoneCall_00",
+    "outdoors_fencing_01"
+  ],
+  "num_samples": 35463,
+  "results": [
+    {
+      "joint_set": "J14",
+      "num_joints": 14,
+      "num_samples": 35463,
+      "MPJPE_mm": 77.25832087421568,
+      "PA_MPJPE_mm": 54.8939122400647,
+      "PCK3D_50mm": 0.5790421405005619,
+      "PCK3D_100mm": 0.8924653864591264,
+      "AUC_0_150mm": 0.6371804272928843,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 58.99963246267586,
+        "right_knee": 42.38728858483827,
+        "right_hip": 50.39103164429582,
+        "left_hip": 45.39265522544049,
+        "left_knee": 46.095110047060146,
+        "left_ankle": 62.30361585517269,
+        "right_wrist": 63.81340497982142,
+        "right_elbow": 41.90725242230058,
+        "right_shoulder": 43.96807667630508,
+        "left_shoulder": 50.08607425327331,
+        "left_elbow": 48.06366572018603,
+        "left_wrist": 66.96362486775135,
+        "neck": 32.920260588579204,
+        "head": 115.22307803320544
+      }
+    },
+    {
+      "joint_set": "J12",
+      "num_joints": 12,
+      "num_samples": 35463,
+      "MPJPE_mm": 71.98718459643236,
+      "PA_MPJPE_mm": 48.292409136297024,
+      "PCK3D_50mm": 0.6549784282209626,
+      "PCK3D_100mm": 0.9406353100414516,
+      "AUC_0_150mm": 0.6786479562676105,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 56.99815377789105,
+        "right_knee": 43.630305291279456,
+        "right_hip": 46.529599094848884,
+        "left_hip": 42.83447178924256,
+        "left_knee": 47.52243530675108,
+        "left_ankle": 57.855173112259216,
+        "right_wrist": 62.29407156666568,
+        "right_elbow": 36.678818675428985,
+        "right_shoulder": 38.21018561144652,
+        "left_shoulder": 40.09340440903251,
+        "left_elbow": 40.734850438026946,
+        "left_wrist": 66.12744056269153
+      }
+    },
+    {
+      "joint_set": "J14+adapter",
+      "num_joints": 14,
+      "num_samples": 35463,
+      "MPJPE_mm": 66.85722222445656,
+      "PA_MPJPE_mm": 44.083164610596384,
+      "PCK3D_50mm": 0.7056892294181863,
+      "PCK3D_100mm": 0.9425034543044863,
+      "AUC_0_150mm": 0.705719636913712
+    }
+  ],
+  "contamination": {
+    "training_dirs": [
+      "data/sam3d_distill_mix/annotations",
+      "data/sam3d_gt_3dpw/annotations"
+    ],
+    "seen_frames": 10353,
+    "unseen_frames": 25110,
+    "seen_fraction": 0.29193807630488117,
+    "seen_sequences": [
+      "downtown_arguing_00",
+      "downtown_bar_00",
+      "downtown_bus_00",
+      "downtown_cafe_00",
+      "downtown_car_00",
+      "downtown_crossStreets_00",
+      "downtown_downstairs_00",
+      "downtown_enterShop_00",
+      "downtown_rampAndStairs_00",
+      "downtown_runForBus_00",
+      "downtown_runForBus_01",
+      "downtown_sitOnStairs_00",
+      "downtown_stairs_00",
+      "downtown_upstairs_00",
+      "downtown_walkBridge_01",
+      "downtown_walkUphill_00",
+      "downtown_walking_00",
+      "downtown_warmWelcome_00",
+      "downtown_weeklyMarket_00",
+      "downtown_windowShopping_00",
+      "flat_guitar_01",
+      "flat_packBags_00",
+      "office_phoneCall_00",
+      "outdoors_fencing_01"
+    ]
+  },
+  "results_unseen_frames": [
+    {
+      "joint_set": "J14",
+      "num_joints": 14,
+      "num_samples": 25110,
+      "MPJPE_mm": 80.50931989672257,
+      "PA_MPJPE_mm": 57.05366140421865,
+      "PCK3D_50mm": 0.5548216419184161,
+      "PCK3D_100mm": 0.881657848324515,
+      "AUC_0_150mm": 0.6249301231264464,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 61.47931140891157,
+        "right_knee": 43.66784597368266,
+        "right_hip": 51.590643380821774,
+        "left_hip": 45.99633112852736,
+        "left_knee": 47.61141586722965,
+        "left_ankle": 65.61625292500608,
+        "right_wrist": 69.17219482531468,
+        "right_elbow": 43.22191976400349,
+        "right_shoulder": 44.582150790065214,
+        "left_shoulder": 50.70150039417648,
+        "left_elbow": 51.159805717594764,
+        "left_wrist": 72.72767706391078,
+        "neck": 34.115691861368255,
+        "head": 117.10851855844838
+      }
+    },
+    {
+      "joint_set": "J12",
+      "num_joints": 12,
+      "num_samples": 25110,
+      "MPJPE_mm": 75.3534859518377,
+      "PA_MPJPE_mm": 50.59458176134388,
+      "PCK3D_50mm": 0.6247710075667064,
+      "PCK3D_100mm": 0.9298320722155847,
+      "AUC_0_150mm": 0.6652752619656309,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 59.2944636488828,
+        "right_knee": 44.98211013553142,
+        "right_hip": 47.548593595632475,
+        "left_hip": 43.394665628452856,
+        "left_knee": 49.07030713900323,
+        "left_ankle": 60.92885186640498,
+        "right_wrist": 67.01462392288674,
+        "right_elbow": 38.323823357280524,
+        "right_shoulder": 39.95733150137268,
+        "left_shoulder": 41.6934507272976,
+        "left_elbow": 43.797015072444125,
+        "left_wrist": 71.12974454093712
+      }
+    },
+    {
+      "joint_set": "J14+adapter",
+      "num_joints": 14,
+      "num_samples": 25110,
+      "MPJPE_mm": 70.43668183981028,
+      "PA_MPJPE_mm": 46.514347723018886,
+      "PCK3D_50mm": 0.6766484610570632,
+      "PCK3D_100mm": 0.9324372759856631,
+      "AUC_0_150mm": 0.6915008065892562
+    }
+  ],
+  "results_seen_frames": [
+    {
+      "joint_set": "J14",
+      "num_joints": 14,
+      "num_samples": 10353,
+      "MPJPE_mm": 69.3734000343482,
+      "PA_MPJPE_mm": 49.655691288465555,
+      "PCK3D_50mm": 0.6377861489423355,
+      "PCK3D_100mm": 0.9186778159539678,
+      "AUC_0_150mm": 0.6668921183601361,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 52.98545895355014,
+        "right_knee": 39.2814452511299,
+        "right_hip": 47.48151259627433,
+        "left_hip": 43.92850938109478,
+        "left_knee": 42.41748625256036,
+        "left_ankle": 54.26919908481471,
+        "right_wrist": 50.81628211491889,
+        "right_elbow": 38.71867935650709,
+        "right_shoulder": 42.478711178718214,
+        "left_shoulder": 48.593429570758246,
+        "left_elbow": 40.554337473790454,
+        "left_wrist": 52.98358520334844,
+        "neck": 30.020880770194864,
+        "head": 110.65016085085732
+      }
+    },
+    {
+      "joint_set": "J12",
+      "num_joints": 12,
+      "num_samples": 10353,
+      "MPJPE_mm": 63.82261132933802,
+      "PA_MPJPE_mm": 42.70875660901737,
+      "PCK3D_50mm": 0.7282430213464697,
+      "PCK3D_100mm": 0.9668373096364983,
+      "AUC_0_150mm": 0.7110818743515204,
+      "per_joint_PA_MPJPE_mm": {
+        "right_ankle": 51.42872068017997,
+        "right_knee": 40.351659522983596,
+        "right_hip": 44.05814619089098,
+        "left_hip": 41.47578664459172,
+        "left_knee": 43.768251813285275,
+        "left_ankle": 50.400322004696164,
+        "right_wrist": 50.84491966241465,
+        "right_elbow": 32.689050727849335,
+        "right_shoulder": 33.97268601750797,
+        "left_shoulder": 36.21267775476452,
+        "left_elbow": 33.30792549161378,
+        "left_wrist": 53.99493279743053
+      }
+    },
+    {
+      "joint_set": "J14+adapter",
+      "num_joints": 14,
+      "num_samples": 10353,
+      "MPJPE_mm": 58.175658335580685,
+      "PA_MPJPE_mm": 38.18661211828219,
+      "PCK3D_50mm": 0.7761242428005685,
+      "PCK3D_100mm": 0.9669178016034,
+      "AUC_0_150mm": 0.7402057597232443
+    }
+  ],
+  "per_sequence_J14": {
+    "downtown_arguing_00": {
+      "n": 1793,
+      "PA_MPJPE_mm": 53.86209217665553
+    },
+    "downtown_bar_00": {
+      "n": 2458,
+      "PA_MPJPE_mm": 67.11104059483931
+    },
+    "downtown_bus_00": {
+      "n": 2534,
+      "PA_MPJPE_mm": 57.3890391264324
+    },
+    "downtown_cafe_00": {
+      "n": 2076,
+      "PA_MPJPE_mm": 52.69031252948052
+    },
+    "downtown_car_00": {
+      "n": 1546,
+      "PA_MPJPE_mm": 60.43672446675064
+    },
+    "downtown_crossStreets_00": {
+      "n": 1042,
+      "PA_MPJPE_mm": 55.938241587076654
+    },
+    "downtown_downstairs_00": {
+      "n": 638,
+      "PA_MPJPE_mm": 47.09329939736882
+    },
+    "downtown_enterShop_00": {
+      "n": 1385,
+      "PA_MPJPE_mm": 46.63087615806622
+    },
+    "downtown_rampAndStairs_00": {
+      "n": 1954,
+      "PA_MPJPE_mm": 56.34401250060689
+    },
+    "downtown_runForBus_00": {
+      "n": 1302,
+      "PA_MPJPE_mm": 52.232966837233924
+    },
+    "downtown_runForBus_01": {
+      "n": 1437,
+      "PA_MPJPE_mm": 66.2344342328675
+    },
+    "downtown_sitOnStairs_00": {
+      "n": 2631,
+      "PA_MPJPE_mm": 52.626225175849925
+    },
+    "downtown_stairs_00": {
+      "n": 1197,
+      "PA_MPJPE_mm": 63.31683556710035
+    },
+    "downtown_upstairs_00": {
+      "n": 825,
+      "PA_MPJPE_mm": 47.17526695041395
+    },
+    "downtown_walkBridge_01": {
+      "n": 1182,
+      "PA_MPJPE_mm": 44.298063167659926
+    },
+    "downtown_walkUphill_00": {
+      "n": 387,
+      "PA_MPJPE_mm": 44.89834428674509
+    },
+    "downtown_walking_00": {
+      "n": 2594,
+      "PA_MPJPE_mm": 52.14282318214196
+    },
+    "downtown_warmWelcome_00": {
+      "n": 1122,
+      "PA_MPJPE_mm": 64.06683409393634
+    },
+    "downtown_weeklyMarket_00": {
+      "n": 1055,
+      "PA_MPJPE_mm": 47.945786223105564
+    },
+    "downtown_windowShopping_00": {
+      "n": 1821,
+      "PA_MPJPE_mm": 44.496857077869684
+    },
+    "flat_guitar_01": {
+      "n": 748,
+      "PA_MPJPE_mm": 60.36081947705571
+    },
+    "flat_packBags_00": {
+      "n": 1273,
+      "PA_MPJPE_mm": 64.67982670780314
+    },
+    "office_phoneCall_00": {
+      "n": 1524,
+      "PA_MPJPE_mm": 45.326043123588434
+    },
+    "outdoors_fencing_01": {
+      "n": 939,
+      "PA_MPJPE_mm": 55.91377958820054
+    }
+  }
+}

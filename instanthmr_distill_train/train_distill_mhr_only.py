@@ -181,6 +181,16 @@ class DistillConfig:
     warmup_epochs: int = 3
     grad_clip: float = 1.0          
     anomaly_loss_threshold: float = 100.0  
+    # A skipped step updates NOTHING — not the weights, not the EMA, not the LR
+    # schedule (they all live behind the same `continue`).  So a model that is
+    # anomalous on every batch is frozen for good: the loss can never come back
+    # under the threshold and the run idles until early stopping, which took
+    # ~139 wasted epochs the one time it happened.  After this many CONSECUTIVE
+    # skips, roll the raw weights back to the EMA copy, scale the LR down and
+    # clear the optimiser moments; give up after `max_ema_rollbacks` attempts.
+    anomaly_skip_patience: int = 50
+    anomaly_rollback_lr_decay: float = 0.5
+    max_ema_rollbacks: int = 3
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -837,6 +847,42 @@ class DistillationLoss(nn.Module):
         losses['total_loss'] = sum(losses.values())
         return losses
 
+def format_loss_terms(losses, top_k: int = 5) -> str:
+    """The largest individual loss terms, for diagnosing an anomalous batch.
+
+    The anomaly guard only ever printed the total, which says nothing about
+    which head blew up.  The 2D terms are bounded (`joints_2d` is a SimCC
+    expectation over bins in [-kp2d_range, kp2d_range], and the SimCC CE by
+    log(kp2d_bins)); the parameter regressions and the FK-derived keypoint loss
+    are not, so this line is what tells the two cases apart in the job log.
+    """
+    terms = [(k.replace("loss_", ""), float(v))
+             for k, v in losses.items() if k != "total_loss"]
+    terms.sort(key=lambda kv: kv[1], reverse=True)
+    return " ".join(f"{k}={v:.1f}" for k, v in terms[:top_k])
+
+
+def scale_lr(optimizer, factor: float, scheduler=None) -> None:
+    """Multiply every learning-rate anchor in place.
+
+    OneCycleLR does not read a stored LR — it interpolates between `initial_lr`,
+    `max_lr` and `min_lr` on the param groups, and those all scale linearly with
+    the peak.  Scaling the anchors therefore rescales the whole remaining
+    schedule while leaving its *position* (``last_epoch``) untouched, which is
+    what both the resume path and the rollback want.
+    """
+    for group in optimizer.param_groups:
+        for key in ("lr", "max_lr", "initial_lr", "min_lr"):
+            if key in group:
+                group[key] *= factor
+    if scheduler is not None:
+        # LRScheduler stashes these at construction and restores them from a
+        # checkpoint, so they have to move with the param groups.
+        for attr in ("base_lrs", "_last_lr"):
+            if hasattr(scheduler, attr):
+                setattr(scheduler, attr, [lr * factor for lr in getattr(scheduler, attr)])
+
+
 # ============================================================
 # Cell 10 — HMR Evaluation Metrics (MPJPE & PA-MPJPE)
 # ============================================================
@@ -1010,6 +1056,17 @@ def train_instant_hmr():
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        # Both loads above put the checkpoint's LR state back: `param_groups`
+        # (max_lr / initial_lr / min_lr) come from the optimizer state_dict and
+        # `base_lrs` from the scheduler's, which overwrites everything the
+        # freshly-built OneCycleLR just installed.  Without this, --lr is
+        # SILENTLY IGNORED on every resume.  Re-apply the requested peak by
+        # rescaling the anchors, keeping the schedule's shape and position.
+        ckpt_max_lr = float(optimizer.param_groups[0].get("max_lr", cfg.lr))
+        if ckpt_max_lr > 0.0 and abs(ckpt_max_lr - cfg.lr) > 1e-12:
+            scale_lr(optimizer, cfg.lr / ckpt_max_lr, scheduler)
+            print(f"   LR rescaled: checkpoint peak {ckpt_max_lr:.2e} -> requested "
+                  f"{cfg.lr:.2e} (current {optimizer.param_groups[0]['lr']:.2e})")
         start_epoch = ckpt.get("epoch", -1) + 1
         best_overall_pa = ckpt.get("val_pa_mpjpe", float('inf'))
         best_raw_pa = best_overall_pa
@@ -1052,6 +1109,11 @@ def train_instant_hmr():
 
     global_step = start_epoch * steps_per_epoch
     criterion.set_step(global_step)
+    # Skips are counted ACROSS epochs — a stalled run skips whole epochs at a
+    # time, so a per-epoch counter would never trip.
+    consecutive_skips = 0
+    ema_rollbacks = 0
+    training_aborted = False
     for epoch in range(start_epoch, cfg.epochs):
         model.train()
         tm = {'total': 0.0, '2d': 0.0, 'simcc': 0.0, '3d': 0.0, 'pose': 0.0, 'scale': 0.0, 'shape': 0.0, 'mhr': 0.0, 'reproj': 0.0}
@@ -1066,12 +1128,43 @@ def train_instant_hmr():
             losses = criterion(preds_fp32, batch)
             loss = losses['total_loss']
             loss_val = loss.item()
+
+            skip_reason = None
             if math.isnan(loss_val) or math.isinf(loss_val):
-                print("⚠️ WARNING: NaN/Inf loss detected! Skipping step.")
+                skip_reason = "NaN/Inf loss detected!"
+            elif loss_val > cfg.anomaly_loss_threshold:
+                skip_reason = f"anomalous loss {loss_val:.1f} > {cfg.anomaly_loss_threshold}"
+
+            if skip_reason is not None:
+                consecutive_skips += 1
+                print(f"⚠️ WARNING: {skip_reason} — skipping step. "
+                      f"[{consecutive_skips} in a row] {format_loss_terms(losses)}")
+                if consecutive_skips >= cfg.anomaly_skip_patience:
+                    if ema_rollbacks >= cfg.max_ema_rollbacks:
+                        print(f"\n🛑 Aborting: still stuck after {cfg.max_ema_rollbacks} EMA "
+                              f"rollback(s). The best RAW / EMA checkpoints on disk are "
+                              f"unaffected, and the ONNX export still runs off "
+                              f"best_student_model_v3.pth — inspect the loss terms above "
+                              f"before relaunching.")
+                        training_aborted = True
+                        break
+                    ema_rollbacks += 1
+                    print(f"\n🚑 {consecutive_skips} consecutive skipped steps: the raw weights "
+                          f"are outside the valid MHR region and CANNOT recover on their own, "
+                          f"because a skipped step updates neither the weights nor the LR.\n"
+                          f"   Rolling back to the EMA weights "
+                          f"(attempt {ema_rollbacks}/{cfg.max_ema_rollbacks}), scaling the LR by "
+                          f"{cfg.anomaly_rollback_lr_decay} and clearing the optimiser moments.")
+                    model.load_state_dict(ema_model.module.state_dict())
+                    # The Adam moments are what drove the model out of the valid
+                    # region; carrying them over would walk straight back out.
+                    optimizer.state.clear()
+                    scale_lr(optimizer, cfg.anomaly_rollback_lr_decay, scheduler)
+                    print(f"   LR is now {optimizer.param_groups[0]['lr']:.2e}", flush=True)
+                    consecutive_skips = 0
                 continue
-            if loss_val > cfg.anomaly_loss_threshold:
-                print(f"⚠️ WARNING: anomalous loss {loss_val:.1f} > {cfg.anomaly_loss_threshold} — skipping step.")
-                continue
+
+            consecutive_skips = 0
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -1096,6 +1189,8 @@ def train_instant_hmr():
             pbar.set_postfix({'Tot': f"{loss.item():.3f}",
                               'MHR': f"{losses.get('loss_mhr_joints', torch.tensor(0)).item():.3f}"})
         pbar.close()
+        if training_aborted:
+            break
         avg_train = {k: v / max(nb, 1) for k, v in tm.items()}
 
         raw_val, raw_hmr, n_raw = run_validation(model, "raw", epoch)

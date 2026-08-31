@@ -3,11 +3,22 @@
 InstantHMR takes a 224x224 person crop and a 3-vector CLIFF condition
 (bbox center / scale in full-frame coords) and returns mhr_params, shape,
 camera translation, and 70 joints in 2D (crop space) and 3D (camera coords,
-body-centred, metres, Y-down).
+rig-local, metres, Y-down).
 
 This module wraps the ONNX session and the per-person preprocessing — square
 crop, CLIFF cond, ImageNet normalisation, and re-projection of joints back
 into full-frame pixels.
+
+Two graph layouts are supported, and the session tells them apart by itself:
+
+  * **5 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d, joints_3d)``
+    — the student has its own 3D coordinate head (``train_distill.py`` and the
+    optimized / correctives scripts).
+  * **4 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d)`` — the
+    MHR-only student (``train_distill_mhr_only.py``) has no 3D head, exactly
+    like the SAM3D teacher. Its 70 keypoints are derived here by running the
+    MHR skeleton forward on the predicted parameters, so such a model needs an
+    MHR backend (see :mod:`instanthmr.mhr_renderer`) passed as ``mhr=``.
 """
 
 from __future__ import annotations
@@ -27,6 +38,23 @@ INPUT_SIZE = 224
 CROP_EXPAND = 1.2  # square crop around the detector bbox, matching training
 
 
+def onnx_output_names(onnx_path: str | Path) -> Optional[list[str]]:
+    """Read a graph's output names without creating an inference session.
+
+    Lets a caller know whether it must supply an MHR backend *before* paying for
+    session creation and detector loading. Returns ``None`` when the ``onnx``
+    package is unavailable or the file cannot be parsed — callers should then
+    fall back to letting :class:`InstantHMR` decide.
+    """
+    try:
+        import onnx
+
+        model = onnx.load(str(onnx_path), load_external_data=False)
+        return [o.name for o in model.graph.output]
+    except Exception:  # noqa: BLE001 — purely advisory
+        return None
+
+
 @dataclass
 class HMRPrediction:
     """Per-person outputs from one InstantHMR forward pass.
@@ -36,7 +64,9 @@ class HMRPrediction:
     Attributes:
         bbox: (4,) raw detector bbox [x1, y1, x2, y2].
         confidence: detection confidence in [0, 1].
-        joints_3d_local: (70, 3) body-centred joints, metres, Y-down.
+        joints_3d_local: (70, 3) rig-local joints, metres, Y-down. Either read
+            straight from the model's 3D head, or regressed from the MHR
+            skeleton when the graph has no such head.
         joints_3d_cam: (70, 3) joints in camera space (= local + cam_trans).
         joints_2d: (70, 2) joints projected into full-frame pixel coords.
         cam_trans: (3,) camera translation [tx, ty, tz], metres.
@@ -67,6 +97,15 @@ class HMRPrediction:
 class InstantHMR:
     """ONNX wrapper for the InstantHMR model.
 
+    Args:
+        onnx_path: path to the exported graph.
+        device: ``"cuda"``, ``"coreml"`` or ``"cpu"``.
+        providers: explicit onnxruntime execution providers (overrides *device*).
+        mhr: MHR backend used to derive ``joints_3d`` when the graph has no 3D
+            head. Any object exposing ``keypoints(mhr_params, shape_params)``
+            works; see :func:`instanthmr.mhr_renderer.build_mhr`. Ignored for
+            5-output graphs.
+
     Example
     -------
         hmr = InstantHMR("models/instanthmr.onnx")
@@ -79,6 +118,7 @@ class InstantHMR:
         onnx_path: str | Path,
         device: str = "cuda",
         providers: Optional[list[str]] = None,
+        mhr: object | None = None,
     ):
         import onnxruntime as ort
 
@@ -116,8 +156,42 @@ class InstantHMR:
         out_names = [o.name for o in self.session.get_outputs()]
         self._in_image = in_names[0]   # "image"
         self._in_cliff = in_names[1]   # "cliff_cond"
-        # Output order from export: mhr_params, shape_params, cam_trans, joints_2d, joints_3d
+        # Output order from export: mhr_params, shape_params, cam_trans,
+        # joints_2d[, joints_3d]. The MHR-only student stops after joints_2d.
         self._out_names = out_names
+        self.has_joints_3d_head = "joints_3d" in out_names or len(out_names) >= 5
+        self._mhr = mhr
+
+    @property
+    def derives_joints_3d(self) -> bool:
+        """True when the 70 keypoints must come from an MHR forward pass."""
+        return not self.has_joints_3d_head
+
+    def set_mhr(self, mhr: object | None) -> None:
+        """Attach (or replace) the MHR backend used to derive ``joints_3d``."""
+        self._mhr = mhr
+
+    def _joints_3d(self, mhr_params: np.ndarray, shape_params: np.ndarray) -> np.ndarray:
+        """Regress the 70 keypoints from predicted MHR parameters.
+
+        Mirrors ``train_distill_mhr_only.MHRForwardPass.get_native_keypoints``:
+        skeleton forward, cm -> m, Y/Z flip, then the (70, 127) affine map. The
+        student was trained through exactly this operator, so any other
+        keypoint definition would silently shift the predictions.
+        """
+        if self._mhr is None:
+            raise RuntimeError(
+                "this ONNX graph has no 'joints_3d' output — it comes from "
+                "train_distill_mhr_only.py, where the 3D keypoints are derived from "
+                "the MHR forward pass.\n"
+                "Pass an MHR backend, e.g.\n"
+                "    from instanthmr.mhr_renderer import build_mhr\n"
+                "    InstantHMR(onnx, mhr=build_mhr(script_path='checkpoints/mhr_model.pt'))\n"
+                "or run demo.py with --mhr-model / --mhr-assets."
+            )
+        return np.asarray(
+            self._mhr.keypoints(mhr_params, shape_params), dtype=np.float32,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -154,12 +228,15 @@ class InstantHMR:
                 self._in_cliff: cliff_cond[np.newaxis],   # (1, 3)
             },
         )
-        # Order: mhr_params, shape_params, cam_trans, joints_2d, joints_3d
+        # Order: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
         mhr_params = outs[0][0].astype(np.float32)
         shape_params = outs[1][0].astype(np.float32)
         cam_trans = outs[2][0].astype(np.float32)
         joints_2d_norm = outs[3][0].astype(np.float32)    # (70, 2) in [-1, 1]
-        joints_3d_local = outs[4][0].astype(np.float32)   # (70, 3) body-centred
+        if self.has_joints_3d_head:
+            joints_3d_local = outs[4][0].astype(np.float32)   # (70, 3) rig-local
+        else:
+            joints_3d_local = self._joints_3d(mhr_params, shape_params)
 
         # Re-project the 2D head from normalised crop space → full-frame pixels.
         crop_px = (joints_2d_norm + 1.0) * 0.5 * INPUT_SIZE
@@ -238,7 +315,12 @@ class InstantHMR:
         shape_params_b = outs[1].astype(np.float32, copy=False)
         cam_trans_b = outs[2].astype(np.float32, copy=False)
         joints_2d_norm_b = outs[3].astype(np.float32, copy=False)
-        joints_3d_local_b = outs[4].astype(np.float32, copy=False)
+        if self.has_joints_3d_head:
+            joints_3d_local_b = outs[4].astype(np.float32, copy=False)
+        else:
+            # One batched MHR skeleton forward for the whole frame (~0.9 ms),
+            # including the zero-padded slots — they are discarded below.
+            joints_3d_local_b = self._joints_3d(mhr_params_b, shape_params_b)
 
         f = math.sqrt(h * h + w * w)
         focal_length = np.array([f, f], dtype=np.float32)

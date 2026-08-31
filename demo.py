@@ -8,21 +8,31 @@ drawn on top, and live latency plots for RF-DETR, InstantHMR, MHR mesh
 rendering, and total pipeline cost.
 
 Optionally renders a full MHR body mesh per person by decoding the
-``mhr_params`` and ``shape_params`` outputs through Meta's MHR model:
+``mhr_params`` and ``shape_params`` outputs through Meta's MHR model, either
+from the TorchScript rig used by the distillation (``--mhr-model``) or from the
+unpacked asset folder (``--mhr-assets``). See ``instanthmr/mhr_renderer.py``.
 
-    python demo.py --image photo.jpg \\
-        --mhr-assets models/mhr_assets
-
-See ``instanthmr/mhr_renderer.py`` for setup instructions (assets download,
-MHR package installation).
+MHR-only checkpoints
+--------------------
+A model exported from ``train_distill_mhr_only.py`` has FOUR ONNX outputs — it
+has no 3D coordinate head, so its 70 keypoints are derived from the MHR forward
+pass, exactly like the SAM3D teacher does. Such a model therefore *requires* an
+MHR rig; when none is requested explicitly the demo falls back to
+``checkpoints/mhr_model.pt``.
 
 Usage
 -----
-    # Single image (skeleton only)
+    # Single image (skeleton only; needs a 5-output model)
     python demo.py --image path/to/photo.jpg
 
-    # Single image with MHR mesh
-    python demo.py --image path/to/photo.jpg --mhr-assets models/mhr_assets
+    # Single image with the MHR mesh, from the TorchScript rig
+    python demo.py --image path/to/photo.jpg --mhr-model
+
+    # MHR-only student: the rig is mandatory and auto-selected
+    python demo.py --image path/to/photo.jpg --model models/instanthmr_mhr_only.onnx
+
+    # Same, but decoding the mesh from the asset folder at a chosen LOD
+    python demo.py --image path/to/photo.jpg --mhr-assets models/mhr_assets --mhr-lod 3
 
     # Video file
     python demo.py --video path/to/clip.mp4
@@ -40,7 +50,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from instanthmr import PosePipeline
+from instanthmr import PosePipeline, onnx_output_names
+from instanthmr.mhr_renderer import DEFAULT_MHR_SCRIPT
 from instanthmr.visualizer import RerunVisualizer
 
 
@@ -105,6 +116,16 @@ def parse_args() -> argparse.Namespace:
         help="Don't spawn the Rerun viewer GUI (useful when only saving .rrd).",
     )
     p.add_argument(
+        "--mhr-model", type=str, nargs="?", default=None, const=DEFAULT_MHR_SCRIPT,
+        metavar="PT",
+        help=(
+            "Decode the body mesh with the TorchScript MHR rig used by the "
+            "distillation (bare flag = checkpoints/mhr_model.pt). Needs only "
+            "PyTorch, so it works regardless of the pymomentum build. Takes "
+            "precedence over --mhr-assets."
+        ),
+    )
+    p.add_argument(
         "--mhr-assets", type=str, default=None, metavar="DIR",
         help=(
             "Path to the unpacked MHR assets folder. When provided, runs a "
@@ -116,15 +137,24 @@ def parse_args() -> argparse.Namespace:
         "--mhr-lod", type=int, default=3, metavar="N",
         choices=range(7),
         help=(
-            "MHR level-of-detail (0=73 639 verts … 6=595 verts). "
-            "Default: 3 (4 899 verts)."
+            "MHR level-of-detail for --mhr-assets (0=73 639 verts … 6=595 "
+            "verts). Default: 3 (4 899 verts). The TorchScript rig has a fixed "
+            "LOD (18 439 verts) and ignores this."
+        ),
+    )
+    p.add_argument(
+        "--mesh-alpha", type=float, default=0.35, metavar="A",
+        help=(
+            "Body-mesh opacity in [0, 1] (default: 0.35). Applied as a Rerun "
+            "albedo factor so the 70 keypoints stay visible inside the body; "
+            "raise it towards 1.0 for a solid mesh."
         ),
     )
 
     return p.parse_args()
 
 
-def build_pipeline(args: argparse.Namespace) -> PosePipeline:
+def resolve_model_path(args: argparse.Namespace) -> Path:
     model_path = Path(args.model)
     if not model_path.exists():
         sys.stderr.write(
@@ -133,23 +163,70 @@ def build_pipeline(args: argparse.Namespace) -> PosePipeline:
             "        --model /path/to/instanthmr.onnx\n\n"
         )
         sys.exit(1)
+    return model_path
 
+
+def build_pipeline(args: argparse.Namespace, mhr=None) -> PosePipeline:
     return PosePipeline(
-        onnx_path=model_path,
+        onnx_path=resolve_model_path(args),
         device=args.device,
         detector_variant=args.detector_variant,
         det_confidence=args.det_confidence,
         max_persons=args.max_persons,
         detector_stride=args.detector_stride,
         batch_persons=not args.no_batch_persons,
+        mhr=mhr,
     )
 
 
-def build_mhr_renderer(args: argparse.Namespace):
-    if args.mhr_assets is None:
-        return None
+def _model_needs_mhr(model_path: Path) -> bool:
+    """True when the graph has no ``joints_3d`` output (MHR-only student).
 
-    assets_path = Path(args.mhr_assets)
+    Cheap protobuf peek, so the decision is made before any session or detector
+    is loaded. An unreadable graph is treated as "does not need MHR" — the
+    pipeline then raises a precise error of its own.
+    """
+    names = onnx_output_names(model_path)
+    return names is not None and "joints_3d" not in names
+
+
+def build_mhr(args: argparse.Namespace, required: bool = False):
+    """Build the MHR rig requested on the command line.
+
+    ``--mhr-model`` (TorchScript) wins over ``--mhr-assets`` (pip package).
+    When *required* — i.e. the ONNX has no 3D head — and neither flag was given,
+    fall back to the TorchScript rig that shipped with the training code.
+    """
+    script_path = args.mhr_model
+    assets_folder = args.mhr_assets
+
+    if script_path is None and assets_folder is None:
+        if not required:
+            return None
+        script_path = DEFAULT_MHR_SCRIPT
+        print(
+            f"[info] {Path(args.model).name} has no 'joints_3d' output "
+            "(MHR-only student): its 70 keypoints are derived from the MHR "
+            f"forward pass.\n       Using {script_path}; override with "
+            "--mhr-model / --mhr-assets."
+        )
+
+    if script_path is not None:
+        path = Path(script_path)
+        if not path.exists():
+            sys.stderr.write(
+                f"\n[error] MHR TorchScript rig not found: {path}\n"
+                "        This is the ~700 MB mhr_model.pt the distillation loads with\n"
+                "        torch.jit.load; see instanthmr_distill_train/checkpoints/README.md.\n"
+                "        Alternatively use --mhr-assets with the unpacked MHR asset folder.\n\n"
+            )
+            sys.exit(1)
+        from instanthmr.mhr_renderer import MHRScriptRenderer
+
+        print(f"Loading MHR body model (TorchScript) from {path} …")
+        return MHRScriptRenderer(path, device=args.device)
+
+    assets_path = Path(assets_folder)
     if not assets_path.exists():
         sys.stderr.write(
             f"\n[error] MHR assets folder not found: {assets_path}\n"
@@ -172,6 +249,8 @@ def build_mhr_renderer(args: argparse.Namespace):
             "    pip install pymomentum-gpu          # NVIDIA GPU\n"
             "    pip install pymomentum-cpu          # macOS / CPU-only\n"
             "\n"
+            "  Or skip it entirely and use --mhr-model, which needs only torch.\n"
+            "\n"
             "  See README.md §'MHR body mesh' for full setup instructions.\n\n"
         )
         sys.exit(1)
@@ -184,13 +263,24 @@ def build_mhr_renderer(args: argparse.Namespace):
     )
 
 
-def build_visualizer(args: argparse.Namespace, mhr_renderer=None) -> RerunVisualizer:
-    return RerunVisualizer(
+def build_all(args: argparse.Namespace):
+    """Build the MHR rig, the pipeline and the visualizer, in that order.
+
+    The rig comes first because an MHR-only graph cannot produce 3D keypoints
+    without it — the pipeline takes it as a constructor argument rather than
+    the visualizer alone.
+    """
+    model_path = resolve_model_path(args)
+    mhr = build_mhr(args, required=_model_needs_mhr(model_path))
+    pipeline = build_pipeline(args, mhr=mhr)
+    viz = RerunVisualizer(
         application_id="instanthmr_demo",
         spawn_viewer=not args.no_spawn,
         save_path=args.save_rrd,
-        mhr_renderer=mhr_renderer,
+        mhr_renderer=mhr,
+        mesh_alpha=args.mesh_alpha,
     )
+    return pipeline, viz
 
 
 def _print_timings(
@@ -228,9 +318,7 @@ def run_image(args: argparse.Namespace) -> None:
         sys.exit(f"[error] cv2.imread failed for {image_path}")
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    pipeline = build_pipeline(args)
-    mhr = build_mhr_renderer(args)
-    viz = build_visualizer(args, mhr)
+    pipeline, viz = build_all(args)
 
     result = pipeline.predict(rgb)
 
@@ -261,9 +349,7 @@ def run_video(args: argparse.Namespace) -> None:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"video: {video_path.name}, {total} frames @ {fps:.1f} fps")
 
-    pipeline = build_pipeline(args)
-    mhr = build_mhr_renderer(args)
-    viz = build_visualizer(args, mhr)
+    pipeline, viz = build_all(args)
 
     frame_idx = 0
     sent = 0
@@ -341,9 +427,7 @@ def run_camera(args: argparse.Namespace) -> None:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     print(f"camera {args.camera}: {width}x{height} @ {fps:.1f} fps — Ctrl+C to stop")
 
-    pipeline = build_pipeline(args)
-    mhr = build_mhr_renderer(args)
-    viz = build_visualizer(args, mhr)
+    pipeline, viz = build_all(args)
 
     frame_idx = 0
     det_times: list[float] = []
