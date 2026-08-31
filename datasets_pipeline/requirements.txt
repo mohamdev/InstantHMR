@@ -1,0 +1,8 @@
+# On top of the training env (numpy, opencv-python, tqdm).
+pyarrow>=14
+pandas>=2
+huggingface_hub>=0.23   # fetch_annotations.py; needs an accepted licence + token
+# Optional, per dataset:
+#   gdown         egohumans (Google Drive folder)
+#   opendatalab   aic       (odl login && odl get OpenDataLab/AI_Challenger)
+#   ego4d         egoexo4d  (egoexo -o $DEST --parts sam_3d_body)
