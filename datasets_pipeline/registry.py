@@ -50,6 +50,11 @@ class Dataset:
     image_root_suffix: str = ""
     needs_undistort: bool = False
     approx_gb: float = 0.0            # download size
+    # Many HPC sites mirror the big public datasets into a read-only shared
+    # space. Set SHARED_DATASET_DIR and check there before downloading —
+    # presence of a directory is not enough, the referenced SUBSET has to be
+    # there in the layout image_relpath() expects.
+    shared_mirror: str = ""
     notes: str = ""
     # Per-scene/shard archives, for streaming one at a time. Empty means the
     # dataset arrives as one blob.
@@ -77,8 +82,12 @@ DATASETS: dict[str, Dataset] = {
         method="direct",
         urls=("http://images.cocodataset.org/zips/train2014.zip",),
         approx_gb=13.5,
+        shared_mirror="COCO",
         notes="Only train2014 is referenced by coco_train — val2014/test2014 are "
-              "a waste of 9 GB. Verified over every image string in shard 0.",
+              "a waste of 9 GB. Verified over every image string in shard 0.\n"
+              "If your site mirrors COCO, confirm the mirror carries train2014 "
+              "and not just 2017 before trusting it, then build with "
+              "--originals link instead of downloading.",
     ),
     "mpii": Dataset(
         name="mpii",
@@ -168,6 +177,7 @@ DATASETS: dict[str, Dataset] = {
         splits=("sa1b_train",),
         method="links_file",
         approx_gb=0.0,
+        shared_mirror="SegmentAnything_1B",
         notes="1,850 annotation shards ~= 3.4M person crops — bigger than every "
               "other split combined. Accept the terms at "
               "https://ai.meta.com/datasets/segment-anything-downloads/ to get "
@@ -184,8 +194,16 @@ DATASETS: dict[str, Dataset] = {
               "only 0.3% of hands are fully visible.\n"
               "Any prefix of the tar list is a valid subset — each tar is "
               "self-contained and the builder skips rows whose image is absent "
-              "— so stream it and stop whenever. But spend the bandwidth on "
-              "egoexo4d first.",
+              "— so stream it and stop whenever.\n"
+              "If your site already mirrors SA-1B the download cost is zero and "
+              "it becomes the largest body corpus here by far (3.4M persons, 4x "
+              "everything else combined). A mirror that unpacked the 1000 tars "
+              "in place needs index_sa1b.py + build_split.py --image-index, "
+              "because the parquet asks for a flat sa_<id>.jpg. Its 3D "
+              "keypoints and MHR params are 100% complete; only the 2D array is "
+              "sparse (body 100%, feet 97%, hands 8%) — see the label trap in "
+              "README.md. Near-useless for hand CROPS either way: 0.3% of hands "
+              "have all 21 2D keypoints.",
     ),
 }
 

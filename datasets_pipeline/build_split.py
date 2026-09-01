@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -70,6 +71,41 @@ from tools.parquet_to_npz import (  # noqa: E402
 # instanthmr_distill_train/train_distill_mhr_only.py.
 RIGHT_HAND_KPS = list(range(21, 42))
 LEFT_HAND_KPS = list(range(42, 63))
+
+ID_RE = re.compile(r"^sa_(\d+)\.jpe?g$", re.I)
+
+
+class ImageIndex:
+    """Resolve a flat `sa_<id>.jpg` to its per-tar subfolder.
+
+    Only needed when a mirror unpacked SA-1B's 1000 distribution tars in place
+    rather than flattening them. Built by index_sa1b.py.
+    """
+
+    def __init__(self, path: Path):
+        z = np.load(path, allow_pickle=True)
+        self.dirs = [str(d) for d in z["dirs"]]
+        self.mode = str(z["mode"])
+        if self.mode == "ranges":
+            self.lo, self.hi, self.folder = z["lo"], z["hi"], z["folder"]
+        else:
+            self.ids, self.folder = z["ids"], z["folder"]
+
+    def resolve(self, image: str) -> str | None:
+        m = ID_RE.match(os.path.basename(image))
+        if not m:
+            return None
+        n = int(m.group(1))
+        if self.mode == "ranges":
+            k = int(np.searchsorted(self.lo, n, side="right")) - 1
+            if k < 0 or n > self.hi[k]:
+                return None
+            return f"{self.dirs[self.folder[k]]}/{image}"
+        k = int(np.searchsorted(self.ids, n))
+        if k >= self.ids.size or self.ids[k] != n:
+            return None
+        return f"{self.dirs[self.folder[k]]}/{image}"
+
 
 
 def hand_boxes(joints_2d: np.ndarray,
@@ -165,6 +201,13 @@ def parse_args() -> argparse.Namespace:
                    help="copy: self-contained, prunes unreferenced source images. "
                         "link/hardlink: free, but the source root must survive.")
 
+    p.add_argument("--image-index", type=Path, default=None,
+                   help="npz from index_sa1b.py, for a SA-1B mirror that kept "
+                        "the per-tar sa_NNNNNN/ folders instead of a flat tree")
+    p.add_argument("--shard-slice", default=None, metavar="I/N",
+                   help="process only shard I of N (0-based) — for a Slurm job "
+                        "array. Resume-safety makes overlap harmless, but a "
+                        "clean split avoids duplicated decoding.")
     p.add_argument("--image-prefix", default=None,
                    help="only rows whose `image` starts with this — the hook "
                         "stream_archives.py uses to build one archive at a time")
@@ -194,11 +237,24 @@ def main() -> None:
     # Let the unmodified training script discover this folder.
     compat = out_dir / "images"
     if not compat.exists():
-        os.symlink("body_crops", compat)
+        try:
+            os.symlink("body_crops", compat)
+        except FileExistsError:
+            pass  # another array task won the race
 
     parquets = sorted(args.annotation_dir.glob("*.parquet"))
     if not parquets:
         sys.exit(f"no parquet files in {args.annotation_dir}")
+    if args.shard_slice:
+        i, n = (int(x) for x in args.shard_slice.split("/"))
+        if not 0 <= i < n:
+            sys.exit(f"--shard-slice {args.shard_slice}: need 0 <= I < N")
+        parquets = parquets[i::n]
+        print(f"shard slice {i}/{n}: {len(parquets)} parquet file(s)")
+
+    index = ImageIndex(args.image_index) if args.image_index else None
+    if index:
+        print(f"image index: {len(index.dirs)} folders, mode={index.mode}")
 
     ext = args.crop_format
     imwrite_params = ([int(cv2.IMWRITE_JPEG_QUALITY), args.jpg_quality]
@@ -232,6 +288,12 @@ def main() -> None:
                 continue
 
             relpath = image_relpath(dataset, image)
+            if index is not None:
+                resolved = index.resolve(image)
+                if resolved is None:
+                    st["missing_image"] += 1
+                    continue
+                relpath = resolved
             if image not in img_cache:
                 bgr = cv2.imread(str(args.image_dir / relpath))
                 img_cache[image] = (cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)

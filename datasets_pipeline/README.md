@@ -62,14 +62,14 @@ Everything is resume-safe: re-running skips crops already on disk.
 
 | dataset | images | route | undistort |
 |---|---|---|---|
-| coco | 13.5 GB | `wget` train2014.zip — **only train2014 is referenced** | no |
+| coco | 13.5 GB (often mirrored) | `wget` train2014.zip — **only train2014 is referenced** | no |
 | mpii | 12.1 GB | `wget` mpii_human_pose_v1.tar.gz | no |
 | aic | 36.4 GB | OpenDataLab CLI (login) — where this corpus came from before | no |
 | 3dpw | 4.6 GB | licence form → imageFiles.zip | no |
 | harmony4d | 352 GB | HF `Jyun-Ting/Harmony4D`, ungated, per-scene zips | **yes** |
 | egohumans | 107 GB referenced (550 GB advertised) | Google Drive, per-take tar.gz → `gdown --folder` | **yes** |
 | egoexo4d | ~8 GB (procedure) | `egoexo -o $DEST --parts sam_3d_body` (signed licence) | no |
-| sa1b | ~11 TB | terms → `links.txt` → `--links-file` | no |
+| sa1b | ~11 TB (often mirrored) | terms → `links.txt` → `--links-file` | no |
 
 `fetch_images.py` handles the first two and harmony4d directly. For the rest it
 prints the exact commands and exits 2 rather than pretending.
@@ -173,8 +173,15 @@ corpus.
 
 ## SA-1B
 
-Accept the terms at <https://ai.meta.com/datasets/segment-anything-downloads/>
-to get `links.txt` (one `sa_NNNNNN.tar <signed-url>` per line), then:
+**Check your cluster's shared dataset mirror first** — SA-1B is commonly
+mirrored, and if it is, everything below is moot. A mirror that unpacked the
+1000 tars in place stores `sa_000000/`, `sa_000001/`, ... while the parquet asks
+for a flat `sa_<id>.jpg`; `index_sa1b.py` walks it once and
+`build_split.py --image-index` resolves against that index.
+
+Otherwise, accept the terms at
+<https://ai.meta.com/datasets/segment-anything-downloads/> to get `links.txt`
+(one `sa_NNNNNN.tar <signed-url>` per line), then:
 
 ```bash
 python datasets_pipeline/stream_archives.py --dataset sa1b \
@@ -184,8 +191,8 @@ python datasets_pipeline/stream_archives.py --dataset sa1b \
     -- --originals none --crop-format jpg
 ```
 
-Any prefix of the tar list is a valid dataset, so you can stop whenever. But
-the measured economics are poor, and I would not start here:
+Any prefix of the tar list is a valid dataset, so you can stop whenever. If you
+are paying for the bandwidth, the economics are poor:
 
 - References are spread **uniformly over all 1000 tars** — 994 of 1000 id
   blocks are hit by just 3% of the annotations — so there is no dense subset to
@@ -193,17 +200,36 @@ the measured economics are poor, and I would not start here:
 - Only **11.4%** of SA-1B is referenced. Each ~10 GB tar yields ~1,270 useful
   frames ≈ 3,400 crops, i.e. **~2.3 MB of download per crop** against AIC's
   0.13 MB. The full 3.4M crops cost ~11 TB.
-- It is the one split with real visibility flags: a mean of **44 of 70**
-  keypoints are literal `(0, 0)` placeholders, and only **0.3%** of hands are
-  fully visible.
 
-That last point is a trap for any converter. `tools/parquet_to_npz.py` drops the
-visibility column (`joints_2d = kp2[:, :2]`), so a naive SA-1B build writes
-those placeholders as if they were observations at the image corner — poisoning
-the 2D loss and blowing every hand box out to the frame edge. `build_split.py`
-stores `joints_2d_vis` / `joints_3d_conf` and refuses to cut a hand crop unless
-all 21 of its keypoints are visible. Every other split is 100% visible, so this
-only bites on SA-1B.
+### The SA-1B label trap
+
+SA-1B is the one split whose keypoint arrays are not fully populated, and the
+two arrays differ:
+
+| | populated |
+|---|---|
+| `keypoints_3d` + `model_params` + `shape_params` | **100%** |
+| `keypoints_2d`, body (0–14) | 100% |
+| `keypoints_2d`, feet (15–20) | 97% |
+| `keypoints_2d`, hands (21–62) | **8%** |
+
+So the 3D supervision is complete and the split is fully usable — but the 2D
+array stores unobserved keypoints as literal `(0, 0)` with a graded confidence
+in the third column. `tools/parquet_to_npz.py` drops that column
+(`joints_2d = kp2[:, :2]`), so a naive build writes ~45 of 70 keypoints per
+person as observations at the image corner. Left unmasked that would drag every
+predicted hand keypoint to the top-left of the frame.
+
+`build_split.py` stores `joints_2d_vis` and `joints_3d_conf`, and refuses to cut
+a hand crop unless all 21 of that hand's keypoints are visible (true for 0.3% of
+SA-1B hands and 100% of every other split).
+
+`train_distill_mhr_only.py` consumes the mask: `loss_2d_native`,
+`loss_2d_simcc` and `loss_reproj` are weighted by `joints_2d_vis`, which
+defaults to all-ones when a folder does not carry it — so every existing
+`data/sam3d_gt_*` folder trains exactly as before (verified to float32
+rounding, 6e-8). On SA-1B, `vis > 0` is an exact gate for "this coordinate is
+real": zero exceptions in 183k keypoints measured.
 
 ## Datasets that do not fit: `stream_archives.py`
 
@@ -260,7 +286,7 @@ fingertips — an upper bound on what a hand branch could learn from them.
 | **egoexo4d_procedure** | ~350k | **16.1 mm** | **85.5%** | licence + CLI |
 | egoexo4d_physical | ~700k | 14.5 mm | 19.3% | licence + CLI |
 | harmony4d | 496k | 12.6 mm | 3.4% | 352 GB |
-| sa1b | 3.4M | 8.5 mm | 0.3% visible at all | ~11 TB |
+| sa1b | 3.4M | 8.5 mm | 0.3% visible at all | ~11 TB, or free if mirrored |
 | 3dpw | 22k | 7.5 mm | 71.4% | 4.6 GB |
 | mpii | 7k | 7.4 mm | 11.5% | 12.1 GB |
 | aic | 287k | 6.9 mm | 16.6% | 36.4 GB |

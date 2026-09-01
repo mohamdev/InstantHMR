@@ -368,6 +368,22 @@ class SAM3DStudentDataset(Dataset):
         joints_2d[:, 0] = (joints_2d[:, 0] / self.image_size) * 2.0 - 1.0
         joints_2d[:, 1] = (joints_2d[:, 1] / self.image_size) * 2.0 - 1.0
 
+        # Per-keypoint 2D visibility. Present only on folders built by
+        # datasets_pipeline/build_split.py; older folders (and every split
+        # except SA-1B) are fully observed, so the all-ones default reproduces
+        # the previous behaviour bit for bit.
+        #
+        # SA-1B is the one split that needs this: its keypoints_2d stores
+        # unobserved points as literal (0, 0) with a graded confidence in the
+        # third column — body 100% observed, feet 97%, hands 8%. Training on it
+        # without the mask drags every predicted hand keypoint to the top-left
+        # of the frame. The 3D keypoints and the MHR params are complete, so
+        # only the 2D losses need it.
+        if "joints_2d_vis" in ann:
+            joints_2d_vis = ann["joints_2d_vis"].astype(np.float32).copy()
+        else:
+            joints_2d_vis = np.ones(joints_2d.shape[0], dtype=np.float32)
+
         joints_3d = ann["joints_3d"].astype(np.float32).copy()
         cam_trans = ann["cam_trans"].astype(np.float32).copy()
 
@@ -422,6 +438,7 @@ class SAM3DStudentDataset(Dataset):
                 # Without this the 2D head gets contradictory left/right supervision
                 # and collapses symmetric joints toward the body midline.
                 joints_2d = joints_2d[FLIP_PERM]
+                joints_2d_vis = joints_2d_vis[FLIP_PERM]
                 cam_trans[0] = -cam_trans[0]
                 cx = orig_w - cx                  
             rad = math.radians(angle)
@@ -448,6 +465,7 @@ class SAM3DStudentDataset(Dataset):
             "cam_trans": torch.from_numpy(cam_trans).float(),                        
             "cam_focal": torch.from_numpy(ann["cam_focal_length"]).float(),          
             "joints_2d": torch.from_numpy(joints_2d).float(),                        
+            "joints_2d_vis": torch.from_numpy(joints_2d_vis).float(),                
             "joints_3d": torch.from_numpy(joints_3d).float(),                        
             "orig_shape": torch.tensor([orig_h, orig_w], dtype=torch.float32),       
             "bbox_square": sq_bbox,                                                  
@@ -720,7 +738,18 @@ class DistillationLoss(nn.Module):
         e = (pred - tgt).abs().flatten(1).mean(1)
         return self._mmean(e, mask)
 
-    def _simcc_ce(self, logits, tgt_2d):
+    @staticmethod
+    def _kp_weighted(per_kp, w_kp, m_sample=None):
+        """Mean of a (B, K) error under per-keypoint weights and a sample mask.
+
+        With w_kp all ones and no sample mask this is exactly `.mean()`, so the
+        masked 2D losses below are numerically identical to the unmasked ones
+        on every split that is fully observed.
+        """
+        w = w_kp if m_sample is None else w_kp * m_sample.view(-1, 1)
+        return (per_kp * w).sum() / w.sum().clamp_min(1e-6)
+
+    def _simcc_ce(self, logits, tgt_2d, w_kp=None):
         bins = torch.linspace(-self.cfg.kp2d_range, self.cfg.kp2d_range,
                               self.cfg.kp2d_bins, device=logits.device)
         tgt = tgt_2d.clamp(-self.cfg.kp2d_range, self.cfg.kp2d_range)
@@ -728,7 +757,10 @@ class DistillationLoss(nn.Module):
         label = torch.exp(-(d ** 2) / (2.0 * self.simcc_sigma ** 2))
         label = label / label.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         logp = F.log_softmax(logits, dim=-1)
-        return -(label * logp).sum(dim=-1).mean()
+        per_kp = -(label * logp).sum(dim=-1).mean(dim=-1)   # (B, K), mean over x/y
+        if w_kp is None:
+            return per_kp.mean()
+        return self._kp_weighted(per_kp, w_kp)
 
     def _project_3d_to_norm_2d(self, j3d, pred_cam_trans, targets):
         j3d_cam = j3d + pred_cam_trans.unsqueeze(1)
@@ -809,12 +841,26 @@ class DistillationLoss(nn.Module):
         tgt_2d = targets["joints_2d"]
         tgt_3d = targets["joints_3d"]
 
+        # Per-keypoint 2D observation weight. All-ones unless the dataset
+        # supplies `joints_2d_vis` (only SA-1B does), in which case the three
+        # 2D terms below skip the keypoints whose target is a (0, 0)
+        # placeholder. Measured on SA-1B: vis > 0 <=> the coordinate is real,
+        # with zero exceptions in 183k keypoints, so this gate is exact; the
+        # graded values (0.25 / 0.5 / 1.0) additionally down-weight the
+        # uncertain observations.
+        w_kp = targets.get("joints_2d_vis")
+        if w_kp is None:
+            w_kp = torch.ones_like(tgt_2d[..., 0])
+
         # 2D head — training-only auxiliary task, and the ONLY supervision that
         # survives a horizontal flip in full (targets["joints_2d"] is mirrored
-        # AND FLIP_PERM-permuted by the dataset, so it stays self-consistent).
-        losses['loss_2d_native'] = self.l1(pred_2d[..., :2], tgt_2d) * self.cfg.w_keypoints2d
+        # AND FLIP_PERM-permuted by the dataset, so it stays self-consistent —
+        # and so is joints_2d_vis).
+        e2d = F.smooth_l1_loss(pred_2d[..., :2], tgt_2d, reduction='none').mean(-1)
+        losses['loss_2d_native'] = self._kp_weighted(e2d, w_kp) * self.cfg.w_keypoints2d
         if "joints_2d_logits" in preds:
-            losses['loss_2d_simcc'] = self._simcc_ce(preds["joints_2d_logits"], tgt_2d) * self.cfg.w_simcc
+            losses['loss_2d_simcc'] = self._simcc_ce(
+                preds["joints_2d_logits"], tgt_2d, w_kp) * self.cfg.w_simcc
 
         # Main 3D loss, now on the MHR-derived keypoints.  Deliberately UNMASKED:
         # targets["joints_3d"] is mirrored + permuted under flip, and the MHR rest
@@ -842,7 +888,9 @@ class DistillationLoss(nn.Module):
         # need an extra FLIP_PERM + cx mirror that is not worth the complexity
         # for a 0.01-weight auxiliary term.
         pred_reproj = self._project_3d_to_norm_2d(_counter_rot_pts(pred_kp3d), cam_cr, targets)
-        losses['loss_reproj'] = self.m_l1(pred_reproj, tgt_2d, m_noflip) * self.cfg.w_reproj * self.fk_scale
+        e_reproj = (pred_reproj - tgt_2d).abs().mean(-1)
+        losses['loss_reproj'] = self._kp_weighted(
+            e_reproj, w_kp, m_noflip) * self.cfg.w_reproj * self.fk_scale
 
         losses['total_loss'] = sum(losses.values())
         return losses

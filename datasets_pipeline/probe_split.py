@@ -7,10 +7,13 @@ reads only the annotations and answers, before you spend the bandwidth:
   size      persons, unique frames, and how many GB of frames that implies.
             Totals extrapolate over the shards ON DISK, so fetch the whole
             split's annotations first if you want the true count.
-  labels    keypoint visibility health. NOT cosmetic: SA-1B stores invisible
+  labels    keypoint visibility, reported separately for 2D and 3D because
+            they differ. NOT cosmetic: SA-1B's 2D array stores unobserved
             keypoints as literal (0, 0) with a visibility column that
-            parquet_to_npz.py discards, so a naive build writes 44 of 70
+            parquet_to_npz.py discards, so a naive build writes ~45 of 70
             keypoints per person as fake observations at the image corner.
+            Its 3D array and MHR params are complete, so the split is
+            perfectly usable once the 2D losses are masked.
   hands     how many hands are fully visible and how big their crop would be
   signal    how far the finger poses sit from ONE constant hand pose, in mm at
             the fingertips — an upper bound on what a hand branch could learn
@@ -83,25 +86,31 @@ def probe(d: Path, shards: int, hand_expand: float, args) -> None:
     rows = 0
     frames: set[str] = set()
     all_vis = 0
-    zero_kps = []
+    vis3d = []
+    vis_body = []
+    vis_hand = []
     params: list[np.ndarray] = []
     spans: list[float] = []
     hands_seen = hands_full = 0
 
     for f in used:
         t = pq.read_table(f, columns=["image", "mhr_valid", "keypoints_2d",
-                                      "model_params"])
-        for im, mv, k, mp in zip(t.column("image").to_pylist(),
-                                 t.column("mhr_valid").to_pylist(),
-                                 t.column("keypoints_2d").to_pylist(),
-                                 t.column("model_params").to_pylist()):
+                                      "keypoints_3d", "model_params"])
+        for im, mv, k, k3, mp in zip(t.column("image").to_pylist(),
+                                     t.column("mhr_valid").to_pylist(),
+                                     t.column("keypoints_2d").to_pylist(),
+                                     t.column("keypoints_3d").to_pylist(),
+                                     t.column("model_params").to_pylist()):
             if not mv:
                 continue
             rows += 1
             frames.add(im)
             k = np.asarray(k, dtype=np.float32).reshape(70, 3)
             all_vis += bool((k[:, 2] > 0).all())
-            zero_kps.append(int(((k[:, 0] == 0) & (k[:, 1] == 0)).sum()))
+            vis_body.append(float((k[:15, 2] > 0).mean()))
+            vis_hand.append(float((k[21:63, 2] > 0).mean()))
+            vis3d.append(float(
+                (np.asarray(k3, dtype=np.float32).reshape(70, 4)[:, 3] > 0).mean()))
             params.append(np.asarray(mp, dtype=np.float32))
             for idx in (RIGHT_HAND_KPS, LEFT_HAND_KPS):
                 hands_seen += 1
@@ -125,9 +134,12 @@ def probe(d: Path, shards: int, hand_expand: float, args) -> None:
           f"({gb * 1000 / max(rows * scale, 1):.2f} MB per person crop){note}")
 
     pct = 100.0 * all_vis / max(rows, 1)
-    flag = "" if pct > 99 else "   <-- gate hand boxes on joints_2d_vis"
-    print(f"  all 70 kps visible : {pct:5.1f}%   "
-          f"mean (0,0) placeholders {np.mean(zero_kps):.1f}/70{flag}")
+    print(f"  2D kps visible     : {pct:5.1f}% of rows have all 70   "
+          f"(body {100 * np.mean(vis_body):.0f}%, hands {100 * np.mean(vis_hand):.0f}%)")
+    print(f"  3D kps valid       : {100 * np.mean(vis3d):5.1f}% of keypoints")
+    if pct <= 99:
+        print("      ^ mask the 2D losses with joints_2d_vis and gate hand "
+              "boxes on it; the 3D labels above are unaffected")
 
     if spans:
         s = np.array(spans)
