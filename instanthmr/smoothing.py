@@ -19,8 +19,17 @@ Two things the filter needs that the pipeline does not provide:
 * **Lookahead**, for ``mode="centered"``. A centred window has no phase lag
   but needs ``(window - 1) // 2`` future frames, so :meth:`TemporalSmoother.push`
   returns results delayed by that many frames and :meth:`flush` drains the
-  tail. Use ``mode="causal"`` for live sources, which trades phase lag for
-  zero latency.
+  tail. ``mode="causal"`` trades phase lag for zero latency.
+
+The moving average has one structural weakness: it is a *fixed*-cutoff filter,
+so it cannot tell jitter from fast intentional motion and lags during both. On
+a waving hand that is plainly visible. ``mode="1euro"`` fixes it with the
+1 Euro filter (Casiez, Roussel & Vogel, CHI 2012): an exponential smoother
+whose cutoff frequency rises with the signal's own speed. At rest the cutoff is
+low and jitter is crushed; during fast motion the cutoff opens up and the
+output tracks. It is causal, needs no lookahead, and is the right choice for
+demos and live camera. The centred moving average remains the right choice for
+benchmark numbers, since that is the filter NLF measured.
 
 Caveat on ``mhr_params``: these are MHR joint parameters (angles and scales),
 and this filter averages them linearly. That is well-behaved for continuous
@@ -53,6 +62,66 @@ SMOOTHED_FIELDS = (
     "mhr_params",
     "shape_params",
 )
+
+
+#: Per-field ``(mincutoff_hz, beta)`` for ``mode="1euro"``.
+#:
+#: ``beta`` scales a *speed*, so its right value depends on the field's units —
+#: this is the classic tuning trap with the 1 Euro filter. ``joints_2d`` is in
+#: full-frame pixels (a fast hand runs ~500-1500 px/s), the 3D fields are in
+#: metres (~1-3 m/s), ``mhr_params`` in radians and scale units. The values
+#: below put all of them at a comparable cutoff (~9 Hz) during fast motion
+#: while holding ~1 Hz at rest. ``shape_params`` gets beta 0 on purpose:
+#: identity does not change, so it should be filtered as hard as possible —
+#: the per-track limit of that idea is NLF's shared-beta-per-track fitting.
+ONE_EURO_DEFAULTS: dict[str, tuple[float, float]] = {
+    "joints_2d":       (1.0, 0.01),
+    "joints_3d_local": (1.0, 4.0),
+    "cam_trans":       (0.6, 2.0),
+    "mhr_params":      (1.0, 2.0),
+    "shape_params":    (0.3, 0.0),
+}
+
+
+class _OneEuro:
+    """1 Euro filter (Casiez, Roussel & Vogel, CHI 2012), vectorised.
+
+    Operates elementwise on an array of any shape, so every joint — indeed
+    every coordinate — adapts on its own speed. That is the property that
+    matters here: a still torso stays heavily smoothed in the same frame where
+    a waving hand is barely smoothed at all.
+    """
+
+    def __init__(self, mincutoff: float, beta: float, dcutoff: float = 1.0):
+        self.mincutoff = float(mincutoff)
+        self.beta = float(beta)
+        self.dcutoff = float(dcutoff)
+        self._x: np.ndarray | None = None
+        self._dx: np.ndarray | None = None
+        self._t: float | None = None
+
+    @staticmethod
+    def _alpha(cutoff, dt: float):
+        tau = 1.0 / (2.0 * np.pi * np.maximum(cutoff, 1e-6))
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x: np.ndarray, t: float) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        if self._x is None:
+            self._x, self._dx, self._t = x, np.zeros_like(x), t
+            return x
+        dt = t - self._t
+        if not (dt > 0.0):
+            # Repeated or non-monotonic timestamps would blow up the derivative;
+            # fall back to a nominal 30 fps step rather than dividing by zero.
+            dt = 1.0 / 30.0
+        self._t = t
+
+        a_d = self._alpha(self.dcutoff, dt)
+        self._dx = a_d * ((x - self._x) / dt) + (1.0 - a_d) * self._dx
+        a = self._alpha(self.mincutoff + self.beta * np.abs(self._dx), dt)
+        self._x = a * x + (1.0 - a) * self._x
+        return self._x
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -126,36 +195,53 @@ class _Tracker:
                 self._age.pop(t, None)
         return ids
 
+    @property
+    def active_ids(self) -> set[int]:
+        return set(self._boxes)
+
 
 class TemporalSmoother:
-    """Moving-average filter over per-person predictions.
+    """Temporal filter over per-person predictions.
 
     Args:
-        window: number of frames averaged. Forced odd in ``"centered"`` mode.
-        mode: ``"centered"`` (no phase lag, ``(window-1)//2`` frames of
-            latency) or ``"causal"`` (trailing average, zero latency).
+        window: frames averaged by the moving-average modes. Forced odd in
+            ``"centered"``. Ignored by ``"1euro"``.
+        mode: ``"centered"`` (moving average, no phase lag, ``(window-1)//2``
+            frames of latency — the filter NLF measured, so the one to use for
+            benchmark numbers), ``"causal"`` (trailing average, zero latency,
+            real phase lag) or ``"1euro"`` (adaptive, zero latency, no phase
+            lag during fast motion — the one to use for demos and live camera).
+        beta_scale: multiplies every per-field ``beta`` in ``"1euro"`` mode.
+            This is *the* jitter-versus-lag knob: raise it if motion still lags,
+            lower it if the output looks noisy while you hold still.
+        mincutoff_scale: multiplies every per-field ``mincutoff``. Governs how
+            hard the signal is smoothed at rest.
         iou_threshold: minimum IoU to associate a detection with a track.
         max_age: frames a track survives without a detection.
 
-    Usage mirrors a delay line::
+    Usage mirrors a delay line — in the zero-latency modes ``push`` simply
+    always returns a frame and ``flush`` yields nothing::
 
         for persons in stream:
-            out = smoother.push(persons)
+            out = smoother.push(persons, timestamp=t)
             if out is not None:
-                render(out)          # a frame (window-1)//2 back
+                render(out)
         for out in smoother.flush():
-            render(out)              # the tail
+            render(out)
     """
 
     def __init__(
         self,
         window: int = 5,
         mode: str = "centered",
+        beta_scale: float = 1.0,
+        mincutoff_scale: float = 1.0,
         iou_threshold: float = 0.3,
         max_age: int = 5,
     ):
-        if mode not in ("centered", "causal"):
-            raise ValueError(f"mode must be 'centered' or 'causal', got {mode!r}")
+        if mode not in ("centered", "causal", "1euro"):
+            raise ValueError(
+                f"mode must be 'centered', 'causal' or '1euro', got {mode!r}")
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
         if mode == "centered" and window % 2 == 0:
@@ -163,9 +249,15 @@ class TemporalSmoother:
         self.window = window
         self.mode = mode
         self.lag = (window - 1) // 2 if mode == "centered" else 0
+        self.beta_scale = float(beta_scale)
+        self.mincutoff_scale = float(mincutoff_scale)
 
         self._tracker = _Tracker(iou_threshold=iou_threshold, max_age=max_age)
         self._buf: deque[dict[int, HMRPrediction]] = deque(maxlen=window)
+        # mode="1euro" only: one filter bank per track, built on first sight and
+        # dropped when the tracker retires the track.
+        self._banks: dict[int, dict[str, _OneEuro]] = {}
+        self._clock = 0.0
         # Frames in and frames out. Every pushed frame is emitted exactly once,
         # so a caller holding its own delay line can pop one entry per returned
         # frame and stay in step with the video.
@@ -182,12 +274,32 @@ class TemporalSmoother:
         self._out_j3d: list[float] = []
 
     # ------------------------------------------------------------------
-    def push(self, persons: Sequence[HMRPrediction]) -> list[HMRPrediction] | None:
-        """Feed one frame. Returns a smoothed frame, or ``None`` while filling."""
+    def push(
+        self,
+        persons: Sequence[HMRPrediction],
+        timestamp: float | None = None,
+    ) -> list[HMRPrediction] | None:
+        """Feed one frame. Returns a smoothed frame, or ``None`` while filling.
+
+        ``timestamp`` (seconds) is used only by ``mode="1euro"``, which needs a
+        real time base to turn deltas into speeds — pass wall-clock for a live
+        camera and ``frame_idx / fps`` for a file, so ``--frame-skip`` is
+        accounted for. It defaults to a nominal 30 fps clock.
+        """
         ids = self._tracker.assign(persons)
         frame = {t: p for t, p in zip(ids, persons)}
         self._accumulate(frame, self._prev_raw, self._raw_cam, self._raw_j3d)
         self._prev_raw = frame
+
+        if timestamp is None:
+            self._clock += 1.0 / 30.0
+            timestamp = self._clock
+
+        if self.mode == "1euro":
+            self._n_pushed += 1
+            out = self._one_euro(frame, timestamp)
+            self._n_emitted += 1
+            return out
 
         self._buf.append(frame)
         self._n_pushed += 1
@@ -204,6 +316,40 @@ class TemporalSmoother:
         """Drain the frames still held in the delay line at end of stream."""
         while self._n_emitted < self._n_pushed:
             yield self._emit_next()
+
+    def _one_euro(self, frame: dict[int, HMRPrediction], t: float) -> list[HMRPrediction]:
+        """Filter each track's fields independently, elementwise, on its own speed."""
+        alive = self._tracker.active_ids
+        for dead in [k for k in self._banks if k not in alive]:
+            del self._banks[dead]
+
+        out: list[HMRPrediction] = []
+        emitted: dict[int, HMRPrediction] = {}
+        for track_id, pred in frame.items():
+            bank = self._banks.get(track_id)
+            if bank is None:
+                bank = {
+                    name: _OneEuro(
+                        mincutoff=ONE_EURO_DEFAULTS[name][0] * self.mincutoff_scale,
+                        beta=ONE_EURO_DEFAULTS[name][1] * self.beta_scale,
+                    )
+                    for name in SMOOTHED_FIELDS
+                }
+                self._banks[track_id] = bank
+            fields = {
+                name: bank[name](getattr(pred, name), t).astype(np.float32)
+                for name in SMOOTHED_FIELDS
+            }
+            fields["joints_3d_cam"] = (
+                fields["joints_3d_local"] + fields["cam_trans"][None, :]
+            ).astype(np.float32)
+            smoothed = replace(pred, **fields)
+            out.append(smoothed)
+            emitted[track_id] = smoothed
+
+        self._accumulate(emitted, self._prev_out, self._out_cam, self._out_j3d)
+        self._prev_out = emitted
+        return out
 
     def _emit_next(self) -> list[HMRPrediction]:
         buf_start = self._n_pushed - len(self._buf)
@@ -261,8 +407,10 @@ class TemporalSmoother:
             return None
         rc, oc = float(np.mean(self._raw_cam)), float(np.mean(self._out_cam))
         rj, oj = float(np.mean(self._raw_j3d)), float(np.mean(self._out_j3d))
+        how = (f"1euro, beta x{self.beta_scale:g}" if self.mode == "1euro"
+               else f"window={self.window}, {self.mode}")
         return (
-            f"smoothing (window={self.window}, {self.mode}) — mean frame-to-frame delta\n"
+            f"smoothing ({how}) — mean frame-to-frame delta\n"
             f"  cam_trans        {rc * 1000:7.2f} -> {oc * 1000:7.2f} mm  "
             f"({100.0 * (1.0 - oc / rc) if rc > 0 else 0.0:+.0f}%)\n"
             f"  joints_3d_local  {rj * 1000:7.2f} -> {oj * 1000:7.2f} mm  "

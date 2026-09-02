@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -121,10 +122,25 @@ def parse_args() -> argparse.Namespace:
              "the next odd number in centered mode.",
     )
     p.add_argument(
-        "--smoothing-mode", choices=("centered", "causal"), default="centered",
-        help="'centered' has no phase lag but delays output by (N-1)//2 frames; "
-             "'causal' is a trailing average with zero latency. --camera always "
-             "uses causal (default: centered).",
+        "--smoothing-mode", choices=("centered", "causal", "1euro"),
+        default="centered",
+        help="'centered' = moving average, no phase lag, delays output by "
+             "(N-1)//2 frames — the filter NLF measured, so use it for benchmark "
+             "numbers. 'causal' = trailing average, zero latency but real phase "
+             "lag. '1euro' = adaptive cutoff (Casiez et al. 2012), zero latency "
+             "and no lag on fast motion — use it for demos. --camera always uses "
+             "1euro (default: centered).",
+    )
+    p.add_argument(
+        "--smoothing-beta", type=float, default=1.0, metavar="S",
+        help="Scales every per-field beta in --smoothing-mode 1euro (default: "
+             "1.0). The jitter-versus-lag knob: raise it if motion still lags, "
+             "lower it if the pose looks noisy while you hold still.",
+    )
+    p.add_argument(
+        "--smoothing-mincutoff", type=float, default=1.0, metavar="S",
+        help="Scales every per-field mincutoff in --smoothing-mode 1euro "
+             "(default: 1.0). Governs how hard the pose is smoothed at rest.",
     )
     p.add_argument(
         "--save-rrd", type=str, default=None,
@@ -327,14 +343,27 @@ def _print_timings(
 # ---------------------------------------------------------------------------
 
 
-def build_smoother(args: argparse.Namespace, force_causal: bool = False):
-    """Construct the temporal filter, or ``None`` when --smoothing-filter is off."""
+def build_smoother(args: argparse.Namespace, live: bool = False):
+    """Construct the temporal filter, or ``None`` when --smoothing-filter is off.
+
+    ``live`` forces the adaptive filter: a camera cannot buffer future frames,
+    and a trailing average would show visible phase lag on fast motion.
+    """
     if not args.smoothing_filter:
         return None
-    mode = "causal" if force_causal else args.smoothing_mode
-    sm = TemporalSmoother(window=args.smoothing_window, mode=mode)
-    lag = f", {sm.lag} frame lag" if sm.lag else ""
-    print(f"temporal smoothing: window={sm.window}, mode={sm.mode}{lag}")
+    mode = "1euro" if live else args.smoothing_mode
+    sm = TemporalSmoother(
+        window=args.smoothing_window,
+        mode=mode,
+        beta_scale=args.smoothing_beta,
+        mincutoff_scale=args.smoothing_mincutoff,
+    )
+    if sm.mode == "1euro":
+        print(f"temporal smoothing: 1euro, beta x{sm.beta_scale:g}, "
+              f"mincutoff x{sm.mincutoff_scale:g}, no latency")
+    else:
+        lag = f", {sm.lag} frame lag" if sm.lag else ""
+        print(f"temporal smoothing: window={sm.window}, mode={sm.mode}{lag}")
     return sm
 
 
@@ -427,7 +456,7 @@ def run_video(args: argparse.Namespace) -> None:
             if smoother is None:
                 emit(result.persons)
             else:
-                smoothed = smoother.push(result.persons)
+                smoothed = smoother.push(result.persons, timestamp=frame_idx / fps)
                 if smoothed is not None:
                     emit(smoothed)
 
@@ -483,7 +512,7 @@ def run_camera(args: argparse.Namespace) -> None:
     print(f"camera {args.camera}: {width}x{height} @ {fps:.1f} fps — Ctrl+C to stop")
 
     pipeline, viz = build_all(args)
-    smoother = build_smoother(args, force_causal=True)
+    smoother = build_smoother(args, live=True)
 
     frame_idx = 0
     det_times: list[float] = []
@@ -505,7 +534,11 @@ def run_camera(args: argparse.Namespace) -> None:
 
             persons = result.persons
             if smoother is not None:
-                persons = smoother.push(persons) or persons
+                # Wall clock, not frame_idx/fps: a webcam's real frame interval
+                # drifts and drops, and the adaptive cutoff is a function of
+                # speed, so it needs the interval that actually elapsed.
+                persons = smoother.push(
+                    persons, timestamp=time.perf_counter()) or persons
 
             render_ms = viz.log_frame(
                 rgb, persons,
