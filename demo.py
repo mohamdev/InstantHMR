@@ -44,6 +44,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import sys
 from pathlib import Path
 
@@ -52,6 +53,7 @@ import numpy as np
 
 from instanthmr import PosePipeline, onnx_output_names
 from instanthmr.mhr_renderer import DEFAULT_MHR_SCRIPT
+from instanthmr.smoothing import TemporalSmoother
 from instanthmr.visualizer import RerunVisualizer
 
 
@@ -106,6 +108,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-batch-persons", action="store_true",
         help="Disable batched multi-person HMR (one ONNX call per person).",
+    )
+    p.add_argument(
+        "--smoothing-filter", action="store_true",
+        help="Temporally smooth per-person predictions with a moving-average "
+             "filter (see instanthmr/smoothing.py). Non-learned and free; NLF "
+             "reports a 5-frame filter of this kind giving 3DPW 59.0 -> 57.2 mm.",
+    )
+    p.add_argument(
+        "--smoothing-window", type=int, default=5, metavar="N",
+        help="Frames averaged by --smoothing-filter (default: 5). Rounded up to "
+             "the next odd number in centered mode.",
+    )
+    p.add_argument(
+        "--smoothing-mode", choices=("centered", "causal"), default="centered",
+        help="'centered' has no phase lag but delays output by (N-1)//2 frames; "
+             "'causal' is a trailing average with zero latency. --camera always "
+             "uses causal (default: centered).",
     )
     p.add_argument(
         "--save-rrd", type=str, default=None,
@@ -308,6 +327,17 @@ def _print_timings(
 # ---------------------------------------------------------------------------
 
 
+def build_smoother(args: argparse.Namespace, force_causal: bool = False):
+    """Construct the temporal filter, or ``None`` when --smoothing-filter is off."""
+    if not args.smoothing_filter:
+        return None
+    mode = "causal" if force_causal else args.smoothing_mode
+    sm = TemporalSmoother(window=args.smoothing_window, mode=mode)
+    lag = f", {sm.lag} frame lag" if sm.lag else ""
+    print(f"temporal smoothing: window={sm.window}, mode={sm.mode}{lag}")
+    return sm
+
+
 def run_image(args: argparse.Namespace) -> None:
     image_path = Path(args.image)
     if not image_path.exists():
@@ -350,6 +380,7 @@ def run_video(args: argparse.Namespace) -> None:
     print(f"video: {video_path.name}, {total} frames @ {fps:.1f} fps")
 
     pipeline, viz = build_all(args)
+    smoother = build_smoother(args)
 
     frame_idx = 0
     sent = 0
@@ -357,6 +388,23 @@ def run_video(args: argparse.Namespace) -> None:
     hmr_times: list[float] = []
     render_times: list[float] = []
     tot_times: list[float] = []
+
+    # When smoothing is centred the filter emits frame t only after it has seen
+    # t + (window-1)//2, so the frames still in flight wait here with the data
+    # the visualizer will need for them.
+    pending: deque[tuple[int, np.ndarray, float, float, float]] = deque()
+
+    def emit(persons) -> None:
+        f_idx, f_rgb, d_ms, h_ms, t_ms = pending.popleft()
+        render_times.append(viz.log_frame(
+            f_rgb, persons,
+            frame_idx=f_idx,
+            timestamp=f_idx / fps,
+            detector_ms=d_ms,
+            hmr_ms=h_ms,
+            total_ms=t_ms,
+        ))
+
     try:
         while True:
             ret, bgr = cap.read()
@@ -374,15 +422,14 @@ def run_video(args: argparse.Namespace) -> None:
             hmr_times.append(result.hmr_ms)
             tot_times.append(result.total_ms)
 
-            render_ms = viz.log_frame(
-                rgb, result.persons,
-                frame_idx=frame_idx,
-                timestamp=frame_idx / fps,
-                detector_ms=result.detector_ms,
-                hmr_ms=result.hmr_ms,
-                total_ms=result.total_ms,
-            )
-            render_times.append(render_ms)
+            pending.append((frame_idx, rgb, result.detector_ms,
+                            result.hmr_ms, result.total_ms))
+            if smoother is None:
+                emit(result.persons)
+            else:
+                smoothed = smoother.push(result.persons)
+                if smoothed is not None:
+                    emit(smoothed)
 
             sent += 1
             frame_idx += 1
@@ -396,10 +443,18 @@ def run_video(args: argparse.Namespace) -> None:
                     float(np.mean(tot_times[-30:])),
                     len(result.persons),
                 )
+        if smoother is not None:
+            for smoothed in smoother.flush():
+                emit(smoothed)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
         cap.release()
+
+    if smoother is not None:
+        report = smoother.jitter_report()
+        if report:
+            print("\n" + report)
 
     if tot_times:
         # Skip the first frame from the average — it bears the warm-up cost.
@@ -428,6 +483,7 @@ def run_camera(args: argparse.Namespace) -> None:
     print(f"camera {args.camera}: {width}x{height} @ {fps:.1f} fps — Ctrl+C to stop")
 
     pipeline, viz = build_all(args)
+    smoother = build_smoother(args, force_causal=True)
 
     frame_idx = 0
     det_times: list[float] = []
@@ -447,8 +503,12 @@ def run_camera(args: argparse.Namespace) -> None:
             hmr_times.append(result.hmr_ms)
             tot_times.append(result.total_ms)
 
+            persons = result.persons
+            if smoother is not None:
+                persons = smoother.push(persons) or persons
+
             render_ms = viz.log_frame(
-                rgb, result.persons,
+                rgb, persons,
                 frame_idx=frame_idx,
                 timestamp=frame_idx / fps,
                 detector_ms=result.detector_ms,

@@ -282,6 +282,15 @@ def main() -> None:
             name = f"{dataset}_{stem}_p{int(row['person_id'])}"
             if name in existing:
                 st["skipped_existing"] += 1
+                # Still place the original: a resume with a different
+                # --originals must be able to backfill original_images/,
+                # otherwise a split built with `none` can never gain them.
+                if args.originals != "none":
+                    rp = image_relpath(dataset, image)
+                    if index is not None:
+                        rp = index.resolve(image) or rp
+                    place_original(args.image_dir / rp,
+                                   dirs["original_images"] / rp, args.originals)
                 continue
             if not args.keep_invalid and not bool(row["mhr_valid"]):
                 st["skipped_invalid"] += 1

@@ -103,14 +103,21 @@ DATASETS: dict[str, Dataset] = {
         name="aic",
         splits=("aic_train",),
         method="opendatalab",
-        approx_gb=36.4,
-        notes="AI Challenger 2017. The original challenger.ai host is dead; the "
-              "working route is OpenDataLab, which is where this corpus came "
-              "from last time (see ~/sam3d_data/aic_download).\n"
-              "    pip install opendatalab && odl login\n"
-              "    odl get OpenDataLab/AI_Challenger -d $DEST\n"
-              "    tar xzf $DEST/OpenDataLab___AI_Challenger/raw/AI_Challenger.tar.gz\n"
-              "Needs the train/images/ subtree only.",
+        approx_gb=16.0,
+        notes="AI Challenger 2017. Only the train/images/ subtree is needed: "
+              "210,000 jpgs, 16 GB. The full OpenDataLab archive is 36 GB but "
+              "the rest is val, eval scripts and duplicate annotation copies.\n"
+              "The original challenger.ai host is dead. If you already hold a "
+              "copy, rsync train/ straight in - that is the reliable route.\n"
+              "Otherwise OpenDataLab, in an ISOLATED venv: openxlab pins old "
+              "requests/urllib3/tqdm and will break huggingface_hub if it "
+              "shares an environment with fetch_annotations.py.\n"
+              "    python -m venv ~/venvs/odl && ~/venvs/odl/bin/pip install opendatalab\n"
+              "    ~/venvs/odl/bin/odl login\n"
+              "    ~/venvs/odl/bin/odl get AI_Challenger -d $DEST\n"
+              "The dataset name is bare - `odl get OpenDataLab/AI_Challenger` "
+              "fails with `No dataset: OpenDataLab`; the org/name form is an "
+              "openxlab convention, not an odl one.",
     ),
     "3dpw": Dataset(
         name="3dpw",
