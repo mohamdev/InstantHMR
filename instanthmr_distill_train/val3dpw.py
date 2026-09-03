@@ -1,0 +1,165 @@
+"""3DPW as a held-out validation set during training.
+
+The default validation set is a random slice of the training corpus, which
+measures agreement with the teacher on data drawn from the same distribution —
+useful as a training-health signal, useless as a measure of generalisation.
+3DPW is real MoCap ground truth from a different distribution, so it answers a
+different and more interesting question.
+
+Two rules that matter more than the code:
+
+**Use the ``validation`` split (12 sequences), not ``test``.** The 24 test
+sequences are what ``benchmark/eval_3dpw.py`` reports for publication. Select a
+checkpoint on them and that number stops being held-out — it becomes a number
+you optimised against. The validation split exists precisely so you don't have
+to spend the test split on model selection.
+
+**Never build ``3dpw_train`` into the training corpus.** Neighbouring frames of
+the same person in the same scene make frame-level holdout meaningless. This is
+already the situation locally, where ``sam3d_distill_mix`` contains crops from
+all 60 sequences (see ``benchmark/README.md``). On Jean Zay it is not: the built
+corpus is coco/mpii/aic/sa1b only, so 3DPW there is genuinely unseen — which is
+what makes this worth doing on the cluster and not on the laptop.
+
+Selection metric is **PA-MPJPE on J12**. J12 is limbs only, where MHR and SMPL
+mean the same anatomical points; J14 adds neck and head, which the two rigs
+place differently and which therefore carry a systematic penalty unrelated to
+model quality. Procrustes alignment additionally removes any residual
+coordinate-frame convention mismatch between the rig-local prediction and 3DPW's
+camera space, so the number is comparable across runs without further care.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+_BENCH = Path(__file__).resolve().parent.parent / "benchmark"
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+
+from benchlib import joints as J          # noqa: E402
+from benchlib import metrics as M         # noqa: E402
+from benchlib import threedpw as P        # noqa: E402
+
+INPUT_SIZE = 224
+CROP_EXPAND = 1.2                          # must match instanthmr/inference.py
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+MM = 1000.0
+
+
+def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int):
+    """Square 1.2x crop + ImageNet normalise + CLIFF conditioning.
+
+    A transcription of ``instanthmr.inference.InstantHMR._preprocess``. It is
+    duplicated rather than imported because that module pulls in onnxruntime,
+    and this one runs inside the training loop on every rank. If the crop
+    convention there ever changes, this must follow or the validation numbers
+    will silently stop matching ``benchmark/eval_3dpw.py``.
+    """
+    x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float64)
+    bw, bh = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    cliff = np.array([2.0 * (cx / w) - 1.0,
+                      2.0 * (cy / h) - 1.0,
+                      max(bw, bh) / max(w, h)], dtype=np.float32)
+
+    sq = max(bw, bh) * CROP_EXPAND
+    half = sq / 2.0
+    ix1, iy1 = int(math.floor(cx - half)), int(math.floor(cy - half))
+    ix2, iy2 = int(math.ceil(cx - half + sq)), int(math.ceil(cy - half + sq))
+
+    pl, pt = max(0, -ix1), max(0, -iy1)
+    pr, pb = max(0, ix2 - w), max(0, iy2 - h)
+    patch = image_rgb[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
+    if pl or pt or pr or pb:
+        patch = cv2.copyMakeBorder(patch, pt, pb, pl, pr,
+                                   cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    crop = cv2.resize(patch, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    crop = (crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+    return np.ascontiguousarray(crop.transpose(2, 0, 1)), cliff
+
+
+class ThreeDPWValSet(Dataset):
+    """(crop, cliff_cond, GT SMPL-24 joints) for every evaluatable person-frame.
+
+    Person boxes come from the projected GT joints, so no detector is in the
+    loop and the number isolates the pose model. ``stride`` subsamples frames:
+    3DPW is 30 fps and neighbouring frames are near-duplicates, so stride 5
+    keeps the signal at a fifth of the cost.
+    """
+
+    def __init__(self, sequence_dir: str, image_root: str,
+                 split: str = "validation", stride: int = 5,
+                 bbox_scale: float = 1.2):
+        self.samples, self.gt = P.build_samples(
+            sequence_dir, image_root, split=split,
+            stride=stride, bbox_scale=bbox_scale)
+        self.gt = np.asarray(self.gt, dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, i: int):
+        s = self.samples[i]
+        bgr = cv2.imread(s["image_path"], cv2.IMREAD_COLOR)
+        if bgr is None:
+            # A missing frame must not kill a 20-hour job; return a zero crop
+            # and flag it so the metric can drop it.
+            return {"image": torch.zeros(3, INPUT_SIZE, INPUT_SIZE),
+                    "cliff_cond": torch.zeros(3),
+                    "gt": torch.from_numpy(self.gt[i]),
+                    "ok": torch.tensor(0.0)}
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        crop, cliff = _preprocess(rgb, s["bbox"], h, w)
+        return {"image": torch.from_numpy(crop),
+                "cliff_cond": torch.from_numpy(cliff),
+                "gt": torch.from_numpy(self.gt[i]),
+                "ok": torch.tensor(1.0)}
+
+
+@torch.no_grad()
+def evaluate(model, loader, mhr_module, device, use_amp: bool = True) -> dict:
+    """PA-MPJPE and MPJPE in mm on J12 and J14, from the MHR forward pass.
+
+    Predictions come from ``mhr_params`` through the same FK + (70, 127)
+    regressor the training loss uses, so this measures exactly the geometry the
+    model is being trained to produce.
+    """
+    model.eval()
+    preds, gts = [], []
+    for b in loader:
+        if float(b["ok"].sum()) == 0:
+            continue
+        img = b["image"].to(device, non_blocking=True)
+        cc = b["cliff_cond"].to(device, non_blocking=True)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            out = model(img, cc)
+        kp = mhr_module.get_native_keypoints(out["mhr_params"].float(),
+                                             out["shape_params"].float())
+        keep = b["ok"].bool()
+        preds.append(kp[keep.to(kp.device)].float().cpu().numpy())
+        gts.append(b["gt"][keep].numpy())
+
+    if not preds:
+        return {"n": 0.0}
+    pred = np.concatenate(preds) * MM          # (N, 70, 3) rig-local, mm
+    gt = np.concatenate(gts) * MM              # (N, 24, 3) camera space, mm
+
+    res: dict[str, float] = {"n": float(len(pred))}
+    for name in ("J12", "J14"):
+        spec = J.JOINT_SETS[name]
+        p, g = pred[:, spec["mhr"], :], gt[:, spec["smpl"], :]
+        rp, rg = J.pelvis(p), J.pelvis(g)
+        res[f"{name}_MPJPE"] = float(M.mpjpe(p, g, root=(rp, rg)).mean())
+        res[f"{name}_PA_MPJPE"] = float(M.pa_mpjpe(p, g).mean())
+    return res
