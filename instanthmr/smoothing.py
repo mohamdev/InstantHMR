@@ -54,7 +54,9 @@ from .inference import HMRPrediction
 #: linear mean is the right operation, except ``mhr_params`` — see the module
 #: docstring. ``joints_3d_cam`` is deliberately absent: it is recomputed from
 #: the smoothed ``joints_3d_local`` and ``cam_trans`` so the three stay
-#: consistent with each other.
+#: consistent with each other. ``joints_3d_local`` is filtered only when no
+#: ``keypoint_fn`` is available; with one, it is re-derived from the filtered
+#: ``mhr_params`` so the keypoints and the mesh cannot disagree.
 SMOOTHED_FIELDS = (
     "joints_3d_local",
     "cam_trans",
@@ -216,6 +218,10 @@ class TemporalSmoother:
             lower it if the output looks noisy while you hold still.
         mincutoff_scale: multiplies every per-field ``mincutoff``. Governs how
             hard the signal is smoothed at rest.
+        keypoint_fn: optional ``f(mhr_params, shape_params) -> (70, 3)``. When
+            given, ``joints_3d_local`` is *re-derived* from the filtered pose
+            parameters instead of being filtered on its own. This is what keeps
+            the keypoints welded to the mesh — see :meth:`_finalize`.
         iou_threshold: minimum IoU to associate a detection with a track.
         max_age: frames a track survives without a detection.
 
@@ -236,6 +242,7 @@ class TemporalSmoother:
         mode: str = "centered",
         beta_scale: float = 1.0,
         mincutoff_scale: float = 1.0,
+        keypoint_fn=None,
         iou_threshold: float = 0.3,
         max_age: int = 5,
     ):
@@ -251,6 +258,7 @@ class TemporalSmoother:
         self.lag = (window - 1) // 2 if mode == "centered" else 0
         self.beta_scale = float(beta_scale)
         self.mincutoff_scale = float(mincutoff_scale)
+        self.keypoint_fn = keypoint_fn
 
         self._tracker = _Tracker(iou_threshold=iou_threshold, max_age=max_age)
         self._buf: deque[dict[int, HMRPrediction]] = deque(maxlen=window)
@@ -340,10 +348,7 @@ class TemporalSmoother:
                 name: bank[name](getattr(pred, name), t).astype(np.float32)
                 for name in SMOOTHED_FIELDS
             }
-            fields["joints_3d_cam"] = (
-                fields["joints_3d_local"] + fields["cam_trans"][None, :]
-            ).astype(np.float32)
-            smoothed = replace(pred, **fields)
+            smoothed = self._finalize(pred, fields)
             out.append(smoothed)
             emitted[track_id] = smoothed
 
@@ -358,6 +363,31 @@ class TemporalSmoother:
         return out
 
     # ------------------------------------------------------------------
+    def _finalize(self, anchor: HMRPrediction, fields: dict) -> HMRPrediction:
+        """Assemble one smoothed prediction, keeping its parts self-consistent.
+
+        Filtering ``mhr_params`` and ``joints_3d_local`` independently makes the
+        green keypoints drift off the skin during fast motion, because the mesh
+        is decoded from the former while the keypoints come from the latter and
+        forward kinematics is *nonlinear* — ``filter(FK(p)) != FK(filter(p))``.
+        Adaptive filtering makes it worse still, since each field then gets its
+        own cutoff driven by its own speed in its own units.
+
+        So when a keypoint backend is available we do not filter the keypoints
+        at all: we filter the pose parameters and re-derive the keypoints from
+        them, which is exactly how ``inference.py`` produces them for an
+        MHR-only graph. The two agree by construction, in every mode.
+        """
+        if self.keypoint_fn is not None:
+            fields["joints_3d_local"] = np.asarray(
+                self.keypoint_fn(fields["mhr_params"], fields["shape_params"]),
+                dtype=np.float32,
+            ).reshape(anchor.joints_3d_local.shape)
+        fields["joints_3d_cam"] = (
+            fields["joints_3d_local"] + fields["cam_trans"][None, :]
+        ).astype(np.float32)
+        return replace(anchor, **fields)
+
     def _emit(self, centre: int) -> list[HMRPrediction]:
         """Average every track present in frame ``centre`` over the buffer."""
         out: list[HMRPrediction] = []
@@ -372,10 +402,7 @@ class TemporalSmoother:
                 ).astype(np.float32)
                 for name in SMOOTHED_FIELDS
             }
-            fields["joints_3d_cam"] = (
-                fields["joints_3d_local"] + fields["cam_trans"][None, :]
-            ).astype(np.float32)
-            smoothed = replace(anchor, **fields)
+            smoothed = self._finalize(anchor, fields)
             out.append(smoothed)
             emitted[track_id] = smoothed
 

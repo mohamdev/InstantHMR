@@ -26,11 +26,13 @@ second encoder.
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 from pathlib import Path
 
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -46,7 +48,30 @@ LEFT_HAND_KPS = list(range(42, 63))
 RIGHT_WRIST, LEFT_WRIST = 41, 62
 
 
-def structure(d: Path) -> None:
+def count_files(root: Path) -> int:
+    """Recursive file count that never follows a symlink.
+
+    original_images/ can hold >1M symlinks into a read-only mirror on another
+    filesystem; Path.is_file() resolves each one, turning a count into a
+    million cross-filesystem stats. scandir's d_type answers dir-or-not
+    without any stat at all.
+    """
+    n, stack = 0, [root]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(Path(e.path))
+                    else:
+                        n += 1
+        except OSError:
+            pass
+    return n
+
+
+def structure(d: Path, workers: int = 16, hand_scan_limit: int = 300_000,
+              seed: int = 0) -> None:
     anns = sorted((d / "annotations").glob("*.npz"))
     body = {p.stem for p in (d / "body_crops").iterdir()} if (d / "body_crops").exists() else set()
     hands = {p.stem for p in (d / "hands_crops").iterdir()} if (d / "hands_crops").exists() else set()
@@ -54,27 +79,51 @@ def structure(d: Path) -> None:
 
     missing_body = sorted(stems - body)[:5]
     orphan_body = sorted(body - stems)[:5]
-    want_hands, have_hands, missing_hands = 0, 0, []
-    for p in anns:
-        a = np.load(p, allow_pickle=False)
+
+    # Reading every npz is the expensive half of this check: single-threaded it
+    # runs at ~100/s on Lustre, so a 3.4M-crop split would take 9 h. Sample
+    # above hand_scan_limit and scale, and thread the reads either way.
+    scan = anns
+    scaled = False
+    if len(anns) > hand_scan_limit:
+        scan = random.Random(seed).sample(anns, hand_scan_limit)
+        scaled = True
+
+    def probe(p: Path):
+        try:
+            a = np.load(p, allow_pickle=False)
+        except Exception:  # noqa: BLE001
+            return ()
+        out = []
         for side in ("l", "r"):
             key = f"hand_valid_{side}"
-            if key not in a.files or not bool(a[key]):
-                continue
-            want_hands += 1
-            if f"{p.stem}_{side}" in hands:
-                have_hands += 1
-            elif len(missing_hands) < 5:
-                missing_hands.append(f"{p.stem}_{side}")
+            if key in a.files and bool(a[key]):
+                out.append(f"{p.stem}_{side}")
+        return tuple(out)
+
+    want_hands, have_hands, missing_hands = 0, 0, []
+    with ThreadPoolExecutor(workers) as ex:
+        for names in ex.map(probe, scan):
+            for nm in names:
+                want_hands += 1
+                if nm in hands:
+                    have_hands += 1
+                elif len(missing_hands) < 5:
+                    missing_hands.append(nm)
 
     print(f"  annotations        : {len(anns):,}")
     print(f"  body_crops         : {len(body):,}"
           f"  (missing {len(stems - body):,}, orphan {len(body - stems):,})")
-    print(f"  hands_crops        : {len(hands):,}"
-          f"  (declared {want_hands:,}, present {have_hands:,})")
+    if scaled:
+        f = len(anns) / len(scan)
+        print(f"  hands_crops        : {len(hands):,}"
+              f"  (declared ~{int(want_hands * f):,}, present ~{int(have_hands * f):,}"
+              f"  — estimated from {len(scan):,} of {len(anns):,} npz)")
+    else:
+        print(f"  hands_crops        : {len(hands):,}"
+              f"  (declared {want_hands:,}, present {have_hands:,})")
     if (d / "original_images").exists():
-        n = sum(1 for _ in (d / "original_images").rglob("*") if _.is_file())
-        print(f"  original_images    : {n:,} files")
+        print(f"  original_images    : {count_files(d / 'original_images'):,} files")
     if missing_body:
         print(f"  !! body crop missing for: {missing_body}")
     if orphan_body:
@@ -149,6 +198,10 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dir", type=Path, required=True, help="data/sam3d_gt_<dataset>")
     p.add_argument("--sample", type=int, default=500)
+    p.add_argument("--workers", type=int, default=16,
+                   help="threads for the npz hand-validity scan")
+    p.add_argument("--hand-scan-limit", type=int, default=300_000,
+                   help="above this many npz, estimate hand counts from a sample instead of reading every file")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--hand-signal", action="store_true")
     p.add_argument("--mhr", type=Path,
@@ -162,7 +215,8 @@ def main() -> None:
 
     print(f"\n== {args.dir} ==")
     print("structure")
-    structure(args.dir)
+    structure(args.dir, workers=args.workers,
+              hand_scan_limit=args.hand_scan_limit, seed=args.seed)
     print("geometry")
     geometry(args.dir, args.sample, args.seed)
     if args.hand_signal:

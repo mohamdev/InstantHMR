@@ -2,7 +2,15 @@
 
 The InstantHMR training notebook is
 [`notebooks/distill_transformer_decoder.ipynb`](../notebooks/distill_transformer_decoder.ipynb).
-It is the source of truth — this page is a tour, not a re-implementation.
+It is the source of truth for the notebook workflow — this page is a tour, not a
+re-implementation.
+
+**For cluster training, the notebook is not the source of truth.** That is
+`instanthmr_distill_train/train_distill_mhr_only.py` (dataset, losses, model)
+driven by `train_distill_jz.py` (DDP, mixture sampling, resume, 3DPW
+validation), and the two have diverged from the notebook. See
+[`instanthmr_distill_train/README.md`](../instanthmr_distill_train/README.md)
+for which script to run, what `--preset v2` changes, and the pair-index cache.
 
 ## Setup
 

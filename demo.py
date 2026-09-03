@@ -303,7 +303,8 @@ def build_all(args: argparse.Namespace):
 
     The rig comes first because an MHR-only graph cannot produce 3D keypoints
     without it — the pipeline takes it as a constructor argument rather than
-    the visualizer alone.
+    the visualizer alone. It is returned as well so the temporal filter can
+    re-derive keypoints from filtered pose parameters.
     """
     model_path = resolve_model_path(args)
     mhr = build_mhr(args, required=_model_needs_mhr(model_path))
@@ -315,7 +316,7 @@ def build_all(args: argparse.Namespace):
         mhr_renderer=mhr,
         mesh_alpha=args.mesh_alpha,
     )
-    return pipeline, viz
+    return pipeline, viz, mhr
 
 
 def _print_timings(
@@ -343,21 +344,30 @@ def _print_timings(
 # ---------------------------------------------------------------------------
 
 
-def build_smoother(args: argparse.Namespace, live: bool = False):
+def build_smoother(args: argparse.Namespace, live: bool = False, mhr=None):
     """Construct the temporal filter, or ``None`` when --smoothing-filter is off.
 
     ``live`` forces the adaptive filter: a camera cannot buffer future frames,
     and a trailing average would show visible phase lag on fast motion.
+
+    Handing it the MHR backend lets it re-derive the 3D keypoints from the
+    filtered pose parameters, so they stay welded to the mesh instead of
+    drifting off it during fast motion.
     """
     if not args.smoothing_filter:
         return None
     mode = "1euro" if live else args.smoothing_mode
+    kp_fn = mhr.keypoints if getattr(mhr, "has_keypoints", False) else None
     sm = TemporalSmoother(
         window=args.smoothing_window,
         mode=mode,
         beta_scale=args.smoothing_beta,
         mincutoff_scale=args.smoothing_mincutoff,
+        keypoint_fn=kp_fn,
     )
+    if kp_fn is None:
+        print("  note: no MHR keypoint backend — keypoints are filtered on their "
+              "own, so they may drift off the mesh during fast motion.")
     if sm.mode == "1euro":
         print(f"temporal smoothing: 1euro, beta x{sm.beta_scale:g}, "
               f"mincutoff x{sm.mincutoff_scale:g}, no latency")
@@ -377,7 +387,7 @@ def run_image(args: argparse.Namespace) -> None:
         sys.exit(f"[error] cv2.imread failed for {image_path}")
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    pipeline, viz = build_all(args)
+    pipeline, viz, _ = build_all(args)
 
     result = pipeline.predict(rgb)
 
@@ -408,8 +418,8 @@ def run_video(args: argparse.Namespace) -> None:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"video: {video_path.name}, {total} frames @ {fps:.1f} fps")
 
-    pipeline, viz = build_all(args)
-    smoother = build_smoother(args)
+    pipeline, viz, mhr = build_all(args)
+    smoother = build_smoother(args, mhr=mhr)
 
     frame_idx = 0
     sent = 0
@@ -511,8 +521,8 @@ def run_camera(args: argparse.Namespace) -> None:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     print(f"camera {args.camera}: {width}x{height} @ {fps:.1f} fps — Ctrl+C to stop")
 
-    pipeline, viz = build_all(args)
-    smoother = build_smoother(args, live=True)
+    pipeline, viz, mhr = build_all(args)
+    smoother = build_smoother(args, live=True, mhr=mhr)
 
     frame_idx = 0
     det_times: list[float] = []

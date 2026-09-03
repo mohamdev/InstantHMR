@@ -50,11 +50,13 @@ import datetime as _dt
 import json
 import math
 import os
+import pickle
 import random
 import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -132,6 +134,76 @@ def all_reduce_mean(values: dict[str, float], device) -> dict[str, float]:
 def dataset_of(npz_path: Path) -> str:
     """``.../sam3d_gt_aic/annotations/xxx.npz`` -> ``sam3d_gt_aic``."""
     return npz_path.parent.parent.name
+
+
+INDEX_VERSION = 2
+
+
+def _index_fingerprint(data_root: Path) -> list:
+    """Cheap identity for the corpus: the sub-folders and their mtimes.
+
+    A directory's mtime changes when entries are added or removed, so this
+    catches the cases that matter (a split rebuilt, a split added) at the cost
+    of a handful of stat() calls rather than millions. It will NOT catch a file
+    rewritten in place with the same name -- use --rebuild-index for that.
+    """
+    fp = []
+    for ann, img in T.SAM3DStudentDataset._find_dataset_dirs(data_root):
+        fp.append([ann.parent.name,
+                   int(ann.stat().st_mtime_ns), int(img.stat().st_mtime_ns)])
+    return sorted(fp)
+
+
+def build_pair_index(data_root: str, cache: Path | None = None,
+                     rebuild: bool = False, log_fn=print) -> list:
+    """The (image, npz) pair list, cached to disk.
+
+    Scanning 3.7 M crops takes over an hour on Lustre and every rank of every
+    job in a chained run would otherwise repeat it. The cache stores
+    ``(sub_folder, stem, image_extension)`` rather than full paths -- an order
+    of magnitude smaller than pickling Path objects -- and paths are rebuilt on
+    load, which is seconds rather than minutes because it touches no metadata.
+    """
+    root = Path(data_root)
+    cache = Path(cache) if cache else root / f".pair_index_v{INDEX_VERSION}.pkl"
+    fp = _index_fingerprint(root)
+
+    if cache.exists() and not rebuild:
+        try:
+            with cache.open("rb") as fh:
+                blob = pickle.load(fh)
+            if blob.get("version") == INDEX_VERSION and blob.get("fingerprint") == fp:
+                pairs = [(root / sub / "images" / f"{stem}{ext}",
+                          root / sub / "annotations" / f"{stem}.npz")
+                         for sub, stem, ext in blob["entries"]]
+                log_fn(f"  pair index: {len(pairs):,} crops from cache {cache} "
+                       f"(built {blob.get('built', '?')})")
+                return pairs
+            log_fn(f"  pair index: {cache} is stale (corpus changed) — rebuilding")
+        except Exception as e:                      # truncated / half-written
+            log_fn(f"  pair index: {cache} unreadable ({e}) — rebuilding")
+
+    t0 = time.time()
+    log_fn(f"  pair index: scanning {root} (slow — this is why it is cached)")
+    ds = T.SAM3DStudentDataset(str(root), augment=False, per_dataset_caps=None)
+    entries = [(npz.parent.parent.name, npz.stem, img.suffix)
+               for img, npz in ds.pairs]
+    log_fn(f"  pair index: {len(entries):,} crops in {time.time() - t0:.0f}s")
+
+    try:
+        tmp = cache.with_suffix(cache.suffix + ".tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump({"version": INDEX_VERSION, "fingerprint": fp,
+                         "built": time.strftime("%Y-%m-%d %H:%M"),
+                         "entries": entries}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache)
+        log_fn(f"  pair index: cached to {cache}")
+    except OSError as e:
+        # A read-only data root is not fatal — it just means we pay the scan
+        # again next time. Say so rather than dying an hour into startup.
+        log_fn(f"  pair index: could NOT cache to {cache} ({e}); "
+               f"every job will repeat the scan")
+    return ds.pairs
 
 
 def build_mixture_weights(dataset, mix: str | None) -> tuple[torch.Tensor, str]:
@@ -243,14 +315,30 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
     """
     geom = dict(geom_p=cfg.geom_p, geom_rot_deg=cfg.geom_rot_deg,
                 geom_scale_range=cfg.geom_scale_range,
-                geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p)
+                geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
+                geom_scale_max=cfg.geom_scale_max,
+                cliff_follows_aug=cfg.cliff_follows_aug,
+                occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
+                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
 
+    # Rank 0 builds the index (or reads the cache) while the others wait, then
+    # everyone loads the same cache. Building on all ranks at once would put
+    # world_size concurrent metadata storms on the same filesystem, which is
+    # slower than doing it once and antisocial on a shared cluster.
+    if world > 1 and rank != 0:
+        dist.barrier()
+    pairs = build_pair_index(cfg.data_root, args.index_cache,
+                             rebuild=args.rebuild_index, log_fn=log)
+    if world > 1 and rank == 0:
+        dist.barrier()
+    if cfg.max_images is not None:
+        pairs = pairs[:cfg.max_images]
+
+    # Both datasets share one index; only the augmentation pipeline differs.
     train_ds = T.SAM3DStudentDataset(
-        cfg.data_root, augment=cfg.augment, max_images=cfg.max_images,
-        per_dataset_caps=None, **geom)
+        cfg.data_root, augment=cfg.augment, pairs=pairs, **geom)
     val_ds = T.SAM3DStudentDataset(
-        cfg.data_root, augment=False, max_images=cfg.max_images,
-        per_dataset_caps=None, **geom)
+        cfg.data_root, augment=False, pairs=pairs, **geom)
 
     n = len(train_ds)
     g = torch.Generator().manual_seed(42)          # fixed: the split must not
@@ -510,7 +598,8 @@ def train(args, cfg, rank, local_rank, world):
             raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
                 dpw_raw["J12_MPJPE"], dpw_em["J12_MPJPE"])
 
-        log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}")
+        log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}"
+            f" | peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
         log(f"   train  total {tr['total']:.4f} | 3d {tr['3d']:.4f} | "
             f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f}")
         log(f"   valRAW loss {raw['loss']:.4f} | PA-MPJPE {raw['Mesh_PA_MPJPE']:.1f} | "
@@ -632,6 +721,17 @@ def parse_args():
                    help="Skip the timm download. Compute nodes have no internet, "
                         "so run --warm-cache once on a login node instead.")
     p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--preset", choices=["baseline", "v2"], default="baseline",
+                   help="'v2' enables the wave-1 bundle: truncation, occlusion "
+                        "and JPEG augmentation with the SimCC-mask and CLIFF "
+                        "prerequisites, plus absolute-pose supervision. "
+                        "'baseline' reproduces the pre-v2 trainer exactly.")
+    p.add_argument("--w_reproj", type=float, default=None)
+    p.add_argument("--index-cache", default=None,
+                   help="Where to cache the (image, npz) pair index. "
+                        "Default: <data_root>/.pair_index_v2.pkl")
+    p.add_argument("--rebuild-index", action="store_true",
+                   help="Rescan the corpus even if the cache looks current.")
     p.add_argument("--warm-cache", action="store_true",
                    help="Instantiate the backbone to populate $TORCH_HOME / "
                         "$HF_HOME, then exit. Run on a login or prepost node.")
@@ -657,7 +757,40 @@ def build_cfg(args):
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
+
+    if args.preset == "v2":
+        apply_v2_preset(cfg)
+    # An explicit --w_reproj still wins over the preset.
+    if args.w_reproj is not None:   cfg.w_reproj = args.w_reproj
     return cfg
+
+
+def apply_v2_preset(cfg) -> None:
+    """Wave-1 bundle: augmentation (MeTRAbs items 1/2/4) + absolute-pose (item 3).
+
+    Deliberately one preset rather than four independent flags. MeTRAbs measures
+    the augmentations cumulatively (Table 7: 58.0 -> 52.8 -> 49.3), so splitting
+    them into separate runs would spend three 3-seed sweeps reproducing an
+    ablation that already exists in the literature. Absolute-pose supervision
+    rides along because it touches disjoint machinery -- the reprojection and
+    translation terms, not the input pipeline -- so a regression stays
+    attributable from the per-term loss breakdown in history.jsonl.
+    """
+    # --- item 1: truncation -------------------------------------------------
+    cfg.geom_scale_max = 2.0          # retains the central quarter by area
+    cfg.geom_trans = 0.20             # off-centre, so truncation is not symmetric
+    cfg.cliff_follows_aug = True      # prerequisite B
+    cfg.mask_oob_2d = True            # prerequisite A
+    # --- item 2: occlusion --------------------------------------------------
+    cfg.occl_p = 0.7                  # MeTRAbs Table 7
+    cfg.occl_scale = (0.02, 0.30)
+    # --- item 4: JPEG -------------------------------------------------------
+    cfg.jpeg_p = 0.3
+    cfg.jpeg_quality = (30, 90)
+    # --- item 3: absolute pose ---------------------------------------------
+    cfg.w_reproj = 0.5                # was 0.01, i.e. effectively off
+    cfg.reproj_all_samples = True     # the flipped half now contributes
+    cfg.cam_loss = "euclid"
 
 
 def main():
@@ -670,6 +803,10 @@ def main():
         print(f"cached {cfg.backbone}: {sum(p.numel() for p in m.parameters())/1e6:.2f} M "
               f"params under TORCH_HOME={os.environ.get('TORCH_HOME')} "
               f"HF_HOME={os.environ.get('HF_HOME')}")
+        # The pair index too: this is the other thing a compute node should
+        # never have to build, and a prepost node has the walltime for it.
+        build_pair_index(cfg.data_root, args.index_cache,
+                         rebuild=args.rebuild_index)
         return
 
     rank, local_rank, world = setup_distributed()
@@ -705,6 +842,11 @@ def main():
     log(f"out       {cfg.log_dir}")
     log(f"backbone  {cfg.backbone} | epochs {args.epochs} | "
         f"batch {cfg.batch_size}/gpu | lr {cfg.lr:.2e} ({args.lr_scaling} x{world})")
+    log(f"preset    {args.preset}"
+        + (f" | trunc<={cfg.geom_scale_max} trans={cfg.geom_trans} "
+           f"occl_p={cfg.occl_p} jpeg_p={cfg.jpeg_p} "
+           f"w_reproj={cfg.w_reproj} cam={cfg.cam_loss}"
+           if args.preset != "baseline" else ""))
     log(f"seed      {args.seed} | mix {args.mix} | "
         f"samples/epoch {args.samples_per_epoch:,}")
     log("=" * 66)

@@ -44,6 +44,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import io
 import math
 import random
 import gc
@@ -149,6 +150,22 @@ class DistillConfig:
     geom_trans: float = 0.08       
     geom_flip_p: float = 0.5       
 
+    # --- v2 knobs. Every default below reproduces the pre-v2 behaviour bit for
+    # --- bit, so a baseline run started before these existed is unaffected.
+    geom_scale_max: float | None = None   # zoom-in ceiling; None => symmetric
+                                          # U(1-range, 1+range) as before. 2.0 is
+                                          # MeTRAbs's quarter-area truncation bound.
+    cliff_follows_aug: bool = False       # CLIFF cx/cy/b_scale track the augmented
+                                          # crop box, as a real detector box would
+    occl_p: float = 0.2                   # RandomErasing probability (MeTRAbs: 0.7)
+    occl_scale: tuple = (0.02, 0.15)
+    jpeg_p: float = 0.0                   # random JPEG re-encode probability
+    jpeg_quality: tuple = (30, 90)
+    mask_oob_2d: bool = False             # mask 2D targets outside kp2d_range
+                                          # instead of clamping them to the edge
+    reproj_all_samples: bool = False      # include flipped samples in loss_reproj
+    cam_loss: str = "mse"                 # "mse" | "euclid" (unsquared L2 on xyz)
+
     kp2d_bins: int = 96            
     kp2d_range: float = 1.5        
 
@@ -236,6 +253,28 @@ class DistillConfig:
 # ============================================================
 # Cell 3 — Dataset and Data Augmentation
 # ============================================================
+class RandomJPEG:
+    """Re-encode through JPEG at a random quality.
+
+    The one item on NLF's augmentation list that this pipeline lacked, and the
+    most deployment-relevant of them: phone and tablet camera stacks emit JPEG,
+    often aggressively compressed, while training crops are decoded from disk at
+    whatever quality the source dataset happened to store. Blocking artefacts
+    and chroma subsampling are a distribution the model otherwise never sees.
+    """
+
+    def __init__(self, p: float = 0.0, qmin: int = 30, qmax: int = 90):
+        self.p, self.qmin, self.qmax = p, qmin, qmax
+
+    def __call__(self, img):
+        if self.p <= 0.0 or random.random() >= self.p:
+            return img
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=random.randint(self.qmin, self.qmax))
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+
 class RandomPixelate:
     def __init__(self, p=0.2, min_res=32, max_res=112):
         self.p = p
@@ -255,9 +294,14 @@ class SAM3DStudentDataset(Dataset):
     def __init__(self, data_root: str,
                  image_size: int = 224, max_images: int | None = None,
                  augment: bool = True, per_dataset_caps: dict | None = None,
+                 pairs: list | None = None,
                  geom_p: float = 0.8, geom_rot_deg: float = 30.0,
                  geom_scale_range: float = 0.25, geom_trans: float = 0.08,
-                 geom_flip_p: float = 0.5):
+                 geom_flip_p: float = 0.5,
+                 geom_scale_max: float | None = None,
+                 cliff_follows_aug: bool = False,
+                 occl_p: float = 0.2, occl_scale: tuple = (0.02, 0.15),
+                 jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90)):
         super().__init__()
         self.image_size = image_size
         self.data_root = Path(data_root)
@@ -267,6 +311,8 @@ class SAM3DStudentDataset(Dataset):
         self.geom_scale_range = geom_scale_range
         self.geom_trans = geom_trans
         self.geom_flip_p = geom_flip_p
+        self.geom_scale_max = geom_scale_max
+        self.cliff_follows_aug = cliff_follows_aug
 
         tfm_list = [transforms.Resize((image_size, image_size))]
 
@@ -275,6 +321,7 @@ class SAM3DStudentDataset(Dataset):
                 transforms.RandomApply([transforms.ColorJitter(
                     brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)], p=0.5),
                 RandomPixelate(p=0.2, min_res=48, max_res=112),
+                RandomJPEG(p=jpeg_p, qmin=jpeg_quality[0], qmax=jpeg_quality[1]),
                 transforms.RandomApply([transforms.GaussianBlur(kernel_size=5)], p=0.2),
             ])
 
@@ -285,9 +332,22 @@ class SAM3DStudentDataset(Dataset):
         ])
 
         if augment:
-            tfm_list.append(transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)))
+            # MeTRAbs Table 7 puts synthetic occlusion at p=0.7 and credits it
+            # with 52.8 -> 49.3 mm on top of an already-strong colour pipeline.
+            tfm_list.append(transforms.RandomErasing(p=occl_p, scale=tuple(occl_scale)))
 
         self.transform = transforms.Compose(tfm_list)
+
+        # A prebuilt index short-circuits the filesystem scan below. That scan
+        # is one glob plus a stat() per crop -- ~7.5 M metadata operations on a
+        # 3.7 M-crop corpus -- and on a parallel filesystem it dominates job
+        # startup, so having every DDP rank redo it is the largest fixed cost of
+        # a cluster run. See build_pair_index() in train_distill_jz.py.
+        if pairs is not None:
+            self.pairs = list(pairs)
+            print(f"  Prebuilt index: {len(self.pairs)} (image, npz) pairs "
+                  f"(augment={augment}).")
+            return
 
         self.pairs = []
         dataset_dirs = self._find_dataset_dirs(self.data_root)
@@ -407,7 +467,16 @@ class SAM3DStudentDataset(Dataset):
                 M_flip = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
             angle = random.uniform(-self.geom_rot_deg, self.geom_rot_deg)
-            scale = random.uniform(1.0 - self.geom_scale_range, 1.0 + self.geom_scale_range)
+            # Asymmetric by design. bbox_square is exactly 1.2x the tight box on
+            # every split, so the body fills 83.3% of the crop and the old
+            # symmetric ceiling of 1.25 shaved ~2% off each side -- it
+            # essentially never truncated. A ceiling of 2.0 retains the central
+            # quarter by area, which is MeTRAbs's bound. Zoom-OUT is still
+            # capped at 1-geom_scale_range because there are no pixels outside
+            # bbox_square; warpAffine would fill the margin with black.
+            scale_hi = (1.0 + self.geom_scale_range if self.geom_scale_max is None
+                        else self.geom_scale_max)
+            scale = random.uniform(1.0 - self.geom_scale_range, scale_hi)
             dx = random.uniform(-self.geom_trans, self.geom_trans)
             dy = random.uniform(-self.geom_trans, self.geom_trans)
             M_rst = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, scale)
@@ -451,6 +520,19 @@ class SAM3DStudentDataset(Dataset):
             dxy = R_v.astype(np.float64) @ dxy
             cx, cy = orig_w / 2.0 + dxy[0], orig_h / 2.0 + dxy[1]
 
+            # CLIFF conditioning describes the box this crop came from. The flip
+            # and rotation above already move it; dx/dy/scale did not, which was
+            # harmless at +/-0.08 and 1.25 but not at truncation strength. A
+            # crop-space shift of dx corresponds to the box moving
+            # dx * crop_w / 2 original pixels, and a zoom of s shrinks the
+            # visible box by s -- which is exactly what an off-centre or badly
+            # sized detector box looks like at deployment.
+            if self.cliff_follows_aug:
+                crop_w = float(sq_bbox[2] - sq_bbox[0])
+                cx -= dx * crop_w / 2.0
+                cy -= dy * crop_w / 2.0
+                b_scale = b_scale / scale
+
         image = self.transform(img_pil)  
 
         cx_norm = 2.0 * (cx / orig_w) - 1.0
@@ -479,7 +561,11 @@ class SAM3DStudentDataset(Dataset):
 def build_dataloaders(cfg):
     geom = dict(geom_p=cfg.geom_p, geom_rot_deg=cfg.geom_rot_deg,
                 geom_scale_range=cfg.geom_scale_range,
-                geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p)
+                geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
+                geom_scale_max=cfg.geom_scale_max,
+                cliff_follows_aug=cfg.cliff_follows_aug,
+                occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
+                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,
@@ -811,7 +897,15 @@ class DistillationLoss(nn.Module):
         losses['loss_pose'] = self.m_smooth_l1(pred_pose, tgt_pose, m_ident) * self.cfg.w_pose
         losses['loss_scale'] = self.m_mse(pred_scale, tgt_scale, m_noflip) * self.cfg.w_scale
         losses['loss_shape'] = self.m_mse(preds["shape_params"], targets["shape_params"], m_noflip) * self.cfg.w_shape
-        losses['loss_cam'] = self.mse(preds["cam_trans"], targets["cam_trans"]) * self.cfg.w_cam
+        # NLF applies its translation loss as an unsquared Euclidean norm over the
+        # xyz triple rather than elementwise MSE: MSE lets one badly-scaled axis
+        # (in practice depth, which is an order of magnitude larger than x/y)
+        # dominate the gradient of all three.
+        if getattr(self.cfg, "cam_loss", "mse") == "euclid":
+            e_cam = torch.linalg.norm(preds["cam_trans"] - targets["cam_trans"], dim=-1)
+            losses['loss_cam'] = e_cam.mean() * self.cfg.w_cam
+        else:
+            losses['loss_cam'] = self.mse(preds["cam_trans"], targets["cam_trans"]) * self.cfg.w_cam
 
         pred_mhr_joints = self.mhr_module.get_joints(preds["mhr_params"], preds["shape_params"])[..., :3]
         with torch.no_grad():
@@ -852,15 +946,31 @@ class DistillationLoss(nn.Module):
         if w_kp is None:
             w_kp = torch.ones_like(tgt_2d[..., 0])
 
+        # Truncation augmentation pushes keypoints outside the crop. Both 2D
+        # terms below are BOUNDED -- SimCC spans +/-kp2d_range and pred_2d is a
+        # soft-argmax over those same bins -- so a target at 1.67 cannot be
+        # reached. Clamping it to 1.5 asserts the joint is exactly at the crop
+        # edge, which is false, and leaves a permanent saturating gradient at
+        # w_keypoints2d = 10. Mask instead: the 3D loss still supervises those
+        # joints, which is the whole MeTRo argument for predicting them at all.
+        #
+        # Do NOT widen kp2d_range instead: bin_w = 2*range/(bins-1), so at 96
+        # bins that trades 3.5 px bins for 5.9 px, degrading every in-frame
+        # joint to accommodate the out-of-frame ones.
+        w_kp_2d = w_kp
+        if getattr(self.cfg, "mask_oob_2d", False):
+            in_crop = (tgt_2d.abs() <= self.cfg.kp2d_range).all(-1).to(w_kp.dtype)
+            w_kp_2d = w_kp * in_crop
+
         # 2D head — training-only auxiliary task, and the ONLY supervision that
         # survives a horizontal flip in full (targets["joints_2d"] is mirrored
         # AND FLIP_PERM-permuted by the dataset, so it stays self-consistent —
         # and so is joints_2d_vis).
         e2d = F.smooth_l1_loss(pred_2d[..., :2], tgt_2d, reduction='none').mean(-1)
-        losses['loss_2d_native'] = self._kp_weighted(e2d, w_kp) * self.cfg.w_keypoints2d
+        losses['loss_2d_native'] = self._kp_weighted(e2d, w_kp_2d) * self.cfg.w_keypoints2d
         if "joints_2d_logits" in preds:
             losses['loss_2d_simcc'] = self._simcc_ce(
-                preds["joints_2d_logits"], tgt_2d, w_kp) * self.cfg.w_simcc
+                preds["joints_2d_logits"], tgt_2d, w_kp_2d) * self.cfg.w_simcc
 
         # Main 3D loss, now on the MHR-derived keypoints.  Deliberately UNMASKED:
         # targets["joints_3d"] is mirrored + permuted under flip, and the MHR rest
@@ -883,14 +993,32 @@ class DistillationLoss(nn.Module):
         cam_cr = _counter_rot_cam(preds["cam_trans"])
 
         # Single re-projection (replaces loss_reproj_native + loss_reproj_mhr):
-        # one geometry, all 70 keypoints.  Still m_noflip — the re-projection
-        # path undoes the rotation but not the mirror, so flipped samples would
-        # need an extra FLIP_PERM + cx mirror that is not worth the complexity
-        # for a 0.01-weight auxiliary term.
-        pred_reproj = self._project_3d_to_norm_2d(_counter_rot_pts(pred_kp3d), cam_cr, targets)
+        # one geometry, all 70 keypoints.
+        #
+        # The projection runs in the ORIGINAL image frame (real focal, image
+        # centre, un-augmented bbox_square) and only then applies aug_M, which
+        # carries the mirror. So a flipped sample has to be un-mirrored first,
+        # or it gets mirrored twice. The dataset applies flip THEN rotation, so
+        # the inverse is counter-rotate THEN negate x -- on the keypoints and on
+        # cam_trans alike, both of which the dataset negated. Index order needs
+        # no fixing: pred_kp3d is already in FLIP_PERM order and aug_M maps it to
+        # the same order as tgt_2d.
+        #
+        # Previously this whole term was masked to m_noflip, which was defensible
+        # at w_reproj = 0.01 and is not once the weight matters: half the batch
+        # would contribute nothing to the only loss tying 3D to pixels.
+        pts_cr, cam_cr_r = _counter_rot_pts(pred_kp3d), cam_cr
+        m_reproj = m_noflip
+        if getattr(self.cfg, "reproj_all_samples", False):
+            sgn = (1.0 - 2.0 * aug_flip).view(-1, 1)                  # +1 / -1
+            pts_cr = torch.stack([pts_cr[..., 0] * sgn, pts_cr[..., 1],
+                                  pts_cr[..., 2]], dim=-1)
+            cam_cr_r = torch.cat([cam_cr[:, 0:1] * sgn, cam_cr[:, 1:]], dim=1)
+            m_reproj = ones
+        pred_reproj = self._project_3d_to_norm_2d(pts_cr, cam_cr_r, targets)
         e_reproj = (pred_reproj - tgt_2d).abs().mean(-1)
         losses['loss_reproj'] = self._kp_weighted(
-            e_reproj, w_kp, m_noflip) * self.cfg.w_reproj * self.fk_scale
+            e_reproj, w_kp, m_reproj) * self.cfg.w_reproj * self.fk_scale
 
         losses['total_loss'] = sum(losses.values())
         return losses
