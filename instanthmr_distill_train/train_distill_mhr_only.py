@@ -166,6 +166,9 @@ class DistillConfig:
     reproj_all_samples: bool = False      # include flipped samples in loss_reproj
     cam_loss: str = "mse"                 # "mse" | "euclid" (unsquared L2 on xyz)
 
+    max_consecutive_skips: int = 200  # abort rather than burn the allocation
+                                      # on a run that has already diverged
+
     kp2d_bins: int = 96            
     kp2d_range: float = 1.5        
 

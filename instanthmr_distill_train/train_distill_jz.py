@@ -176,6 +176,15 @@ def build_pair_index(data_root: str, cache: Path | None = None,
                 pairs = [(root / sub / "images" / f"{stem}{ext}",
                           root / sub / "annotations" / f"{stem}.npz")
                          for sub, stem, ext in blob["entries"]]
+                # One stat() against millions saved. Catches a cache written by
+                # an older build whose stored sub-folder does not round-trip
+                # under this data_root -- silently wrong paths would otherwise
+                # surface as a FileNotFoundError from a dataloader worker hours
+                # into a job.
+                if pairs and not pairs[0][0].exists():
+                    log_fn(f"  pair index: {cache} does not resolve under "
+                           f"{root} (first entry {pairs[0][0]}) — rebuilding")
+                    raise FileNotFoundError(cache)
                 log_fn(f"  pair index: {len(pairs):,} crops from cache {cache} "
                        f"(built {blob.get('built', '?')})")
                 return pairs
@@ -186,7 +195,12 @@ def build_pair_index(data_root: str, cache: Path | None = None,
     t0 = time.time()
     log_fn(f"  pair index: scanning {root} (slow — this is why it is cached)")
     ds = T.SAM3DStudentDataset(str(root), augment=False, per_dataset_caps=None)
-    entries = [(npz.parent.parent.name, npz.stem, img.suffix)
+    # relative_to(root), not .name: when data_root IS a split -- it holds
+    # annotations/ and images/ directly -- .name is the root's own folder and
+    # rebuilding yields <root>/<root name>/images/... For the nested layout the
+    # two are identical, which is why INDEX_VERSION does not need bumping and
+    # existing caches stay valid. Path / "." normalises away, so no special case.
+    entries = [(str(npz.parent.parent.relative_to(root)), npz.stem, img.suffix)
                for img, npz in ds.pairs]
     log_fn(f"  pair index: {len(entries):,} crops in {time.time() - t0:.0f}s")
 
@@ -380,6 +394,12 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
 # ============================================================
 # Checkpointing
 # ============================================================
+def atomic_save_json(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
+
+
 def atomic_save(obj, path: Path) -> None:
     """Write then rename. A job killed mid-``torch.save`` must not leave a
     truncated ``last.pth`` — that would turn one lost epoch into a lost run."""
@@ -460,7 +480,7 @@ def train(args, cfg, rank, local_rank, world):
     train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
     steps_per_epoch = len(train_loader)
 
-    dpw_loader = None
+    dpw_loader = dpw_test_loader = None
     if args.val_3dpw:
         if not args.val_3dpw_images:
             raise SystemExit("--val-3dpw needs --val-3dpw-images")
@@ -474,6 +494,22 @@ def train(args, cfg, rank, local_rank, world):
             num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
         log(f"3DPW {args.val_3dpw_split}: {len(dpw):,} person-frames "
             f"(stride {args.val_3dpw_stride}) -> selection metric is J12 PA-MPJPE")
+
+        # Optional read-only monitor on the split the paper reports. Selection
+        # NEVER touches it: picking the best of ~100 epochs on the test split
+        # would bank a few mm of selection luck and the published number would
+        # no longer be held out. Watching it is fine; optimising against it is
+        # not, so it is logged and never compared to `best`.
+        if args.val_3dpw_test:
+            dpw_t = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
+                                   split="test", stride=args.val_3dpw_test_stride)
+            dpw_test_loader = torch.utils.data.DataLoader(
+                torch.utils.data.Subset(dpw_t, list(range(rank, len(dpw_t), world))),
+                batch_size=cfg.batch_size, shuffle=False, drop_last=False,
+                num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
+            log(f"3DPW test:       {len(dpw_t):,} person-frames "
+                f"(stride {args.val_3dpw_test_stride}) -> REPORTED ONLY, "
+                f"never used for checkpoint selection")
 
     model = T.InstantHMRStudent(cfg, pretrained=not args.no_pretrained).to(device)
     if args.sync_bn and world > 1:
@@ -501,20 +537,60 @@ def train(args, cfg, rank, local_rank, world):
     if last_path.exists() and not args.no_resume:
         ck = torch.load(last_path, map_location=device, weights_only=False)
         prev = ck.get("run", {})
+        prev_epochs = prev.get("epochs")
+        extending = bool(args.extend and prev_epochs is not None
+                         and args.epochs > prev_epochs)
         for k in ("epochs", "samples_per_epoch", "batch_size"):
             cur = {"epochs": args.epochs, "samples_per_epoch": args.samples_per_epoch,
                    "batch_size": cfg.batch_size}[k]
-            if prev.get(k) not in (None, cur):
+            if prev.get(k) not in (None, cur) and not (k == "epochs" and extending):
                 log(f"⚠️  {k} changed {prev[k]} -> {cur} since the checkpoint. "
                     f"OneCycleLR's schedule is defined over the ORIGINAL total "
                     f"step count, so the LR curve will not match a fresh run.")
+        # A changed --lr on resume is silently ignored: OneCycleLR keeps max_lr in
+        # the optimiser's param groups, and optimizer.load_state_dict below
+        # restores the checkpoint's. You would think you were training at the new
+        # rate and actually be back at the old one. Refuse instead -- this cost a
+        # 16-hour run once.
+        prev_lr = prev.get("lr")
+        if prev_lr is not None and abs(prev_lr - cfg.lr) > 1e-12 and not extending:
+            raise SystemExit(
+                f"refusing to resume: checkpoint was trained at peak lr "
+                f"{prev_lr:.3e}, this invocation asks for {cfg.lr:.3e}.\n"
+                f"OneCycleLR stores max_lr in the optimiser state, so resuming "
+                f"would silently use {prev_lr:.3e} and ignore your --lr.\n"
+                f"Use a NEW --output_dir (RUN_NAME) to start fresh at "
+                f"{cfg.lr:.3e}, or delete {last_path} to restart in place.")
+
         unwrap(model).load_state_dict(ck["model_state_dict"])
         ema.load_state_dict(ck["ema_state_dict"])
         optimizer.load_state_dict(ck["optimizer_state_dict"])
         scaler.load_state_dict(ck["scaler_state_dict"])
-        scheduler.load_state_dict(ck["scheduler_state_dict"])
-        best = ck["best"]
         start_epoch = ck["epoch"] + 1
+        if extending:
+            # A finished OneCycle run sits at lr ~= 0, and its state_dict carries
+            # total_steps -- loading it would clobber the longer schedule built
+            # above and then raise on the first step past the old total. Instead
+            # keep the NEW schedule and fast-forward it to where we are, so the
+            # remaining epochs follow the tail of a curve drawn for the full
+            # extended length.
+            #
+            # Be clear about what this is: a warm restart, not the same
+            # trajectory as one uninterrupted run of the longer length, because
+            # the weights up to here were produced under a schedule that had
+            # already annealed. Fine for squeezing more out of a converged run;
+            # not a substitute for choosing the epoch count up front when two
+            # arms have to be comparable.
+            for _ in range(start_epoch * steps_per_epoch):
+                scheduler.step()
+            log(f"⏩ extending {prev_epochs} -> {args.epochs} epochs. Warm restart: "
+                f"schedule rebuilt over the new total and fast-forwarded to "
+                f"step {start_epoch * steps_per_epoch:,}, lr "
+                f"{scheduler.get_last_lr()[0]:.2e}. NOT equivalent to a single "
+                f"{args.epochs}-epoch run.")
+        else:
+            scheduler.load_state_dict(ck["scheduler_state_dict"])
+        best = ck["best"]
         if (r := ck.get("rng")):
             random.setstate(r["python"]); np.random.set_state(r["numpy"])
             torch.set_rng_state(r["torch"].cpu())
@@ -530,11 +606,31 @@ def train(args, cfg, rank, local_rank, world):
     log(f"steps/epoch {steps_per_epoch} | world {world} | "
         f"effective batch {cfg.batch_size * world} | peak lr {cfg.lr:.2e}")
 
+    if is_main():
+        # summarize_runs.py reads this for the epoch total, the preset and the
+        # seed; without it every run shows "?/?" and no preset.
+        atomic_save_json(out_dir / "run_config.json", {
+            "preset": args.preset, "seed": args.seed, "epochs": args.epochs,
+            "samples_per_epoch": args.samples_per_epoch,
+            "batch_size": cfg.batch_size, "world": world,
+            "lr": cfg.lr, "lr_arg": args.lr, "lr_scaling": args.lr_scaling,
+            "mix": args.mix, "steps_per_epoch": steps_per_epoch,
+            "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
+            "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
+            "jpeg_p": cfg.jpeg_p, "cam_loss": cfg.cam_loss,
+            "started": time.strftime("%Y-%m-%d %H:%M")})
+
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         ddp_model.train()
-        run = {"total": 0.0, "3d": 0.0, "2d": 0.0, "simcc": 0.0}
+        # reproj and cam are here because --preset v2 changes both; without them
+        # a regression in the absolute-pose supervision is invisible in
+        # history.jsonl and you would have to guess from the total.
+        run = {"total": 0.0, "3d": 0.0, "2d": 0.0, "simcc": 0.0,
+               "reproj": 0.0, "cam": 0.0, "pose": 0.0}
         nb = 0
+        n_skip = n_skip_run = 0
+        t_epoch = time.time()
         criterion.set_step(epoch * steps_per_epoch)
         for i, batch in enumerate(train_loader):
             batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
@@ -556,8 +652,32 @@ def train(args, cfg, rank, local_rank, world):
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX)
                 bad = int(flag.item())
             if bad:
-                log(f"⚠️  skipping step {i} (loss {lv:.1f})")
+                n_skip += 1
+                n_skip_run += 1
+                # Step the schedule ANYWAY. Skipping it freezes the LR, and a
+                # too-high LR is what produces anomalies in the first place, so
+                # `continue`-ing past it is a runaway: skip -> LR stays at peak
+                # -> more skips -> never anneals. Measured on the first sweep:
+                # by epoch 20 the scheduler had taken 8,161 of 29,678 steps and
+                # the LR was pinned at 1.18e-3 instead of annealing to 4.3e-4.
+                scheduler.step()
+                # Drop the graph before the next forward builds another one.
+                # Without this, `continue` leaves two autograd graphs alive at
+                # once -- measured 1.8x peak memory, 9.3 -> 17.2 GiB, which OOMs
+                # a 16 GB node.
+                del preds, losses, loss
+                if n_skip_run == 1 or n_skip_run % 100 == 0:
+                    log(f"⚠️  skipping step {i} (loss {lv:.1f}) "
+                        f"[{n_skip_run} consecutive]")
+                if n_skip_run >= cfg.max_consecutive_skips:
+                    raise RuntimeError(
+                        f"{n_skip_run} consecutive anomalous steps at epoch "
+                        f"{epoch + 1} — the run has diverged and will not "
+                        f"recover. Lower --lr (or use --lr-scaling sqrt/none) "
+                        f"and restart. Exiting rather than burning the "
+                        f"remaining {args.epochs - epoch} epochs.")
                 continue
+            n_skip_run = 0
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -572,6 +692,9 @@ def train(args, cfg, rank, local_rank, world):
             run["3d"] += losses.get("loss_3d_native", torch.zeros(())).item()
             run["2d"] += losses.get("loss_2d_native", torch.zeros(())).item()
             run["simcc"] += losses.get("loss_2d_simcc", torch.zeros(())).item()
+            run["reproj"] += losses.get("loss_reproj", torch.zeros(())).item()
+            run["cam"] += losses.get("loss_cam", torch.zeros(())).item()
+            run["pose"] += losses.get("loss_pose", torch.zeros(())).item()
             nb += 1
             if is_main() and i % args.log_every == 0:
                 log(f"  e{epoch+1}/{args.epochs} step {i}/{steps_per_epoch} "
@@ -584,7 +707,7 @@ def train(args, cfg, rank, local_rank, world):
         # 3DPW, when available, replaces the held-in metric for selection: it is
         # the only signal here that measures generalisation rather than teacher
         # agreement. The held-in numbers keep printing either way.
-        dpw_raw = dpw_em = None
+        dpw_raw = dpw_em = dpw_test_raw = dpw_test_em = None
         if dpw_loader is not None:
             import val3dpw
             dpw_raw = all_reduce_mean(
@@ -593,6 +716,11 @@ def train(args, cfg, rank, local_rank, world):
             dpw_em = all_reduce_mean(
                 val3dpw.evaluate(ema, dpw_loader, mhr_module, device, cfg.use_amp),
                 device)
+            if dpw_test_loader is not None:
+                dpw_test_raw = all_reduce_mean(val3dpw.evaluate(
+                    ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp), device)
+                dpw_test_em = all_reduce_mean(val3dpw.evaluate(
+                    ema, dpw_test_loader, mhr_module, device, cfg.use_amp), device)
             raw["Mesh_PA_MPJPE"], em["Mesh_PA_MPJPE"] = (
                 dpw_raw["J12_PA_MPJPE"], dpw_em["J12_PA_MPJPE"])
             raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
@@ -601,7 +729,9 @@ def train(args, cfg, rank, local_rank, world):
         log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}"
             f" | peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
         log(f"   train  total {tr['total']:.4f} | 3d {tr['3d']:.4f} | "
-            f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f}")
+            f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f} | "
+            f"reproj {tr['reproj']:.4f} | cam {tr['cam']:.4f} "
+            f"| skipped {n_skip}/{steps_per_epoch} | {time.time() - t_epoch:.0f}s")
         log(f"   valRAW loss {raw['loss']:.4f} | PA-MPJPE {raw['Mesh_PA_MPJPE']:.1f} | "
             f"MPJPE {raw['Mesh_MPJPE']:.1f} mm")
         log(f"   valEMA loss {em['loss']:.4f} | PA-MPJPE {em['Mesh_PA_MPJPE']:.1f} | "
@@ -611,6 +741,12 @@ def train(args, cfg, rank, local_rank, world):
                 f"MPJPE {dpw_raw['J12_MPJPE']:.1f} | J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} mm")
             log(f"   3DPW-{args.val_3dpw_split} EMA  J12 PA {dpw_em['J12_PA_MPJPE']:.1f} "
                 f"MPJPE {dpw_em['J12_MPJPE']:.1f} | J14 PA {dpw_em['J14_PA_MPJPE']:.1f} mm")
+        if dpw_test_raw is not None:
+            log(f"   3DPW-TEST (report only, not used for selection)")
+            log(f"     RAW  J14 MPJPE {dpw_test_raw['J14_MPJPE']:.1f} | "
+                f"J14 PA {dpw_test_raw['J14_PA_MPJPE']:.1f} mm")
+            log(f"     EMA  J14 MPJPE {dpw_test_em['J14_MPJPE']:.1f} | "
+                f"J14 PA {dpw_test_em['J14_PA_MPJPE']:.1f} mm")
 
         improved = False
         if raw["Mesh_PA_MPJPE"] < best["raw"]:
@@ -646,7 +782,12 @@ def train(args, cfg, rank, local_rank, world):
                 fh.write(json.dumps({"epoch": epoch, "train": tr,
                                      "val_raw": raw, "val_ema": em,
                                      "dpw_raw": dpw_raw, "dpw_ema": dpw_em,
-                                     "lr": scheduler.get_last_lr()[0]}) + "\n")
+                                     "dpw_test_raw": dpw_test_raw,
+                                     "dpw_test_ema": dpw_test_em,
+                                     "lr": scheduler.get_last_lr()[0],
+                                     "skipped": n_skip,
+                                     "sec": round(time.time() - t_epoch, 1),
+                                     "at": time.time()}) + "\n")
         if world > 1:
             dist.barrier()   # nobody starts epoch N+1 before last.pth is on disk
 
@@ -679,7 +820,7 @@ def parse_args():
                    help="PER GPU. Effective batch is this times the world size.")
     p.add_argument("--lr", type=float, default=3e-4,
                    help="Peak LR for a single GPU; scaled by --lr-scaling.")
-    p.add_argument("--lr-scaling", choices=("linear", "sqrt", "none"), default="linear",
+    p.add_argument("--lr-scaling", choices=("linear", "sqrt", "none"), default="sqrt",
                    help="How to scale --lr with world size. 'linear' is the "
                         "standard rule for SGD-style large-batch training; "
                         "'sqrt' is gentler and sometimes better for Adam.")
@@ -701,6 +842,11 @@ def parse_args():
                    choices=("validation", "test", "train"),
                    help="Keep this at 'validation'. Selecting on 'test' spends "
                         "the split benchmark/eval_3dpw.py reports.")
+    p.add_argument("--val-3dpw-test", action="store_true",
+                   help="ALSO evaluate the 24-sequence test split each epoch and "
+                        "log it, so you can watch the number the paper will "
+                        "report. Never used for checkpoint selection.")
+    p.add_argument("--val-3dpw-test-stride", type=int, default=5)
     p.add_argument("--val-3dpw-stride", type=int, default=5,
                    help="3DPW is 30 fps; neighbouring frames are near-duplicates.")
     p.add_argument("--mix", default="sqrt",
@@ -717,6 +863,11 @@ def parse_args():
 
     p.add_argument("--sync-bn", action="store_true")
     p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--extend", action="store_true",
+                   help="Continue a run past the epoch count it was trained "
+                        "with: rebuild the LR schedule over the new total and "
+                        "fast-forward it. A warm restart, not the same as one "
+                        "long run -- see the note in the resume path.")
     p.add_argument("--no-pretrained", action="store_true",
                    help="Skip the timm download. Compute nodes have no internet, "
                         "so run --warm-cache once on a login node instead.")
