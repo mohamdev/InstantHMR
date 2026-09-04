@@ -55,6 +55,46 @@ Two things to know when reading v2 results:
 so the term stops being decorative). Sweep it first if v2 underperforms:
 `--preset v2 --w_reproj 0.1`.
 
+## The `--losses` switch
+
+**Orthogonal to `--preset`.** `--preset` controls the input pipeline and the
+absolute-pose terms; `--losses {legacy,rebalanced}` controls the loss budget.
+`legacy` is the default and is bit-identical to the pre-rebalance trainer, so
+b2 / v2 runs already in flight stay valid controls. The four arms are
+`baseline`, `v2`, `baseline + rebalanced`, `v2 + rebalanced`.
+
+`rebalanced` (see `apply_rebalanced_losses` in `train_distill_mhr_only.py`)
+comes from two measurements on a trained checkpoint, both reproducible from the
+repo root against `data/sam3d_gt_coco`:
+
+- **an oracle ablation** — replace one predicted group with the teacher's value
+  and re-measure. Of the 37.8 mm of removable PA-MPJPE, `pose[6:136]` (the 130
+  local joint angles) accounts for **34.3 mm**; the bone scales, the root and
+  the 45 identity blendshapes account for **0.00 mm each**.
+- **a per-term gradient norm** — back-propagate each term alone. `loss_shape`
+  owned 27% of the update direction and `loss_cam` 15%, against `loss_pose`'s
+  4.7% on 21% of the batch.
+
+| item | change | why |
+|---|---|---|
+| shape | `w_shape` 1.0 -> 0.03 | Driving MHR params 204–248 to ±2σ moves the 127-joint skeleton by exactly `0.00e+00` cm, and `MHRForwardPass.get_joints` substitutes zeros for `shape_params` anyway. The blendshapes drive the mesh only. Kept non-zero so the deployed mesh identity stays supervised. |
+| pose mask | `pose_split` | `loss_pose` was masked to `m_ident` (21% of the batch) because the dataset rotates the labels. Model params 3/4/5 map to joint-parameter slots 10/11/12 and nothing else, so `pose[6:136]` is exactly invariant to the in-plane rotation and only needs the flip mask — 21% -> 60% coverage on the parameters that carry all of the error. Root stays on `m_ident`; the two halves keep their per-parameter weight, so this changes the mask and not the root-vs-local balance. |
+| pose beta | `pose_beta` 1.0 -> 0.05 | SmoothL1's beta is in radians here, so 1.0 is ~10x the p95 error and the term is a scaled MSE. |
+| 3D loss | `kp3d_loss` `euclid`, `w_keypoints3d` 2.0 -> 0.35 | SmoothL1's beta of 1.0 is one **metre**, so at a 37.7 mm mean / 119 mm p95 error every sample is in the quadratic branch: 16x less gradient than L1 and 31x less than NLF's unsquared Euclidean at the same weight. The weight drops because the form under it changed. |
+| fingers | `finger_weight` 0.2 | 40 of the 70 keypoints are finger joints and they carry 61% of `loss_3d_native`'s mass, while J12/J14 contain none of them and SA-1B — 55% of the batch under `--mix sqrt` — records hands as 8% observed. Applied to `loss_3d_native` and `loss_reproj`, the two FK-derived geometric terms; the 2D head's own terms are untouched. |
+
+**The unsquared Euclidean is gentler where divergence happens, not harsher.**
+`d‖x‖/dx` is a unit vector, so its gradient is flat in the error, where
+SmoothL1(beta=1) grows with it. Measured against the form it replaces, at the
+weights above: **0.62x** the gradient on a freshly initialised model (515 mm
+error) and 6.4x once trained (60 mm). That is the opposite of the shape that
+produced the LR blow-ups in `datasets_pipeline/jeanzay/STATUS.md`.
+
+Validation also gains `Mesh_PA_MPJPE_body` / `Mesh_MPJPE_body` over the 30
+non-finger keypoints, reported next to the existing metrics. **Selection is
+unchanged** — and with `--val-3dpw` on, both are replaced by the 3DPW J12
+numbers anyway.
+
 ## The pair index
 
 `SAM3DStudentDataset` enumerates the corpus with one `glob` plus a `stat()` per

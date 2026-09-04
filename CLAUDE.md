@@ -73,10 +73,10 @@ Docs are the source of truth; the code is bigger than any context window.
 
 | order | file | for |
 |---|---|---|
-| 1 | `instanthmr_distill_train/README.md` | which training script to run, what `--preset v2` changes, the pair-index cache |
+| 1 | `instanthmr_distill_train/README.md` | which training script to run, what `--preset v2` and `--losses rebalanced` change, the pair-index cache |
 | 2 | `datasets_pipeline/jeanzay/STATUS.md` | Jean Zay cluster + data state, what is built, job templates *(git-excluded, local only)* |
 | 3 | `datasets_pipeline/JEAN_ZAY.md` | site runbook: env, quotas, proxy quirks *(git-excluded, local only)* |
-| 4 | `benchmark/README.md` | how published numbers are produced; J12 vs J14 and MHR-vs-SMPL joint conventions |
+| 4 | `benchmark/README.md` | how published numbers are produced; J12 vs J14, and **why the current 3DPW GT is not yet the published protocol** |
 | 5 | `datasets_pipeline/README.md` | how the corpus is built, including the SA-1B visibility mask |
 | 6 | `docs/architecture.md` | the student model |
 
@@ -93,10 +93,30 @@ file so both entry points get them. **Never fork the base file** — that is how
 `train_distill.py` drifted until its ONNX export silently zeroed the SimCC 2D
 head, with keypoints collapsing to the bbox centre and no error raised.
 
-**`--preset baseline` must stay bit-identical.** Runs in flight use it as the
-control. If you change the dataset or a loss, gate it behind a config flag whose
-default reproduces the old behaviour, and prove it — diff a few dozen augmented
-samples against `git show HEAD:<file>`.
+**`--preset baseline` and `--losses legacy` must stay bit-identical.** Runs in
+flight use them as controls. The two flags are orthogonal axes — `--preset` is
+the input pipeline and the absolute-pose terms, `--losses` is the loss budget —
+and both default to the old behaviour. If you change the dataset or a loss, gate
+it behind a config flag whose default reproduces the old behaviour, and prove it
+— diff a few dozen augmented samples against `git show HEAD:<file>`. When you
+do, compare **alternating** calls: the TorchScript MHR forward differs by ~5e-10
+on its first invocation in a process (cold-kernel autotuning), which reads as a
+regression if you only compare once.
+
+**Know the MHR parameter layout before touching a pose loss.** From
+`character_torch.parameter_transform.parameter_names`: `0:3` root translation
+(always 0 in the corpus, 1 unit = 10 cm), `3:6` root rotation (extrinsic-XYZ
+Euler, driving joint-parameter slots 10/11/12 *and nothing else*), `6:136` the
+130 local joint angles, `136:204` 68 bone scales. Consequences that cost a
+session to re-derive: `6:136` is exactly invariant to the in-plane rotation
+augmentation, so it never needed the `m_ident` mask; and the 45 `shape_params`
+move the 127-joint skeleton by `0.00e+00 cm`, so they are mesh-only and every
+loss and metric in the trainer is blind to them.
+
+**`DistillationLoss` is never `.to(device)`'d.** `run_overfit_test`,
+`run_self_tests`, `train_instant_hmr` and `train_distill_jz.train` all construct
+it bare, so any buffer you register lands on the CPU and raises on step 1. Build
+tensors on `mhr_module.device` instead.
 
 **Seed spread is wide.** Observed 70-keypoint PA-MPJPE varies 34–49 mm across
 seeds, which is larger than several of the changes on the roadmap. A single-run

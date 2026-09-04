@@ -1,9 +1,18 @@
 # Model architecture
 
-InstantHMR is a 17 M-parameter network that mimics
-`facebook/sam-3d-body-dinov3` on the **per-person 3D pose estimation** task,
-running ~80× faster on a single GPU and exporting cleanly to ONNX / TFLite /
-QNN for mobile and edge deployment.
+InstantHMR mimics `facebook/sam-3d-body-dinov3` on the **per-person 3D pose
+estimation** task, running ~80× faster on a single GPU and exporting cleanly to
+ONNX / TFLite / QNN for mobile and edge deployment.
+
+> **This page describes the released 17 M checkpoint, not what the trainer
+> builds today.** `train_distill_mhr_only.py`'s `DistillConfig` defaults to
+> `repvit_m2_3` at `d_model=512`, 8 heads, 4 decoder layers, and **71** query
+> tokens (1 global + 70 for the 2D SimCC head) — **39.96 M parameters**:
+> 22.40 M backbone, 16.82 M decoder. The per-part joint queries in the table
+> below are gone; every parameter output now comes from one
+> `Linear(512 → 252)` on the single global token, and the 3D keypoints are
+> derived from the MHR forward pass rather than predicted. Read the config, not
+> this page, before quoting a parameter count.
 
 ## High level
 

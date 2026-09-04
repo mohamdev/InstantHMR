@@ -121,6 +121,31 @@ def _build_flip_perm(names):
 
 FLIP_PERM = _build_flip_perm(JOINT_NAMES)
 
+# 40 of the 70 keypoints are finger joints.  Measured on a trained checkpoint,
+# they carry 61.0% of loss_3d_native's L1 mass and 60% of Mesh_PA_MPJPE, while
+# the published metrics (J12 / J14) contain none of them and SA-1B — 55% of the
+# batch under `--mix sqrt` — records hands as 8% observed.  `finger_weight`
+# down-weights them in the FK-derived geometric losses; see DistillConfig.
+FINGER_KP = np.array(
+    [i for i, n in enumerate(JOINT_NAMES)
+     if any(t in n for t in ("thumb", "index", "middle", "ring", "pinky"))],
+    dtype=np.int64)
+BODY_KP = np.array([i for i in range(len(JOINT_NAMES)) if i not in set(FINGER_KP.tolist())],
+                   dtype=np.int64)
+assert len(FINGER_KP) == 40 and len(BODY_KP) == 30
+
+# MHR model-parameter layout, read off character_torch.parameter_transform:
+#   0:3    root_tx/ty/tz   (always 0 in the corpus)
+#   3:6    root_rx/ry/rz   -> joint-parameter slots 10/11/12 and nothing else
+#   6:136  130 local joint angles
+#   136:204 68 bone scales
+# Because the root rotation is exclusive to slots 10/11/12, the 130 local angles
+# are EXACTLY invariant to the in-plane rotation the dataset applies, which is
+# what makes `pose_split` valid.  Verified: recomposing the root as
+# R_aug @ R_root in extrinsic-xyz Euler reproduces the rotated skeleton up to a
+# pure translation (the pelvis-vs-origin pivot offset), not a pose change.
+POSE_ROOT_DIM = 6
+
 # ============================================================
 # Cell 1 — Configuration
 # ============================================================
@@ -165,6 +190,36 @@ class DistillConfig:
                                           # instead of clamping them to the edge
     reproj_all_samples: bool = False      # include flipped samples in loss_reproj
     cam_loss: str = "mse"                 # "mse" | "euclid" (unsquared L2 on xyz)
+
+    # --- loss-rebalance knobs (`--losses rebalanced` in train_distill_jz.py).
+    # --- Every default below reproduces the pre-rebalance behaviour bit for bit,
+    # --- so `--preset baseline` and `--preset v2` are unaffected.  All four come
+    # --- from the measured error/gradient budget:
+    #   * an oracle ablation attributes 34.3 of the 37.8 mm of removable
+    #     PA-MPJPE to pose[6:136] and 0.00 mm to shape_params, the bone scales
+    #     and the root, yet loss_shape owns 27% of the gradient and loss_pose
+    #     4.7% on 21% of the batch;
+    #   * SmoothL1's default beta=1.0 is a metre, so on metre-scale coordinates
+    #     every sample sits in the quadratic branch -- 16x less gradient than L1
+    #     and 31x less than NLF's unsquared Euclidean, at the same weight.
+    pose_split: bool = False       # supervise pose[6:136] on the 60% of the batch
+                                   # that is not flipped instead of the 21% that is
+                                   # un-augmented.  Root stays on m_ident.  The two
+                                   # halves keep their per-parameter weight (6/136
+                                   # and 130/136 of w_pose), so this changes the
+                                   # MASK, not the root-vs-local balance.
+    pose_beta: float = 1.0         # SmoothL1 beta for the pose terms, in radians.
+                                   # 1.0 rad is ~10x the p95 error, i.e. pure MSE.
+    kp3d_loss: str = "smooth_l1"   # "smooth_l1" | "euclid" (NLF 2407.07532 §3.2:
+                                   # "the Euclidean loss without squaring, for
+                                   # better outlier-robustness").  euclid has a
+                                   # FLAT gradient, so it is *gentler* than the
+                                   # current form at init (measured 0.62x on a
+                                   # fresh model, 515 mm error) and stronger at
+                                   # convergence (6.4x at 60 mm) -- the opposite
+                                   # of the shape that caused the LR divergences.
+    finger_weight: float = 1.0     # per-keypoint weight on FINGER_KP inside
+                                   # loss_3d_native and loss_reproj
 
     max_consecutive_skips: int = 200  # abort rather than burn the allocation
                                       # on a run that has already diverged
@@ -252,6 +307,43 @@ class DistillConfig:
     # No loss uses them any more.
     native_mapping_ids = [ 1, 2, 5, 6, 9, 10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62 ]
     mhr_mapping_ids    = [ 125, 123, 75, 39, 2, 18, 3, 19, 5, 21, 64, 63, 62, 61, 59, 58, 57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 41, 100, 99, 98, 97, 95, 94, 93, 92, 91, 90, 89, 88, 87, 86, 85, 84, 83, 82, 81, 80, 77 ]
+
+def apply_rebalanced_losses(cfg) -> None:
+    """The four loss-budget fixes, as one switch. Lives here, not in
+    train_distill_jz.py, so the single-GPU trainer and the DDP driver cannot
+    drift apart.
+
+    Every number is chosen from a measured unit-weight gradient norm on real
+    augmented batches, not from taste. The resulting split of the update
+    direction (batch 12, epoch-78 checkpoint, COCO):
+
+        term            before   after
+        loss_3d_native     8.5%   30.3%
+        loss_2d_simcc     29.6%   26.4%
+        loss_pose          5.6%   20.2%
+        loss_cam          13.8%   12.3%
+        loss_mhr_joints    8.5%    7.6%
+        loss_shape        14.4%    0.4%
+
+    `w_keypoints3d` drops 2.0 -> 0.35 because the loss form under it changed:
+    at equal weight the unsquared Euclidean carries 31x the gradient of
+    SmoothL1(beta=1) at the operating point, so keeping 2.0 would put the
+    FK path at ~20x its current strength -- the failure mode the w=10
+    experiments in this file's header already found. 0.35 lands it at ~3x,
+    leading without dominating.
+    """
+    cfg.w_shape = 0.03          # 45 identity blendshapes. Verified: driving MHR
+                                # params 204..248 to +/-2 sigma moves the 127-joint
+                                # skeleton by 0.00e+00 cm, and get_joints() zeroes
+                                # them before the forward pass anyway. Non-zero so
+                                # the deployed mesh identity stays supervised.
+    cfg.pose_split = True       # pose[6:136] on m_noflip (60%) not m_ident (21%)
+    cfg.pose_beta = 0.05        # ~= the p50 pose-parameter error, so the term is
+                                # linear over the bulk of the distribution
+    cfg.kp3d_loss = "euclid"    # NLF 2407.07532 §3.2
+    cfg.w_keypoints3d = 0.35    # re-scaled for the new form; see docstring
+    cfg.finger_weight = 0.2     # 40 of 70 keypoints, none of them in J12/J14
+
 
 # ============================================================
 # Cell 3 — Dataset and Data Augmentation
@@ -799,6 +891,17 @@ class DistillationLoss(nn.Module):
         self.simcc_sigma = 2.0 * bin_w
         self._global_step = 0
         self.warmup_steps = int(getattr(cfg, "kp3d_warmup_steps", 0))
+        # Per-keypoint weight for the FK-derived geometric losses. All ones
+        # unless finger_weight != 1, so the unweighted path stays bit-identical.
+        #
+        # Built on the MHR module's device, NOT the CPU default: every call site
+        # in this repo constructs DistillationLoss without .to(device)
+        # (run_overfit_test, run_self_tests, train_instant_hmr and
+        # train_distill_jz.train all do), so a CPU buffer would raise on the
+        # first step. register_buffer still lets an explicit .to() move it.
+        w = torch.ones(cfg.num_joints, device=getattr(mhr_module, "device", "cpu"))
+        w[torch.from_numpy(FINGER_KP).to(w.device)] = float(getattr(cfg, "finger_weight", 1.0))
+        self.register_buffer("kp3d_weight", w, persistent=False)
 
     def set_step(self, step: int):
         """Drives the FK-loss warm-up ramp. Call once per optimiser step."""
@@ -817,6 +920,12 @@ class DistillationLoss(nn.Module):
 
     def m_smooth_l1(self, pred, tgt, mask):
         e = F.smooth_l1_loss(pred, tgt, reduction='none').flatten(1).mean(1)
+        return self._mmean(e, mask)
+
+    def _m_beta(self, pred, tgt, mask, beta):
+        """m_smooth_l1 with an explicit beta. beta=1.0 is F.smooth_l1_loss's
+        default, so this reproduces m_smooth_l1 exactly at the default."""
+        e = F.smooth_l1_loss(pred, tgt, reduction='none', beta=beta).flatten(1).mean(1)
         return self._mmean(e, mask)
 
     def m_mse(self, pred, tgt, mask):
@@ -897,7 +1006,26 @@ class DistillationLoss(nn.Module):
         tgt_pose = targets["mhr_model_params"][:, :idx_pose]
         tgt_scale = targets["mhr_model_params"][:, idx_pose:]
 
-        losses['loss_pose'] = self.m_smooth_l1(pred_pose, tgt_pose, m_ident) * self.cfg.w_pose
+        # loss_pose. Masked to m_ident (~21% of the batch at geom_p 0.8) because
+        # the dataset rotates the LABELS and the target parameters are not
+        # rotated with them. That is only true of the 6 root parameters:
+        # model params 3/4/5 drive joint-parameter slots 10/11/12 exclusively,
+        # so pose[6:136] -- the 130 local angles, which the oracle ablation
+        # attributes 100% of the PA-MPJPE error to -- is invariant to the
+        # in-plane rotation and only needs the flip mask.  See POSE_ROOT_DIM.
+        beta = float(getattr(self.cfg, "pose_beta", 1.0))
+        if getattr(self.cfg, "pose_split", False):
+            r = POSE_ROOT_DIM
+            n = pred_pose.shape[1]
+            # Proportional weights: the split changes the MASK, not the
+            # root-vs-local balance a single mean over n parameters implied.
+            losses['loss_pose_root'] = self._m_beta(
+                pred_pose[:, :r], tgt_pose[:, :r], m_ident, 1.0) * self.cfg.w_pose * (r / n)
+            losses['loss_pose'] = self._m_beta(
+                pred_pose[:, r:], tgt_pose[:, r:], m_noflip, beta) * self.cfg.w_pose * ((n - r) / n)
+        else:
+            losses['loss_pose'] = self._m_beta(
+                pred_pose, tgt_pose, m_ident, beta) * self.cfg.w_pose
         losses['loss_scale'] = self.m_mse(pred_scale, tgt_scale, m_noflip) * self.cfg.w_scale
         losses['loss_shape'] = self.m_mse(preds["shape_params"], targets["shape_params"], m_noflip) * self.cfg.w_shape
         # NLF applies its translation loss as an unsquared Euclidean norm over the
@@ -980,7 +1108,22 @@ class DistillationLoss(nn.Module):
         # skeleton is mirror-symmetric to 0.7 mm, so a mirrored pose is a perfectly
         # representable MHR pose.  (loss_pose / loss_scale / loss_shape stay masked
         # because the TARGET PARAMETERS are not mirrored — only the geometry is.)
-        losses['loss_3d_native'] = self.l1(pred_kp3d, tgt_3d) * self.cfg.w_keypoints3d * self.fk_scale
+        #
+        # SmoothL1's beta defaults to 1.0 -- one METRE here -- so every sample of
+        # a 37.7 mm mean / 119 mm p95 error distribution sits in the quadratic
+        # branch and the term behaves as a scaled MSE: measured 16x less gradient
+        # than L1 and 31x less than the unsquared Euclidean at the same weight,
+        # which is why w_keypoints3d=2.0 delivered 7.7% of the update direction.
+        # "euclid" also has a FLAT gradient (d||x||/dx is a unit vector), so it is
+        # gentler than the current form where the error is large -- 0.62x on a
+        # freshly initialised model -- and only stronger once the model is close.
+        if getattr(self.cfg, "kp3d_loss", "smooth_l1") == "euclid":
+            e_kp3d = (pred_kp3d - tgt_3d).norm(dim=-1)                # (B, 70), metres
+            losses['loss_3d_native'] = (
+                self._kp_weighted(e_kp3d, self.kp3d_weight.expand_as(e_kp3d))
+                * self.cfg.w_keypoints3d * self.fk_scale)
+        else:
+            losses['loss_3d_native'] = self.l1(pred_kp3d, tgt_3d) * self.cfg.w_keypoints3d * self.fk_scale
 
         cc = targets["aug_cos"].view(-1, 1)
         ss = targets["aug_sin"].view(-1, 1)
@@ -1020,8 +1163,13 @@ class DistillationLoss(nn.Module):
             m_reproj = ones
         pred_reproj = self._project_3d_to_norm_2d(pts_cr, cam_cr_r, targets)
         e_reproj = (pred_reproj - tgt_2d).abs().mean(-1)
+        # Same finger down-weight as loss_3d_native: this is the other geometric
+        # term over all 70 keypoints, and at --preset v2's w_reproj = 0.5 it would
+        # otherwise also be ~60% fingers. The 2D head's own terms are left alone —
+        # joints_2d is a deployed output and SA-1B's visibility mask already
+        # handles its unobserved hands.
         losses['loss_reproj'] = self._kp_weighted(
-            e_reproj, w_kp, m_reproj) * self.cfg.w_reproj * self.fk_scale
+            e_reproj, w_kp * self.kp3d_weight, m_reproj) * self.cfg.w_reproj * self.fk_scale
 
         losses['total_loss'] = sum(losses.values())
         return losses
@@ -1110,6 +1258,18 @@ def evaluate_hmr_batch(preds, targets, cfg, mhr_module):
     pred_aligned = batched_procrustes_alignment(pred_kp3d, gt_3d_native)
     metrics['Mesh_PA_MPJPE'] = torch.linalg.norm(
         pred_aligned - gt_3d_native, dim=-1).mean().item() * 1000.0
+
+    # Body-only variant over the 30 non-finger keypoints. Mesh_PA_MPJPE is 60%
+    # fingers by keypoint count, so on the single-GPU path it selects largely on
+    # hands; the published J12/J14 sets contain none of them. Reported alongside,
+    # never substituted — selection behaviour is unchanged.
+    b = torch.from_numpy(BODY_KP).to(pred_kp3d.device)
+    pb, gb = pred_kp3d[:, b], gt_3d_native[:, b]
+    metrics['Mesh_MPJPE_body'] = torch.linalg.norm(
+        (pb - pb.mean(1, keepdim=True)) - (gb - gb.mean(1, keepdim=True)),
+        dim=-1).mean().item() * 1000.0
+    metrics['Mesh_PA_MPJPE_body'] = torch.linalg.norm(
+        batched_procrustes_alignment(pb, gb) - gb, dim=-1).mean().item() * 1000.0
 
     if hasattr(cfg, 'native_mapping_ids') and hasattr(cfg, 'mhr_mapping_ids'):
         pred_mesh_anchors = pred_mhr_vision[:, cfg.mhr_mapping_ids, :]
@@ -1360,7 +1520,8 @@ def train_instant_hmr():
             tm['2d']     += losses.get('loss_2d_native', torch.tensor(0)).item()
             tm['simcc']  += losses.get('loss_2d_simcc', torch.tensor(0)).item()
             tm['3d']     += losses.get('loss_3d_native', torch.tensor(0)).item()
-            tm['pose']   += losses.get('loss_pose', torch.tensor(0)).item()
+            tm['pose']   += (losses.get('loss_pose', torch.tensor(0)).item()
+                             + losses.get('loss_pose_root', torch.tensor(0)).item())
             tm['scale']  += losses.get('loss_scale', torch.tensor(0)).item()
             tm['mhr']    += losses.get('loss_mhr_joints', torch.tensor(0)).item()
             tm['reproj'] += losses.get('loss_reproj', torch.tensor(0)).item()
@@ -1804,8 +1965,11 @@ def run_overfit_test(steps=3000, subset=8, lr=5e-4):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     def reg(ls):
+        # loss_pose_root only exists under cfg.pose_split; the .get keeps the
+        # regression figure comparable between the two settings.
         return (ls['loss_2d_native'].item() + ls['loss_3d_native'].item()
-                + ls['loss_cam'].item() + ls['loss_pose'].item())
+                + ls['loss_cam'].item() + ls['loss_pose'].item()
+                + ls.get('loss_pose_root', torch.zeros(())).item())
 
     first_reg = last_reg = last_pa = None
     best_pa = float('inf')   # 8-sample overfit is noisy at constant LR; judge the best fit reached
@@ -1855,6 +2019,7 @@ def run_overfit_test(steps=3000, subset=8, lr=5e-4):
                   f"| shape {losses.get('loss_shape', torch.tensor(0)).item():.4f} "
                   f"| mhr {losses['loss_mhr_joints'].item():.4f} "
                   f"| Mesh [MPJPE: {m['Mesh_MPJPE']:.1f} | PA: {m['Mesh_PA_MPJPE']:.1f}] mm "
+                  f"| body PA: {m['Mesh_PA_MPJPE_body']:.1f} mm "
                   f"| Mesh52 [MPJPE: {m['Mesh52_MPJPE']:.1f} | PA: {m['Mesh52_PA_MPJPE']:.1f}] mm")
 
     # THRESHOLD CHANGED, 40.0 -> 55.0 mm, and this is deliberate — the quantity
@@ -1990,6 +2155,11 @@ def parse_args():
                    help="Optimiser steps over which the FK-path losses ramp from 0 to full weight.")
     p.add_argument("--w_keypoints3d", type=float, default=None,
                    help="Weight of the MHR-derived 3D keypoint loss (FK path).")
+    p.add_argument("--losses", choices=("legacy", "rebalanced"), default="legacy",
+                   help="'rebalanced' applies the four loss-budget fixes "
+                        "(w_shape down, pose split + beta, unsquared-Euclidean 3D "
+                        "loss, finger down-weight). 'legacy' reproduces the "
+                        "pre-rebalance recipe bit for bit. See apply_rebalanced_losses.")
     p.add_argument("--seed", type=int, default=None,
                    help="Seed torch/numpy/random (for reproducible sanity runs).")
     p.add_argument("--split-wd", dest="split_wd", action="store_true",
@@ -2035,6 +2205,8 @@ def main():
             cfg.per_dataset_caps["sam3d_gt_harmony4d"] = args.harmony4d_cap
     if args.no_resume:                  cfg.resume = False
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
+    if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)
+    # An explicit --w_keypoints3d still wins over the preset.
     if args.w_keypoints3d is not None:   cfg.w_keypoints3d = args.w_keypoints3d
     if args.split_wd:                   cfg.split_weight_decay = True
     if args.backbone is not None:

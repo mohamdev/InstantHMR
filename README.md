@@ -182,10 +182,23 @@ InstantHMR ONNX
   └─ cam_trans (3,)     ──┘         + cam_trans  →  camera-space mesh
 ```
 
-The 204-dim `mhr_params` encode joint rotations in 6-D representation
-(34 joints × 6); `shape_params (45,)` encode identity blend shapes
-(20 body + 20 head + 5 hand components). Facial expression is set to
-neutral (zeros) since InstantHMR does not regress it.
+The 204-dim `mhr_params` are MHR **model parameters**, not a 6-D rotation
+encoding. Read off `character_torch.parameter_transform.parameter_names`, the
+layout is:
+
+| slice | contents |
+|---|---|
+| `0:3` | `root_tx/ty/tz` — always 0 in the corpus; 1 unit = 10 cm, applied at joint 1 |
+| `3:6` | `root_rx/ry/rz` — extrinsic-XYZ Euler, driving joint-parameter slots 10/11/12 and nothing else |
+| `6:136` | 130 local joint angles (`spine0_rx_flexible`, `l_knee_ry`, …) |
+| `136:204` | 68 bone-scale parameters |
+
+Because the root rotation is exclusive to slots 10/11/12, `6:136` is exactly
+invariant to a camera roll — which is what `pose_split` in the trainer relies
+on. `shape_params (45,)` encode identity blend shapes (20 body + 20 head + 5
+hand components) and drive the **mesh only**: a ±2σ probe moves the 127-joint
+skeleton by `0.00e+00 cm`. Facial expression is set to neutral (zeros) since
+InstantHMR does not regress it.
 
 ## Performance tuning
 

@@ -82,6 +82,39 @@ comparable to COCO-leaderboard AP, which includes detection. InstantHMR emits no
 per-keypoint confidence, so every keypoint is scored 1.0 — read AP next to the
 confidence-free `mean_OKS` and `PCK` numbers.
 
+### The GT-joint caveat — READ THIS BEFORE QUOTING A 3DPW NUMBER
+
+**The ground truth this harness uses is not the one 3DPW papers report on.**
+`benchlib/threedpw.py` reads `jointPositions` straight from the sequence
+pickles: the 24 **SMPL kinematic-tree** joints. Every published 3DPW number —
+NLF's included ("obtained through the same Human3.6M-style joint regressor that
+all prior works use") — instead runs SMPL *forward* on the GT `poses` / `betas`
+and applies the H36M joint regressor to the resulting 6890 vertices. Those are
+different landmarks, most visibly at the shoulders and hips, which is 4 of the
+12 joints in J12.
+
+That is what makes this harness cheap to set up (see "Why these two" above) and
+it is fine for *tracking a run*. It is **not** comparable to a published table.
+
+Fixing it needs two files that are not in this repo:
+
+| file | where |
+|---|---|
+| `SMPL_{MALE,FEMALE,NEUTRAL}.pkl` | `smpl.is.tue.mpg.de`, free research licence. 3DPW's `genders` field is per-subject, so get the gendered pair. |
+| `J_regressor_h36m.npy` | ships inside SPIN / HMR2.0 / 4D-Humans |
+
+Then: `V = SMPL(poses, betas)` per frame, `J14 = J_regressor @ V`, and fit the
+existing `--fit-adapter` linear MHR70 -> J14 map on 3DPW **train** against that
+GT before reporting on test. A forward pass, not a fit.
+
+`v_template_clothed` in the pickles cannot substitute — it is a static T-pose
+surface with no blend weights, no pose blendshapes and no joint regressor, so it
+cannot be posed.
+
+This does **not** affect `instanthmr_distill_train/val3dpw.py`, which uses the
+same GT for checkpoint selection: selection only needs a consistent metric, not
+a comparable one.
+
 ### The joint-convention caveat — do not skip this
 
 InstantHMR predicts MHR70 joints; 3DPW's GT is SMPL. The two rigs place several

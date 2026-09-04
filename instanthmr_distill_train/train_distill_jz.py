@@ -440,7 +440,8 @@ def unwrap(m):
 @torch.no_grad()
 def run_validation(eval_model, loader, criterion, cfg, mhr_module, device):
     eval_model.eval()
-    acc = {"loss": 0.0, "Mesh_MPJPE": 0.0, "Mesh_PA_MPJPE": 0.0}
+    acc = {"loss": 0.0, "Mesh_MPJPE": 0.0, "Mesh_PA_MPJPE": 0.0,
+           "Mesh_PA_MPJPE_body": 0.0}
     n = 0
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
@@ -456,6 +457,10 @@ def run_validation(eval_model, loader, criterion, cfg, mhr_module, device):
         acc["loss"] += lv
         acc["Mesh_MPJPE"] += bm.get("Mesh_MPJPE", 0.0)
         acc["Mesh_PA_MPJPE"] += bm.get("Mesh_PA_MPJPE", 0.0)
+        # Reported only. Mesh_PA_MPJPE is 60% fingers by keypoint count; this is
+        # the 30 body/face/foot keypoints. Selection is untouched — and when
+        # --val-3dpw is on, both of these are replaced by the 3DPW J12 numbers.
+        acc["Mesh_PA_MPJPE_body"] += bm.get("Mesh_PA_MPJPE_body", 0.0)
         n += 1
     out = {k: v / max(n, 1) for k, v in acc.items()}
     out["n"] = float(n)
@@ -618,6 +623,10 @@ def train(args, cfg, rank, local_rank, world):
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
             "jpeg_p": cfg.jpeg_p, "cam_loss": cfg.cam_loss,
+            "losses": args.losses, "w_shape": cfg.w_shape,
+            "w_keypoints3d": cfg.w_keypoints3d, "kp3d_loss": cfg.kp3d_loss,
+            "pose_split": cfg.pose_split, "pose_beta": cfg.pose_beta,
+            "finger_weight": cfg.finger_weight,
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
     for epoch in range(start_epoch, args.epochs):
@@ -694,7 +703,11 @@ def train(args, cfg, rank, local_rank, world):
             run["simcc"] += losses.get("loss_2d_simcc", torch.zeros(())).item()
             run["reproj"] += losses.get("loss_reproj", torch.zeros(())).item()
             run["cam"] += losses.get("loss_cam", torch.zeros(())).item()
-            run["pose"] += losses.get("loss_pose", torch.zeros(())).item()
+            # Under cfg.pose_split, loss_pose is the local half and loss_pose_root
+            # the other; summing keeps history.jsonl's "pose" column comparable
+            # against a --losses legacy run.
+            run["pose"] += (losses.get("loss_pose", torch.zeros(())).item()
+                            + losses.get("loss_pose_root", torch.zeros(())).item())
             nb += 1
             if is_main() and i % args.log_every == 0:
                 log(f"  e{epoch+1}/{args.epochs} step {i}/{steps_per_epoch} "
@@ -733,9 +746,11 @@ def train(args, cfg, rank, local_rank, world):
             f"reproj {tr['reproj']:.4f} | cam {tr['cam']:.4f} "
             f"| skipped {n_skip}/{steps_per_epoch} | {time.time() - t_epoch:.0f}s")
         log(f"   valRAW loss {raw['loss']:.4f} | PA-MPJPE {raw['Mesh_PA_MPJPE']:.1f} | "
-            f"MPJPE {raw['Mesh_MPJPE']:.1f} mm")
+            f"MPJPE {raw['Mesh_MPJPE']:.1f} mm | held-in body PA "
+            f"{raw['Mesh_PA_MPJPE_body']:.1f} mm")
         log(f"   valEMA loss {em['loss']:.4f} | PA-MPJPE {em['Mesh_PA_MPJPE']:.1f} | "
-            f"MPJPE {em['Mesh_MPJPE']:.1f} mm")
+            f"MPJPE {em['Mesh_MPJPE']:.1f} mm | held-in body PA "
+            f"{em['Mesh_PA_MPJPE_body']:.1f} mm")
         if dpw_raw is not None:
             log(f"   3DPW-{args.val_3dpw_split} RAW  J12 PA {dpw_raw['J12_PA_MPJPE']:.1f} "
                 f"MPJPE {dpw_raw['J12_MPJPE']:.1f} | J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} mm")
@@ -878,6 +893,14 @@ def parse_args():
                         "prerequisites, plus absolute-pose supervision. "
                         "'baseline' reproduces the pre-v2 trainer exactly.")
     p.add_argument("--w_reproj", type=float, default=None)
+    p.add_argument("--losses", choices=("legacy", "rebalanced"), default="legacy",
+                   help="Orthogonal to --preset, which only controls the input "
+                        "pipeline and the absolute-pose terms. 'rebalanced' applies "
+                        "the four loss-budget fixes (w_shape 1.0->0.03, pose split "
+                        "onto the non-flipped 60%% of the batch at beta 0.05, "
+                        "unsquared-Euclidean 3D loss at w 0.35, finger keypoints at "
+                        "0.2). 'legacy' reproduces the pre-rebalance recipe bit for "
+                        "bit, so b2/v2 runs in flight stay valid controls.")
     p.add_argument("--index-cache", default=None,
                    help="Where to cache the (image, npz) pair index. "
                         "Default: <data_root>/.pair_index_v2.pkl")
@@ -904,15 +927,19 @@ def build_cfg(args):
     cfg.epochs = args.epochs
     cfg.per_dataset_caps = {}            # replaced by the weighted sampler
     if args.backbone:               cfg.backbone = args.backbone
-    if args.w_keypoints3d is not None: cfg.w_keypoints3d = args.w_keypoints3d
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
 
     if args.preset == "v2":
         apply_v2_preset(cfg)
-    # An explicit --w_reproj still wins over the preset.
+    # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
+    # --losses is the loss budget. Applied second so it owns w_keypoints3d.
+    if args.losses == "rebalanced":
+        T.apply_rebalanced_losses(cfg)
+    # An explicit --w_reproj / --w_keypoints3d still wins over both.
     if args.w_reproj is not None:   cfg.w_reproj = args.w_reproj
+    if args.w_keypoints3d is not None: cfg.w_keypoints3d = args.w_keypoints3d
     return cfg
 
 
@@ -998,6 +1025,11 @@ def main():
            f"occl_p={cfg.occl_p} jpeg_p={cfg.jpeg_p} "
            f"w_reproj={cfg.w_reproj} cam={cfg.cam_loss}"
            if args.preset != "baseline" else ""))
+    log(f"losses    {args.losses}"
+        + (f" | w_shape={cfg.w_shape} pose_split={cfg.pose_split} "
+           f"pose_beta={cfg.pose_beta} kp3d={cfg.kp3d_loss}@{cfg.w_keypoints3d} "
+           f"finger_w={cfg.finger_weight}"
+           if args.losses != "legacy" else ""))
     log(f"seed      {args.seed} | mix {args.mix} | "
         f"samples/epoch {args.samples_per_epoch:,}")
     log("=" * 66)
