@@ -137,6 +137,7 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True) -> dict:
     """
     model.eval()
     preds, gts = [], []
+    n_dropped = 0
     for b in loader:
         if float(b["ok"].sum()) == 0:
             continue
@@ -146,16 +147,38 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True) -> dict:
             out = model(img, cc)
         kp = mhr_module.get_native_keypoints(out["mhr_params"].float(),
                                              out["shape_params"].float())
-        keep = b["ok"].bool()
+        # Drop non-finite predictions BEFORE they reach the metric. The forward
+        # runs under fp16 autocast, so an early-training head output above
+        # 65504 is already inf by the time .float() sees it, and the MHR forward
+        # kinematics turn that into inf/NaN keypoints. numpy's SVD inside
+        # pa_mpjpe's Procrustes alignment then raises "SVD did not converge",
+        # which killed job 1767242 (v3_s0) at the epoch-1 validation with a
+        # perfectly healthy training loop behind it -- 0 skipped steps, no
+        # divergence. One bad frame out of a few hundred must not cost a
+        # 20-hour job.
+        finite = torch.isfinite(kp).flatten(1).all(dim=1).cpu()
+        keep = b["ok"].bool() & finite
+        n_dropped += int((b["ok"].bool() & ~finite).sum())
+        if not bool(keep.any()):
+            continue
         preds.append(kp[keep.to(kp.device)].float().cpu().numpy())
         gts.append(b["gt"][keep].numpy())
 
+    # Always return the SAME key set. train_distill_jz.all_reduce_mean builds a
+    # tensor from sorted(keys) and all-reduces it, so a rank returning a short
+    # dict while the others return a full one is a size mismatch -> NCCL hang.
+    res: dict[str, float] = {"n": 0.0, "n_dropped": float(n_dropped)}
+    for name in ("J12", "J14"):
+        res[f"{name}_MPJPE"] = float("inf")
+        res[f"{name}_PA_MPJPE"] = float("inf")
     if not preds:
-        return {"n": 0.0}
+        # inf, not 0: this epoch's 3DPW number must never look like a new best.
+        return res
+
     pred = np.concatenate(preds) * MM          # (N, 70, 3) rig-local, mm
     gt = np.concatenate(gts) * MM              # (N, 24, 3) camera space, mm
 
-    res: dict[str, float] = {"n": float(len(pred))}
+    res["n"] = float(len(pred))
     for name in ("J12", "J14"):
         spec = J.JOINT_SETS[name]
         p, g = pred[:, spec["mhr"], :], gt[:, spec["smpl"], :]

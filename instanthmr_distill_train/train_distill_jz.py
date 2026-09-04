@@ -756,6 +756,14 @@ def train(args, cfg, rank, local_rank, world):
                 f"MPJPE {dpw_raw['J12_MPJPE']:.1f} | J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} mm")
             log(f"   3DPW-{args.val_3dpw_split} EMA  J12 PA {dpw_em['J12_PA_MPJPE']:.1f} "
                 f"MPJPE {dpw_em['J12_MPJPE']:.1f} | J14 PA {dpw_em['J14_PA_MPJPE']:.1f} mm")
+            # Non-finite predictions are dropped rather than crashing the metric
+            # (see val3dpw.evaluate). Say so — a handful at epoch 1 is the raw
+            # branch still settling, a rising count is a real instability.
+            nd = dpw_raw.get("n_dropped", 0.0) + dpw_em.get("n_dropped", 0.0)
+            if nd > 0:
+                log(f"   ⚠️  3DPW: {nd:.0f} non-finite prediction(s) dropped "
+                    f"(raw {dpw_raw.get('n_dropped', 0.0):.0f} / "
+                    f"ema {dpw_em.get('n_dropped', 0.0):.0f})")
         if dpw_test_raw is not None:
             log(f"   3DPW-TEST (report only, not used for selection)")
             log(f"     RAW  J14 MPJPE {dpw_test_raw['J14_MPJPE']:.1f} | "
