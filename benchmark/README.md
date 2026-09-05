@@ -169,12 +169,10 @@ nothing to do with model quality. The harness therefore reports three rows:
   landmarks. Against the H36M GT it is **not** clean: the hips alone move 292 vs
   120 mm apart between the conventions. Read it as a consistent tracking metric,
   not as a rig-free measure of the model.
-- **J14+adapter** is therefore the row to compare against a published table,
-  not an optional extra.
-- **J14+adapter** *(optional)* — a linear MHR70 → SMPL-J14 joint regressor,
-  fitted on 3DPW **train**, that absorbs the rig offset. Standard practice when
-  a method's joint convention differs from the benchmark's. Fit it once, then
-  apply to test:
+- **J14+adapter** — a linear MHR70 → J14 regressor (14x70, no bias, applied to
+  centred keypoints, so it is equivariant to rotation and translation and can
+  only move landmarks, never fix a pose). It absorbs the rig offset and is the
+  row to compare against a published table, not an optional extra.
 
   ```bash
   python benchmark/eval_3dpw.py --onnx ... --split train --stride 10 \
@@ -183,7 +181,37 @@ nothing to do with model quality. The harness therefore reports three rows:
       --adapter benchmark/results/adapter_j14.npz
   ```
 
-  Fit on train, report on test — never fit on the split you report.
+  Fit on train, report on test — never fit on the split you report. The two
+  splits share no sequences, so this is a real holdout, and an adapter is
+  specific to one model *and* one GT convention: applying b3_s1's to another
+  checkpoint, or an `h36m` one to `jointpositions`, is meaningless.
+
+  **Fit it from the teacher, not from the student.** `--fit-adapter` uses one
+  checkpoint's own predictions as the input side, so the map can absorb that
+  checkpoint's systematic error along with the rig offset — a different adapter
+  per checkpoint, and a fair reader will call it tuning.
+  `benchmark/fit_adapter_mhr.py` instead pairs the **teacher's** MHR labels in
+  `data/sam3d_gt_3dpw` with the H36M GT on the same 3DPW train frames, giving
+  one adapter for every checkpoint that never saw a student:
+
+  ```bash
+  python benchmark/fit_adapter_mhr.py --sequence-dir /path/to/3DPW/sequenceFiles \
+      --out benchmark/results/adapter_j14_h36m_teacher.npz
+  ```
+
+  That it is a rig conversion rather than an error sponge is visible two ways.
+  The teacher's own J14 error against the GT drops from **44.90 mm to 14.83 mm**
+  on a held-out half — near the teacher's accuracy floor, which absorbing error
+  could not reach. And every row reads anatomically:
+  `right_hip = +1.16 right_hip - 0.32 left_hip` (widening SMPL's 120 mm hips
+  toward H36M's 292 mm), `head = +0.57 left_ear +0.55 right_ear -0.47 neck`
+  (extrapolating to the top of the skull), `right_elbow` from the cubital fossa,
+  `right_shoulder` from the acromion, `right_knee = +0.84 right_knee` — nearly
+  identity, because the knee is the same point in both conventions.
+
+  The fit must also be truncated: see `RCOND` in `fit_adapter`, without which
+  the map reaches the hips through +-2000 weights on near-collinear finger
+  joints and stops being a joint regressor in any readable sense.
 
 ### Train/test contamination — READ THIS BEFORE PUBLISHING
 

@@ -36,6 +36,7 @@ from benchlib import threedpw as P
 from benchlib.runner import Sample, build_model, run_samples, stack_joints
 
 MM = 1000.0  # metres -> millimetres
+RCOND = 3e-3  # singular-value cutoff for the joint adapter; see fit_adapter
 
 
 def parse_args():
@@ -107,6 +108,15 @@ def fit_adapter(pred_mhr: np.ndarray, gt_raw: np.ndarray,
     equivariant to rotation and translation — it only removes the systematic
     difference in where the two rigs place each landmark.
 
+    The 70 MHR keypoints are 40 finger joints millimetres apart, so the design
+    matrix is badly conditioned and the unregularised solution reaches those
+    landmarks through +-2000 weights on fingers that nearly cancel. It scores
+    well and is not a joint regressor. Truncating the small singular values
+    (``RCOND``) gives a rank-24 map with weights under 0.9, where the H36M hip
+    reads as ``0.94 * MHR hip + 0.99 * neck``-style combinations of nearby
+    landmarks, and costs nothing measurable: on a sequence-level holdout inside
+    3DPW train, 45.74 mm against the unregularised fit's 45.76 mm.
+
     Centring must happen in float64. Doing it in float32 leaves a ~0.04 mm
     residual in the all-ones direction, which is exactly the direction the
     centring annihilates; ``lstsq`` then sees a singular value of 3e-7 relative
@@ -121,7 +131,7 @@ def fit_adapter(pred_mhr: np.ndarray, gt_raw: np.ndarray,
     # Flatten samples and coordinates into the row dimension.
     A = X.transpose(0, 2, 1).reshape(-1, X.shape[1])      # (N*3, 70)
     B = Y.transpose(0, 2, 1).reshape(-1, Y.shape[1])      # (N*3, 14)
-    W, *_ = np.linalg.lstsq(A, B, rcond=None)
+    W, *_ = np.linalg.lstsq(A, B, rcond=RCOND)
     return W.T                                            # (14, 70)
 
 
