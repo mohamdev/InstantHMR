@@ -491,14 +491,16 @@ def train(args, cfg, rank, local_rank, world):
             raise SystemExit("--val-3dpw needs --val-3dpw-images")
         from val3dpw import ThreeDPWValSet
         dpw = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
-                             split=args.val_3dpw_split, stride=args.val_3dpw_stride)
+                             split=args.val_3dpw_split, stride=args.val_3dpw_stride,
+                             gt=args.val_3dpw_gt)
         # Stride-shard across ranks; the metric is all-reduced afterwards.
         dpw_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(dpw, list(range(rank, len(dpw), world))),
             batch_size=cfg.batch_size, shuffle=False, drop_last=False,
             num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
         log(f"3DPW {args.val_3dpw_split}: {len(dpw):,} person-frames "
-            f"(stride {args.val_3dpw_stride}) -> selection metric is J12 PA-MPJPE")
+            f"(stride {args.val_3dpw_stride}, GT {args.val_3dpw_gt}) "
+            f"-> selection metric is J12 PA-MPJPE")
 
         # Optional read-only monitor on the split the paper reports. Selection
         # NEVER touches it: picking the best of ~100 epochs on the test split
@@ -507,7 +509,8 @@ def train(args, cfg, rank, local_rank, world):
         # not, so it is logged and never compared to `best`.
         if args.val_3dpw_test:
             dpw_t = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
-                                   split="test", stride=args.val_3dpw_test_stride)
+                                   split="test", stride=args.val_3dpw_test_stride,
+                                   gt=args.val_3dpw_gt)
             dpw_test_loader = torch.utils.data.DataLoader(
                 torch.utils.data.Subset(dpw_t, list(range(rank, len(dpw_t), world))),
                 batch_size=cfg.batch_size, shuffle=False, drop_last=False,
@@ -627,6 +630,7 @@ def train(args, cfg, rank, local_rank, world):
             "w_keypoints3d": cfg.w_keypoints3d, "kp3d_loss": cfg.kp3d_loss,
             "pose_split": cfg.pose_split, "pose_beta": cfg.pose_beta,
             "finger_weight": cfg.finger_weight,
+            "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
     for epoch in range(start_epoch, args.epochs):
@@ -724,16 +728,20 @@ def train(args, cfg, rank, local_rank, world):
         if dpw_loader is not None:
             import val3dpw
             dpw_raw = all_reduce_mean(
-                val3dpw.evaluate(ddp_model, dpw_loader, mhr_module, device, cfg.use_amp),
+                val3dpw.evaluate(ddp_model, dpw_loader, mhr_module, device,
+                                 cfg.use_amp, gt=args.val_3dpw_gt),
                 device)
             dpw_em = all_reduce_mean(
-                val3dpw.evaluate(ema, dpw_loader, mhr_module, device, cfg.use_amp),
+                val3dpw.evaluate(ema, dpw_loader, mhr_module, device,
+                                 cfg.use_amp, gt=args.val_3dpw_gt),
                 device)
             if dpw_test_loader is not None:
                 dpw_test_raw = all_reduce_mean(val3dpw.evaluate(
-                    ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp), device)
+                    ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp,
+                    gt=args.val_3dpw_gt), device)
                 dpw_test_em = all_reduce_mean(val3dpw.evaluate(
-                    ema, dpw_test_loader, mhr_module, device, cfg.use_amp), device)
+                    ema, dpw_test_loader, mhr_module, device, cfg.use_amp,
+                    gt=args.val_3dpw_gt), device)
             raw["Mesh_PA_MPJPE"], em["Mesh_PA_MPJPE"] = (
                 dpw_raw["J12_PA_MPJPE"], dpw_em["J12_PA_MPJPE"])
             raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
@@ -872,6 +880,13 @@ def parse_args():
     p.add_argument("--val-3dpw-test-stride", type=int, default=5)
     p.add_argument("--val-3dpw-stride", type=int, default=5,
                    help="3DPW is 30 fps; neighbouring frames are near-duplicates.")
+    p.add_argument("--val-3dpw-gt", default="h36m",
+                   choices=("h36m", "jointpositions"),
+                   help="h36m (default) is the published protocol and needs "
+                        "gt_h36m/ next to sequenceFiles/ (see "
+                        "benchmark/make_3dpw_gt.py). jointpositions is the raw "
+                        "pickle field the runs before this flag selected on — "
+                        "several mm apart, so a resumed run must keep its own.")
     p.add_argument("--mix", default="sqrt",
                    help="Dataset mixture: sqrt | uniform | equal | "
                         "'sa1b=0.4,aic=0.35,coco=0.15,mpii=0.1'.")

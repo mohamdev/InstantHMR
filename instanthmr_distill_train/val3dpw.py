@@ -21,6 +21,12 @@ all 60 sequences (see ``benchmark/README.md``). On Jean Zay it is not: the built
 corpus is coco/mpii/aic/sa1b only, so 3DPW there is genuinely unseen — which is
 what makes this worth doing on the cluster and not on the laptop.
 
+GT is the published protocol by default — SMPL forward + the H36M regressor,
+precomputed by ``benchmark/make_3dpw_gt.py`` into ``<3DPW root>/gt_h36m/`` and
+rsynced next to ``sequenceFiles``. ``gt="jointpositions"`` restores the raw
+pickle field the harness used before; the two are several mm apart, so numbers
+from the two sources must never be compared to each other.
+
 Selection metric is **PA-MPJPE on J12**. J12 is limbs only, where MHR and SMPL
 mean the same anatomical points; J14 adds neck and head, which the two rigs
 place differently and which therefore carry a systematic penalty unrelated to
@@ -99,11 +105,13 @@ class ThreeDPWValSet(Dataset):
 
     def __init__(self, sequence_dir: str, image_root: str,
                  split: str = "validation", stride: int = 5,
-                 bbox_scale: float = 1.2):
+                 bbox_scale: float = 1.2, gt: str = "h36m",
+                 gt_dir: str | None = None):
         self.samples, self.gt = P.build_samples(
             sequence_dir, image_root, split=split,
-            stride=stride, bbox_scale=bbox_scale)
+            stride=stride, bbox_scale=bbox_scale, gt=gt, gt_dir=gt_dir)
         self.gt = np.asarray(self.gt, dtype=np.float32)
+        self.gt_source = gt
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -128,7 +136,8 @@ class ThreeDPWValSet(Dataset):
 
 
 @torch.no_grad()
-def evaluate(model, loader, mhr_module, device, use_amp: bool = True) -> dict:
+def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
+             gt: str = "h36m") -> dict:
     """PA-MPJPE and MPJPE in mm on J12 and J14, from the MHR forward pass.
 
     Predictions come from ``mhr_params`` through the same FK + (70, 127)
@@ -176,12 +185,13 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True) -> dict:
         return res
 
     pred = np.concatenate(preds) * MM          # (N, 70, 3) rig-local, mm
-    gt = np.concatenate(gts) * MM              # (N, 24, 3) camera space, mm
+    gt_all = np.concatenate(gts) * MM          # (N, J, 3) camera space, mm
 
     res["n"] = float(len(pred))
     for name in ("J12", "J14"):
         spec = J.JOINT_SETS[name]
-        p, g = pred[:, spec["mhr"], :], gt[:, spec["smpl"], :]
+        p = pred[:, spec["mhr"], :]
+        g = gt_all[:, J.gt_index(spec, gt), :]
         rp, rg = J.pelvis(p), J.pelvis(g)
         res[f"{name}_MPJPE"] = float(M.mpjpe(p, g, root=(rp, rg)).mean())
         res[f"{name}_PA_MPJPE"] = float(M.pa_mpjpe(p, g).mean())

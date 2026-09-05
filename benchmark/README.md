@@ -7,16 +7,18 @@ to a credible table — one 3D, one 2D:
 
 | Benchmark | What it measures | Data cost | Status |
 |---|---|---|---|
-| **3DPW** test | MPJPE / PA-MPJPE, the standard in-the-wild 3D HMR metric | 4.6 GB images + 30 MB GT, free licence form | ready — **but the test split is contaminated, see below** |
+| **3DPW** test | MPJPE / PA-MPJPE, the standard in-the-wild 3D HMR metric | 4.6 GB images + 30 MB GT + 500 MB SMPL | ready — published-protocol GT; **check contamination below** |
 | **COCO** val2017 | OKS AP / PCK, 2D keypoint localisation in the wild | 820 MB, direct download, no registration | ready — clean |
 
 ## Why these two
 
 **3DPW** is the benchmark essentially every monocular HMR paper reports, so it
-is the one that makes your numbers comparable. It is also unusually cheap here:
-the GT pickles store `jointPositions` (24 SMPL joints in world coordinates)
-directly, so **no SMPL model download or body-model forward pass is needed** —
-which is what makes most 3DPW harnesses painful to set up.
+is the one that makes your numbers comparable. The GT pickles store
+`jointPositions` (24 SMPL joints in world coordinates) directly, which is
+tempting and wrong — published numbers use SMPL run *forward* on the GT
+`poses`/`betas` with the Human3.6M regressor applied to the vertices. The two
+references are **46 mm apart in J12 PA-MPJPE**, so the harness builds the real
+one once with `make_3dpw_gt.py` and scores against that.
 
 **COCO val2017** needs no registration at all and the joint mapping is free:
 MHR70 indices 0–14 already follow COCO's ordering, with the wrists at 41/62.
@@ -47,6 +49,27 @@ python benchmark/download.py --check-3dpw \
     --image-root   /path/to/3DPW/imageFiles
 ```
 
+Then build the ground truth. This needs two files that cannot be redistributed
+here — put both in `benchmark/data/smpl/` (gitignored):
+
+| file | where |
+|---|---|
+| `SMPL_{MALE,FEMALE}.pkl` | `smpl.is.tue.mpg.de`, free research licence. 3DPW's `genders` field is per-subject, so the gendered pair is required. |
+| `J_regressor_h36m.npy` | `visiondata.cis.upenn.edu/spin/data.tar.gz` (SPIN); also ships inside HMR2.0 / 4D-Humans |
+
+```bash
+python benchmark/make_3dpw_gt.py \
+    --sequence-dir /path/to/3DPW/sequenceFiles \
+    --smpl-dir benchmark/data/smpl --check
+```
+
+That writes `<3DPW root>/gt_h36m/{test,validation,train}.npz` — 17 H36M joints
+per person-frame in the same world frame as `jointPositions`, 14 MB for all
+three splits. `--check` additionally regresses the SMPL kinematic joints and
+compares them to `jointPositions`: **0.001 mm max over 74,620 person-frames**,
+which is what certifies the forward pass, the gendered model choice and the
+world frame all the way through.
+
 ## Running
 
 ```bash
@@ -61,6 +84,12 @@ python benchmark/eval_3dpw.py \
     --sequence-dir /path/to/3DPW/sequenceFiles \
     --image-root   /path/to/3DPW/imageFiles \
     --exclude-seen data/sam3d_distill_mix/annotations data/sam3d_gt_3dpw/annotations
+
+# same thing for a training checkpoint instead of an exported graph
+python benchmark/eval_3dpw_ckpt.py \
+    --ckpt instanthmr_distill_train/runs/b3_s1/b3_s1/best_student_model_v3.pth \
+    --sequence-dir /path/to/3DPW/sequenceFiles \
+    --image-root   /path/to/3DPW/imageFiles --split test
 ```
 
 Both write a JSON report to `benchmark/results/`.
@@ -82,51 +111,66 @@ comparable to COCO-leaderboard AP, which includes detection. InstantHMR emits no
 per-keypoint confidence, so every keypoint is scored 1.0 — read AP next to the
 confidence-free `mean_OKS` and `PCK` numbers.
 
-### The GT-joint caveat — READ THIS BEFORE QUOTING A 3DPW NUMBER
+### The ground truth — what it is, and what it used to be
 
-**The ground truth this harness uses is not the one 3DPW papers report on.**
-`benchlib/threedpw.py` reads `jointPositions` straight from the sequence
-pickles: the 24 **SMPL kinematic-tree** joints. Every published 3DPW number —
+The harness scores against the **published-protocol GT**: gendered SMPL run
+forward on each frame's `poses`/`betas`/`trans`, then `J_regressor_h36m.npy`
+applied to the 6890 vertices. This is the reference every 3DPW paper uses —
 NLF's included ("obtained through the same Human3.6M-style joint regressor that
-all prior works use") — instead runs SMPL *forward* on the GT `poses` / `betas`
-and applies the H36M joint regressor to the resulting 6890 vertices. Those are
-different landmarks, most visibly at the shoulders and hips, which is 4 of the
-12 joints in J12.
+all prior works use"). `benchmark/make_3dpw_gt.py` precomputes it; `--gt
+jointpositions` restores the pickles' raw `jointPositions` field, which is what
+this harness used before and is **not** comparable to any published table.
 
-That is what makes this harness cheap to set up (see "Why these two" above) and
-it is fine for *tracking a run*. It is **not** comparable to a published table.
+The difference is not cosmetic. Over 1,437 test person-frames, the same
+landmarks under the two references:
 
-Fixing it needs two files that are not in this repo:
+| | raw | root-relative | after Procrustes |
+|---|---|---|---|
+| J14 mean | 64.2 mm | 86.3 mm | 47.2 mm |
+| J12 mean | 63.6 mm | 88.1 mm | 46.0 mm |
+| right hip | 154.5 mm | 86.8 mm | 114.5 mm |
+| head | 116.3 mm | 42.0 mm | 62.2 mm |
 
-| file | where |
-|---|---|
-| `SMPL_{MALE,FEMALE,NEUTRAL}.pkl` | `smpl.is.tue.mpg.de`, free research licence. 3DPW's `genders` field is per-subject, so get the gendered pair. |
-| `J_regressor_h36m.npy` | ships inside SPIN / HMR2.0 / 4D-Humans |
+The hips dominate, because the two conventions disagree about where a hip is:
+H36M's are marker-derived and **292 mm apart**, SMPL's kinematic ones sit near
+the femoral heads, **120 mm apart**. Shoulder width goes the other way (303 vs
+387 mm), and H36M's `head` is the top of the skull where SMPL's is inside it
+(neck→head 192 vs 100 mm).
 
-Then: `V = SMPL(poses, betas)` per frame, `J14 = J_regressor @ V`, and fit the
-existing `--fit-adapter` linear MHR70 -> J14 map on 3DPW **train** against that
-GT before reporting on test. A forward pass, not a fit.
+Two details worth keeping straight:
 
-`v_template_clothed` in the pickles cannot substitute — it is a static T-pose
-surface with no blend weights, no pose blendshapes and no joint regressor, so it
-cannot be posed.
+- **`jointPositions` is the kinematic joint, not the regressed one.** Comparing
+  `J_regressor @ posed vertices` to it gives a 4.5 mm residual and looks like a
+  bug in the forward pass. The joints that match are the ones carried by the
+  global transforms. `make_3dpw_gt.py --check` compares those, and gets 0.001 mm.
+- **`betas` is 300-dim for 48 of the 87 subject tracks and 10-dim for the other
+  39, and entries 10: are all exactly zero.** So `--num-betas 10`, the published
+  protocol, is also lossless here.
 
-This does **not** affect `instanthmr_distill_train/val3dpw.py`, which uses the
-same GT for checkpoint selection: selection only needs a consistent metric, not
-a comparable one.
+`v_template_clothed` in the pickles is not a substitute for any of this — it is
+a static T-pose surface with no blend weights and no pose blendshapes, so it
+cannot be posed. Using it makes the residual worse (17.9 mm), not better.
+
+Selection inside `instanthmr_distill_train/val3dpw.py` follows the same default,
+so **3DPW numbers from before and after this change are not comparable** — the
+new GT is several mm harsher. The cache has to be rsynced next to the cluster's
+`sequenceFiles/` or the trainer raises on startup.
 
 ### The joint-convention caveat — do not skip this
 
-InstantHMR predicts MHR70 joints; 3DPW's GT is SMPL. The two rigs place several
-landmarks differently, which puts a floor under the error that has nothing to do
-with model quality. The harness therefore reports three rows:
+InstantHMR predicts MHR70 joints; the GT is now in the H36M convention. The two
+place several landmarks differently, which puts a floor under the error that has
+nothing to do with model quality. The harness therefore reports three rows:
 
-- **J14** — the 14-joint LSP set most 3DPW papers use. `neck` and `head` are the
-  two joints where the rigs genuinely disagree (MHR has no head-top; `nose` is
-  substituted), so this row carries a systematic penalty.
-- **J12** — limbs only (shoulders, elbows, wrists, hips, knees, ankles), where
-  both rigs mean the same anatomical point. **This is the cleanest measure of
-  the model.**
+- **J14** — the 14-joint LSP set most 3DPW papers use. `neck` and `head` carry
+  the largest systematic penalty (MHR has no head-top; `nose` is substituted).
+- **J12** — limbs only (shoulders, elbows, wrists, hips, knees, ankles). Against
+  `jointpositions` this was the clean row, because MHR and SMPL agree on those
+  landmarks. Against the H36M GT it is **not** clean: the hips alone move 292 vs
+  120 mm apart between the conventions. Read it as a consistent tracking metric,
+  not as a rig-free measure of the model.
+- **J14+adapter** is therefore the row to compare against a published table,
+  not an optional extra.
 - **J14+adapter** *(optional)* — a linear MHR70 → SMPL-J14 joint regressor,
   fitted on 3DPW **train**, that absorbs the rig offset. Standard practice when
   a method's joint convention differs from the benchmark's. Fit it once, then

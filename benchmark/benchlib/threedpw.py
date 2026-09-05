@@ -9,8 +9,17 @@ useful fields for us:
     campose_valid   list[P] of (F,)     1 where the camera pose is trustworthy
     genders         list[P]
 
-Because ``jointPositions`` is stored directly, evaluating 3D joint error needs
-**no SMPL model download** — we never have to re-run the body model.
+``jointPositions`` holds the 24 SMPL *kinematic-tree* joints, which is not the
+ground truth 3DPW papers report on: those run SMPL forward on ``poses``/
+``betas`` and apply the Human3.6M regressor to the resulting vertices. That
+reference is precomputed once by ``benchmark/make_3dpw_gt.py`` into
+``<3DPW root>/gt_h36m/<split>.npz`` — 17 joints per person-frame in the same
+world frame — and is what ``build_samples`` returns by default. Pass
+``gt="jointpositions"`` to get the old, non-comparable GT back.
+
+Person boxes and the off-screen filter keep using ``jointPositions`` either
+way, so switching the GT changes only the numbers being compared, never which
+frames are evaluated or how they are cropped.
 """
 
 from __future__ import annotations
@@ -50,10 +59,32 @@ def bbox_from_points(uv: np.ndarray, scale: float) -> np.ndarray:
                     dtype=np.float32)
 
 
+def gt_h36m_path(sequence_dir: str | Path, split: str,
+                 gt_dir: str | Path | None = None) -> Path:
+    """Where the regressed GT lives: next to ``sequenceFiles``, not in the repo."""
+    base = Path(gt_dir) if gt_dir else Path(sequence_dir).parent / "gt_h36m"
+    return base / f"{split}.npz"
+
+
+def load_gt_h36m(sequence_dir: str | Path, split: str,
+                 gt_dir: str | Path | None = None) -> dict:
+    path = gt_h36m_path(sequence_dir, split, gt_dir)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"regressed 3DPW ground truth not found: {path}\n"
+            "Build it with benchmark/make_3dpw_gt.py, or pass "
+            "gt='jointpositions' to fall back to the raw (non-comparable) "
+            "SMPL kinematic joints.")
+    with np.load(path) as z:
+        return {k: z[k] for k in z.files if "|" in k}
+
+
 def build_samples(sequence_dir: str | Path, image_root: str | Path,
                   split: str = "test", stride: int = 1,
                   bbox_scale: float = 1.2,
-                  min_visible_frac: float = 0.6):
+                  min_visible_frac: float = 0.6,
+                  gt: str = "h36m",
+                  gt_dir: str | Path | None = None):
     """Enumerate every evaluatable (frame, person) in a 3DPW split.
 
     Args:
@@ -66,10 +97,19 @@ def build_samples(sequence_dir: str | Path, image_root: str | Path,
             projected joints fall inside the image — they are mostly out of
             frame, and a crop around them is meaningless.
 
+        gt: ``h36m`` for the published-protocol GT (17 regressed joints,
+            requires the cache from ``make_3dpw_gt.py``); ``jointpositions``
+            for the raw 24 SMPL kinematic joints in the pickles.
+        gt_dir: override the cache location.
+
     Returns:
-        ``(samples, gt_joints)`` — a list of dicts and an (N, 24, 3) array of
-        camera-space GT joints in metres, index-aligned.
+        ``(samples, gt_joints)`` — a list of dicts and an (N, 17, 3) array
+        (``h36m``) or (N, 24, 3) array (``jointpositions``) of camera-space GT
+        joints in metres, index-aligned.
     """
+    if gt not in ("h36m", "jointpositions"):
+        raise ValueError(f"unknown gt source: {gt}")
+    table = load_gt_h36m(sequence_dir, split, gt_dir) if gt == "h36m" else None
     seq_dir = Path(sequence_dir) / split
     if not seq_dir.is_dir():
         raise FileNotFoundError(f"no such 3DPW split directory: {seq_dir}")
@@ -87,6 +127,10 @@ def build_samples(sequence_dir: str | Path, image_root: str | Path,
 
         for pid, jp in enumerate(seq["jointPositions"]):
             joints_w = np.asarray(jp, dtype=np.float64).reshape(-1, 24, 3)
+            # The box always comes from the SMPL joints; only the scored GT
+            # changes, so the two sources are evaluated on identical crops.
+            gt_w = (np.asarray(table[f"{name}|{pid}"], dtype=np.float64)
+                    if table is not None else joints_w)
             valid = np.asarray(seq["campose_valid"][pid]).astype(bool)
 
             for f in range(0, min(num_frames, joints_w.shape[0]), stride):
@@ -106,7 +150,7 @@ def build_samples(sequence_dir: str | Path, image_root: str | Path,
                     sequence=name, person=pid, frame=f,
                     gender=str(seq["genders"][pid]),
                 ))
-                gts.append(joints_cam)
+                gts.append(gt_w[f] @ T[:3, :3].T + T[:3, 3])
 
     if not samples:
         raise RuntimeError(f"no valid samples found in {seq_dir}")

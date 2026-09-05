@@ -61,6 +61,25 @@ SMPL24_NAMES = [
 SMPL = {n: i for i, n in enumerate(SMPL24_NAMES)}
 
 # --------------------------------------------------------------------------
+# Human3.6M 17 joints — the rows of ``J_regressor_h36m.npy``
+# --------------------------------------------------------------------------
+# This is the GT every published 3DPW number is measured against: SMPL run
+# forward on the sequence's poses/betas, then this regressor applied to the
+# 6890 vertices. The row order below was read off the data, not a table — each
+# row was matched to its nearest SMPL kinematic joint on a real sequence — and
+# it reproduces SPIN's ``H36M_TO_J14 = [6,5,4,1,2,3,16,15,14,11,12,13,8,10]``
+# exactly. Note it is *left-first* in the legs and arms, which is the opposite
+# of how H36M's own raw skeleton is usually tabulated.
+H36M17_NAMES = [
+    "pelvis", "left_hip", "left_knee", "left_ankle",
+    "right_hip", "right_knee", "right_ankle",
+    "spine", "neck", "nose", "head",
+    "left_shoulder", "left_elbow", "left_wrist",
+    "right_shoulder", "right_elbow", "right_wrist",
+]
+H36M = {n: i for i, n in enumerate(H36M17_NAMES)}
+
+# --------------------------------------------------------------------------
 # 3D evaluation joint sets
 # --------------------------------------------------------------------------
 # LSP-14 ordering, the joint set 3DPW papers report on.
@@ -80,16 +99,28 @@ _MHR_FOR_J14 = dict(MHR, head=MHR["nose"])
 
 J14_FROM_MHR70 = np.array([_MHR_FOR_J14[n] for n in J14_NAMES], dtype=np.int64)
 J14_FROM_SMPL24 = np.array([SMPL[n] for n in J14_NAMES], dtype=np.int64)
+J14_FROM_H36M17 = np.array([H36M[n] for n in J14_NAMES], dtype=np.int64)
 J12_FROM_MHR70 = J14_FROM_MHR70[:12]
 J12_FROM_SMPL24 = J14_FROM_SMPL24[:12]
+J12_FROM_H36M17 = J14_FROM_H36M17[:12]
 
 # Pelvis for root alignment: the mid-hip, computed the same way on both sides.
 J14_HIP_IDX = (J14_NAMES.index("left_hip"), J14_NAMES.index("right_hip"))
 
 JOINT_SETS = {
-    "J14": dict(names=J14_NAMES, mhr=J14_FROM_MHR70, smpl=J14_FROM_SMPL24),
-    "J12": dict(names=J12_NAMES, mhr=J12_FROM_MHR70, smpl=J12_FROM_SMPL24),
+    "J14": dict(names=J14_NAMES, mhr=J14_FROM_MHR70,
+                smpl=J14_FROM_SMPL24, h36m=J14_FROM_H36M17),
+    "J12": dict(names=J12_NAMES, mhr=J12_FROM_MHR70,
+                smpl=J12_FROM_SMPL24, h36m=J12_FROM_H36M17),
 }
+
+# ``benchlib.threedpw.build_samples`` returns GT in one of two layouts; this
+# picks the matching index array out of a joint set.
+GT_LAYOUTS = {"h36m": "h36m", "jointpositions": "smpl"}
+
+
+def gt_index(spec: dict, gt: str) -> np.ndarray:
+    return spec[GT_LAYOUTS[gt]]
 
 
 def pelvis(joints: np.ndarray) -> np.ndarray:
