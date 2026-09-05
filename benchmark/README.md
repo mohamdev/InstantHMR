@@ -28,12 +28,61 @@ MHR70 indices 0–14 already follow COCO's ordering, with the wrists at 41/62.
 - **Human3.6M** — the licence forbids redistribution, the download is manual and
   slow, and protocol variants (P1 vs P2, 17 vs 14 joints) differ per paper. High
   effort, high chance of an unfair comparison.
-- **EMDB** — a genuinely good modern benchmark (EMDB-1 for pose), but needs
-  registration *and* the SMPL body model *and* their toolkit to unpack. Worth
-  adding as a second 3D benchmark after 3DPW is in place; `benchlib/threedpw.py`
-  is the template to copy.
-- **RICH** — SMPL-X GT, large download, mostly used for contact estimation.
+- **RICH** — the reason to skip it is not the size alone. Its GT is **SMPL-X**,
+  so it needs the SMPL-X models *and* a second forward pass (different joint
+  count, hand and face parameters) that none of our SMPL code covers; the test
+  split alone is 125K images at 4K, against EMDB-1's few thousand; and NLF
+  *trains* on RICH (the ∗ in SAM 3D Body's Table 2), so the column is not
+  out-of-domain for every method in it.
 - **MPII** — 2D only, so it adds little once COCO is in.
+
+### Next: EMDB — waiting on registration (asked 2026-09-05)
+
+**Status: blocked on the application at `emdb.ait.ethz.ch`** (a form, approved
+by email). Nothing else is missing — the two blockers this file used to list,
+the SMPL body model and their toolkit, are gone: `benchmark/data/smpl/` holds
+the gendered models and the toolkit is only a viewer, not a format we need.
+
+Use **EMDB-1** (17 sequences, 13.5 min), the camera-frame pose split every paper
+reports. EMDB-2 (25 sequences) is global-trajectory and not what this model does.
+
+It is structurally a simpler 3DPW, one subject per sequence:
+
+| EMDB pkl | 3DPW equivalent |
+|---|---|
+| `smpl{poses_root (N,3), poses_body (N,69), betas (10,), trans}` | `poses` (N,72), `betas`, `trans` |
+| `camera{intrinsics, extrinsics (N,4,4), width, height}` | `cam_intrinsics`, `cam_poses` |
+| `good_frames_mask` | `campose_valid` |
+| `bboxes` (N,4) xyxy — **provided** | derived from projected joints |
+
+`betas` is 10-dim, exactly the count the published protocol uses, so
+`make_3dpw_gt.py`'s forward pass drops in unchanged.
+
+**The protocol is the 24 SMPL joints, mid-hip aligned — not the H36M
+regressor.** NLF's Table 3 reads "Results on EMDB1 (24j)" and its metrics
+section states that "on 3DPW and EMDB the reference point is the midpoint
+between the two hip joints"; SAM 3D Body's Table 2 column header is "EMDB (24)".
+Those 24 joints are what `smpl_forward` already returns as its second output.
+
+Two things already done, so the integration is a loader and nothing else:
+
+- `benchmark/results/adapter_smpl24_teacher.npz` — the MHR70 → SMPL-24
+  conversion, fitted the same student-free way as the J14 one, from 22,209
+  teacher/GT pairs on 3DPW train (where `jointPositions` **is** the SMPL-24 set,
+  verified to 0.001 mm). Reads anatomically: `pelvis = 0.38 right_hip + 0.34
+  left_hip`, `left_knee = 0.93 left_knee`, `left_ankle` from heel + ankle + toe.
+- **The conversion floor: 25.11 mm MPJPE / 18.77 mm PA-MPJPE** on a held-out
+  half. That is what an MHR-rigged model carries on a 24-joint benchmark before
+  it makes a single mistake — an *upper* bound, since it also contains the
+  teacher's own 3DPW error, which cannot be separated without perfect MHR GT.
+  Quote it next to the result: the table it joins runs 61.7 (SAM 3D Body) to
+  118.5 (HMR2.0b) MPJPE, so ~25 mm of rig overhead is material.
+
+What is left is `benchlib/emdb.py`, ~80 lines mirroring `threedpw.py`. It was
+deliberately **not** written ahead of the data: `dataset.md` does not say
+whether `extrinsics` is world→camera or camera→world, and guessing wrong gives
+quietly wrong numbers rather than a crash. Thirty seconds with a real pkl
+settles it.
 
 ## Setup
 
@@ -70,6 +119,15 @@ compares them to `jointPositions`: **0.001 mm max over 74,620 person-frames**,
 which is what certifies the forward pass, the gendered model choice and the
 world frame all the way through.
 
+Then fit the MHR70 → J14 adapter once. It is student-free and dataset-wide, so
+this is a one-time step, not something to repeat per checkpoint:
+
+```bash
+python benchmark/fit_adapter_mhr.py \
+    --sequence-dir /path/to/3DPW/sequenceFiles \
+    --out benchmark/results/adapter_j14_h36m_teacher.npz
+```
+
 ## Running
 
 ```bash
@@ -85,14 +143,39 @@ python benchmark/eval_3dpw.py \
     --image-root   /path/to/3DPW/imageFiles \
     --exclude-seen data/sam3d_distill_mix/annotations data/sam3d_gt_3dpw/annotations
 
-# same thing for a training checkpoint instead of an exported graph
+# same thing for a training checkpoint instead of an exported graph. --adapter
+# adds the J14+adapter row, which is the one to quote.
 python benchmark/eval_3dpw_ckpt.py \
-    --ckpt instanthmr_distill_train/runs/b3_s1/b3_s1/best_student_model_v3.pth \
+    --ckpt instanthmr_distill_train/runs/*/*/best_student_model_v3.pth \
     --sequence-dir /path/to/3DPW/sequenceFiles \
-    --image-root   /path/to/3DPW/imageFiles --split test
+    --image-root   /path/to/3DPW/imageFiles --split test \
+    --adapter benchmark/results/adapter_j14_h36m_teacher.npz
 ```
 
 Both write a JSON report to `benchmark/results/`.
+
+## Current numbers (2026-09-05)
+
+3DPW **test**, all 35,463 person-frames, published-protocol GT, the two Jean Zay
+checkpoints pulled at ~epoch 130. Full reports in
+`benchmark/results/3dpw_test_{b3_s1,v3_s1}_teacher_adapter.json`.
+
+| run | preset | J12 PA | J14 PA | **J14+adapter PA** | J14+adapter MPJPE |
+|---|---|---|---|---|---|
+| b3_s1 | baseline | 62.49 | 67.89 | **41.83** | 69.03 |
+| v3_s1 | v2 | 63.20 | 69.05 | **43.23** | 70.59 |
+
+**Quote the adapter row.** Raw J14 is dominated by convention, not quality:
+per-joint it is 131 mm at `head` and 98/87 mm at the hips against ~47 mm at the
+knees.
+
+Two caveats before this goes in a table. The 1.4 mm gap between the two runs is
+**not** a result — measured seed spread in this repo is far wider, so
+baseline-vs-v2 needs 2-3 seeds per arm through the same path. And these are the
+only numbers here that are genuinely held out: both checkpoints were trained on
+Jean Zay, whose corpus is coco/mpii/aic/sa1b/harmony4d with `3dpw_train`
+annotations-only, so all 24 test sequences are unseen. The local `data/` corpus
+is **not** clean — see the contamination section.
 
 ## Protocols, stated precisely
 
@@ -237,11 +320,14 @@ report tells you how large the effect is in the meantime.
 ```
 benchmark/
   download.py        COCO fetcher + 3DPW presence check
-  eval_3dpw.py       3D: MPJPE, PA-MPJPE, PCK3D, AUC, per-sequence breakdown
+  make_3dpw_gt.py    SMPL forward + H36M regressor -> <3DPW root>/gt_h36m/
+  fit_adapter_mhr.py MHR70 -> J14 adapter from TEACHER labels (student-free)
+  eval_3dpw.py       3D from an ONNX graph: MPJPE, PA-MPJPE, PCK3D, AUC
+  eval_3dpw_ckpt.py  the same, for a .pth straight out of runs/
   eval_coco.py       2D: OKS AP/AR, mean OKS, PCK, NME, per-keypoint breakdown
   benchlib/
-    joints.py        MHR70 <-> COCO17 / SMPL24 index maps, J14 & J12 sets
+    joints.py        MHR70 <-> COCO17 / SMPL24 / H36M17 maps, J14 & J12 sets
     metrics.py       Procrustes alignment and the metric definitions
-    threedpw.py      3DPW pickle loading, projection, box derivation
+    threedpw.py      3DPW pickle loading, the GT switch, projection, boxes
     runner.py        batched ONNX inference with overlapped image decoding
 ```

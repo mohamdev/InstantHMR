@@ -76,7 +76,7 @@ Docs are the source of truth; the code is bigger than any context window.
 | 1 | `instanthmr_distill_train/README.md` | which training script to run, what `--preset v2` and `--losses rebalanced` change, the pair-index cache |
 | 2 | `datasets_pipeline/jeanzay/STATUS.md` | Jean Zay cluster + data state, what is built, job templates *(git-excluded, local only)* |
 | 3 | `datasets_pipeline/JEAN_ZAY.md` | site runbook: env, quotas, proxy quirks *(git-excluded, local only)* |
-| 4 | `benchmark/README.md` | how published numbers are produced; J12 vs J14, and **why the current 3DPW GT is not yet the published protocol** |
+| 4 | `benchmark/README.md` | how published numbers are produced; the 3DPW GT (SMPL forward + H36M regressor), the MHR->J14 adapter, and why **J14+adapter** is the row to quote |
 | 5 | `datasets_pipeline/README.md` | how the corpus is built, including the SA-1B visibility mask |
 | 6 | `docs/architecture.md` | the student model |
 
@@ -117,6 +117,24 @@ loss and metric in the trainer is blind to them.
 `run_self_tests`, `train_instant_hmr` and `train_distill_jz.train` all construct
 it bare, so any buffer you register lands on the CPU and raises on step 1. Build
 tensors on `mhr_module.device` instead.
+
+**3DPW GT is the published protocol, and it is a cache on disk.** The pickles'
+`jointPositions` field is the 24 SMPL *kinematic* joints, which is not what any
+paper reports; `benchmark/make_3dpw_gt.py` precomputes the real reference (SMPL
+forward + `J_regressor_h36m`) into `<3DPW root>/gt_h36m/`, and both the harness
+and `val3dpw.py` default to it. Two consequences: a job whose 3DPW directory
+lacks that cache raises at startup, and **numbers from before 2026-09-05 are ~13
+mm apart from later ones** — `--val-3dpw-gt jointpositions` keeps a resumed run
+on its original metric.
+
+**Anything fitted over the 70 MHR keypoints needs float64 and a truncated
+`lstsq`.** 40 of the 70 are finger joints millimetres apart, so the design
+matrix is near-singular. Centring in float32 leaves a 0.04 mm residual in the
+exact direction centring annihilates, `lstsq` keeps it as signal, and the J14
+adapter went from 37 mm to 430 mm in-sample looking like a broken GT. Even in
+float64 the unregularised fit reaches landmarks through ±2000 weights on
+fingers; `RCOND` in `eval_3dpw.fit_adapter` truncates it to a rank-24 map with
+weights under 1 at no measurable cost.
 
 **Seed spread is wide.** Observed 70-keypoint PA-MPJPE varies 34–49 mm across
 seeds, which is larger than several of the changes on the roadmap. A single-run

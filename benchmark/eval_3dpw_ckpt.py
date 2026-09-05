@@ -118,7 +118,7 @@ def main():
         num_workers=args.num_workers, pin_memory=True)
 
     report = {}
-    hdr = (f"\n  {'run':<8s} {'ckpt':<6s} {'ep':>4s} {'GT':<15s} {'J12 PA':>8s} "
+    hdr = (f"\n  {'run':<24s} {'ckpt':<6s} {'ep':>4s} {'GT':<15s} {'J12 PA':>8s} "
            f"{'J12 MPJPE':>10s} {'J14 PA':>8s} {'J14 MPJPE':>10s}"
            + (f" {'J14+ad PA':>10s}" if W_adapt is not None else ""))
     print(hdr)
@@ -146,7 +146,7 @@ def main():
 
             run = Path(ck_path).parts[-3]
             name = Path(ck_path).stem.replace("best_student_model_", "")
-            line = (f"  {run:<8s} {name:<6s} {str(ck.get('epoch')):>4s} {gt:<15s} "
+            line = (f"  {run:<24s} {name:<6s} {str(ck.get('epoch')):>4s} {gt:<15s} "
                     f"{rows['J12']['PA_MPJPE_mm']:8.2f} {rows['J12']['MPJPE_mm']:10.2f} "
                     f"{rows['J14']['PA_MPJPE_mm']:8.2f} {rows['J14']['MPJPE_mm']:10.2f}")
             if W_adapt is not None:

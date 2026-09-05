@@ -100,6 +100,23 @@ def evaluate(pred_mhr: np.ndarray, gt_raw: np.ndarray, set_name: str,
     )
 
 
+def fit_linear_adapter(X_mhr: np.ndarray, Y_target: np.ndarray) -> np.ndarray:
+    """Least-squares map (J, 70) from MHR70 keypoints onto any target joint set.
+
+    Both sides are centred per sample, so the map is bias-free and equivariant
+    to rotation and translation; see ``fit_adapter`` for why the centring is in
+    float64 and why the singular values are truncated.
+    """
+    X = X_mhr.astype(np.float64)
+    Y = Y_target.astype(np.float64)
+    X = X - X.mean(axis=1, keepdims=True)
+    Y = Y - Y.mean(axis=1, keepdims=True)
+    A = X.transpose(0, 2, 1).reshape(-1, X.shape[1])
+    B = Y.transpose(0, 2, 1).reshape(-1, Y.shape[1])
+    W, *_ = np.linalg.lstsq(A, B, rcond=RCOND)
+    return W.T
+
+
 def fit_adapter(pred_mhr: np.ndarray, gt_raw: np.ndarray,
                 gt_src: str) -> np.ndarray:
     """Least-squares regressor W: (14, 70) mapping MHR70 joints to SMPL J14.
@@ -124,15 +141,8 @@ def fit_adapter(pred_mhr: np.ndarray, gt_raw: np.ndarray,
     +-2500. The fitted map still scores ~37 mm in sample in float64 and blows up
     to 430 mm in float32.
     """
-    gt = gt_raw[:, J.gt_index(J.JOINT_SETS["J14"], gt_src), :].astype(np.float64)
-    pred_mhr = pred_mhr.astype(np.float64)
-    X = pred_mhr - pred_mhr.mean(axis=1, keepdims=True)   # (N, 70, 3)
-    Y = gt - gt.mean(axis=1, keepdims=True)               # (N, 14, 3)
-    # Flatten samples and coordinates into the row dimension.
-    A = X.transpose(0, 2, 1).reshape(-1, X.shape[1])      # (N*3, 70)
-    B = Y.transpose(0, 2, 1).reshape(-1, Y.shape[1])      # (N*3, 14)
-    W, *_ = np.linalg.lstsq(A, B, rcond=RCOND)
-    return W.T                                            # (14, 70)
+    gt = gt_raw[:, J.gt_index(J.JOINT_SETS["J14"], gt_src), :]
+    return fit_linear_adapter(pred_mhr, gt)               # (14, 70)
 
 
 def evaluate_adapter(pred_mhr: np.ndarray, gt_raw: np.ndarray,

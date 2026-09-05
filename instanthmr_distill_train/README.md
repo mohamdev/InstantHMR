@@ -95,6 +95,23 @@ non-finger keypoints, reported next to the existing metrics. **Selection is
 unchanged** — and with `--val-3dpw` on, both are replaced by the 3DPW J12
 numbers anyway.
 
+## `--val-3dpw-gt` (added 2026-09-05)
+
+3DPW validation now scores against the published-protocol ground truth — SMPL
+run forward on the sequence's `poses`/`betas`, then the Human3.6M regressor —
+instead of the pickles' raw `jointPositions`. Two things follow.
+
+`ThreeDPWValSet` needs the precomputed reference next to `sequenceFiles/`, built
+once by `benchmark/make_3dpw_gt.py` and rsynced to the cluster as
+`$SCRATCH/instanthmr/3dpw/gt_h36m/`. It is 14 MB for all three splits. Without
+it the job raises at startup rather than silently falling back.
+
+The two references are ~13 mm apart on J12 PA-MPJPE, so **a selection metric
+from before this change cannot be compared with one from after**. A resumed run
+must keep the metric it started on: `--val-3dpw-gt jointpositions`, or
+`DPW_GT=jointpositions` for `52_train_ddp.slurm`. `run_config.json` records
+which was used.
+
 ## The pair index
 
 `SAM3DStudentDataset` enumerates the corpus with one `glob` plus a `stat()` per
