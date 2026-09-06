@@ -177,6 +177,36 @@ Jean Zay, whose corpus is coco/mpii/aic/sa1b/harmony4d with `3dpw_train`
 annotations-only, so all 24 test sequences are unseen. The local `data/` corpus
 is **not** clean — see the contamination section.
 
+### What these metrics cannot see
+
+Both headline metrics are alignment-invariant, and that hides exactly the
+failure a demo shows first. PA-MPJPE removes translation, rotation **and**
+scale; root-relative MPJPE removes translation. So camera-translation drift,
+systematic body-size error and frame-to-frame jitter are all invisible here —
+a change can be worth shipping on stability and move PA-MPJPE by 0.1 mm.
+
+3DPW is video, so measure stability directly on consecutive frames:
+
+- **rigid bone lengths** within a person track. A femur cannot change length,
+  so its variance is pure prediction noise. GT floor: 1.06%.
+- **`cam_trans` acceleration**, `|t[i+1] - 2t[i] + t[i-1]|`. GT floor: 7.0
+  mm/frame².
+
+Measured on 3DPW test (35,463 person-frames, J14 + teacher adapter):
+
+| checkpoint | PA | MPJPE | bone-len CV | cam accel | (z only) |
+|---|---|---|---|---|---|
+| `distill_mhr_only_ckpt90` (old corpus, *contaminated*) | 41.14 | 68.85 | 1.65% | 148.1 | 144.3 |
+| b2_s0 | 44.84 | 72.69 | 1.96% | 234.4 | 229.9 |
+| b3_s1 | 41.83 | 69.03 | 1.85% | 219.6 | 215.9 |
+| v3_s1 | 43.23 | 70.59 | 1.79% | 224.6 | 222.1 |
+| ground truth | — | — | 1.06% | 7.0 | |
+
+Every model is 21-33x jitterier than ground truth, and the rebuilt corpus made
+it ~50% worse — traced to the focal spread and addressed by `--cliff-focal`
+(see `instanthmr_distill_train/README.md`). The legacy row is optimistic on
+both axes: it trained on all 60 3DPW sequences.
+
 ## Protocols, stated precisely
 
 Write these into the paper — they are the details a reviewer will ask about.

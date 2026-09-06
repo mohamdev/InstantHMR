@@ -112,6 +112,55 @@ must keep the metric it started on: `--val-3dpw-gt jointpositions`, or
 `DPW_GT=jointpositions` for `52_train_ddp.slurm`. `run_config.json` records
 which was used.
 
+## `--cliff-focal` (added 2026-09-06, mandatory)
+
+**Use it on every new run.** It changes the CLIFF conditioning from
+image-normalised pixels to a perspective-correct form:
+
+```
+[ atan((cx - W/2) / f),  atan((cy - H/2) / f),  box_px / f ]
+```
+
+— where the box sits in the field of view, and how large it is *angularly*.
+`f` is `cam_focal_length[1]` (fy), a single scalar because the rotation
+augmentation mixes the two image axes and `fx != fy` on the calibrated splits.
+
+**Why it is not optional any more.** Under a *fixed* focal the two forms are
+interchangeable, and the corpus this trainer was written for had exactly that:
+every crop from `tools/annotate_dataset.py` carries the synthetic
+`f = sqrt(H^2+W^2)`, i.e. `f/diag = 1.000` with **zero** spread. The rebuilt
+corpus carries the datasets' own focals instead:
+
+| split | f / diag | sd |
+|---|---|---|
+| `sam3d_distill_mix` (old corpus) | 1.000 | **0.000** |
+| `sam3d_gt_aic` | 1.184 | 0.371 |
+| `sam3d_gt_coco` | 1.049 | 0.344 |
+| `sam3d_gt_mpii` | 0.961 | 0.266 |
+| `sam3d_gt_harmony4d` | 0.285 | 0.010 |
+
+With that spread the pixel form is **ambiguous**: of 4,000 COCO crops, 124 have
+a near-twin under it (conditioning distance < 0.005) whose true depths differ by
+**1.34 m**. The network can only predict the conditional mean, and the residual
+leaves as unstable `cam_trans` and body scale. Measured on 3DPW test, models
+trained on the new corpus jitter at 220-234 mm/frame² of translation
+acceleration (98% of it in depth) against 148 for one trained on the
+constant-focal corpus, and a ground-truth floor of 7.
+
+**PA-MPJPE cannot see any of this** — Procrustes removes translation and scale,
+and the metric moves by ~0.1 mm either way. Judge the change on `cam_trans`
+stability and bone-length variance, never on the benchmark.
+
+**Three places compute this vector and all three must agree**:
+`SAM3DStudentDataset.__getitem__`, `val3dpw._preprocess` (which takes the real
+`fy` from 3DPW's `cam_intrinsics`), and `instanthmr.inference.InstantHMR`
+(pass `focal=` for a checkpoint trained with the flag). Mismatching them raises
+nothing; it silently mis-places the person in depth. `run_config.json` records
+`cliff_focal`.
+
+The default is `False` and is bit-identical to the pre-flag trainer, verified
+over augmented samples tensor by tensor.
+
 ## The pair index
 
 `SAM3DStudentDataset` enumerates the corpus with one `glob` plus a `stat()` per

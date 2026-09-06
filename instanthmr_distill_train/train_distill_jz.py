@@ -332,6 +332,7 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
                 geom_scale_max=cfg.geom_scale_max,
                 cliff_follows_aug=cfg.cliff_follows_aug,
+                cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
 
@@ -492,7 +493,7 @@ def train(args, cfg, rank, local_rank, world):
         from val3dpw import ThreeDPWValSet
         dpw = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
                              split=args.val_3dpw_split, stride=args.val_3dpw_stride,
-                             gt=args.val_3dpw_gt)
+                             gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal)
         # Stride-shard across ranks; the metric is all-reduced afterwards.
         dpw_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(dpw, list(range(rank, len(dpw), world))),
@@ -510,7 +511,7 @@ def train(args, cfg, rank, local_rank, world):
         if args.val_3dpw_test:
             dpw_t = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
                                    split="test", stride=args.val_3dpw_test_stride,
-                                   gt=args.val_3dpw_gt)
+                                   gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal)
             dpw_test_loader = torch.utils.data.DataLoader(
                 torch.utils.data.Subset(dpw_t, list(range(rank, len(dpw_t), world))),
                 batch_size=cfg.batch_size, shuffle=False, drop_last=False,
@@ -631,6 +632,7 @@ def train(args, cfg, rank, local_rank, world):
             "pose_split": cfg.pose_split, "pose_beta": cfg.pose_beta,
             "finger_weight": cfg.finger_weight,
             "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
+            "cliff_focal": cfg.cliff_focal,
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
     for epoch in range(start_epoch, args.epochs):
@@ -880,6 +882,14 @@ def parse_args():
     p.add_argument("--val-3dpw-test-stride", type=int, default=5)
     p.add_argument("--val-3dpw-stride", type=int, default=5,
                    help="3DPW is 30 fps; neighbouring frames are near-duplicates.")
+    p.add_argument("--cliff-focal", action="store_true",
+                   help="Perspective-correct CLIFF conditioning: angles off the "
+                        "optical axis and angular box size instead of "
+                        "image-normalised pixels. Required once the corpus "
+                        "carries real per-image focals (f/diag spans 0.6-1.8), "
+                        "where the pixel form is ambiguous and cam_trans and "
+                        "body scale come out unstable. Applies to training AND "
+                        "to the 3DPW validation crops; the two must agree.")
     p.add_argument("--val-3dpw-gt", default="h36m",
                    choices=("h36m", "jointpositions"),
                    help="h36m (default) is the published protocol and needs "
@@ -963,6 +973,9 @@ def build_cfg(args):
     # An explicit --w_reproj / --w_keypoints3d still wins over both.
     if args.w_reproj is not None:   cfg.w_reproj = args.w_reproj
     if args.w_keypoints3d is not None: cfg.w_keypoints3d = args.w_keypoints3d
+    # Orthogonal to both presets: it changes what the network is TOLD, not what
+    # it is trained on or scored against.
+    cfg.cliff_focal = args.cliff_focal
     return cfg
 
 

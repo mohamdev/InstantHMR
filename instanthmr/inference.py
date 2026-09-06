@@ -119,6 +119,7 @@ class InstantHMR:
         device: str = "cuda",
         providers: Optional[list[str]] = None,
         mhr: object | None = None,
+        focal: float | None = None,
     ):
         import onnxruntime as ort
 
@@ -161,6 +162,10 @@ class InstantHMR:
         self._out_names = out_names
         self.has_joints_3d_head = "joints_3d" in out_names or len(out_names) >= 5
         self._mhr = mhr
+        # None -> the image-normalised CLIFF conditioning the model was trained
+        # with by default. Set it to the camera's focal length in pixels for a
+        # checkpoint trained with --cliff-focal.
+        self.focal = focal
 
     @property
     def derives_joints_3d(self) -> bool:
@@ -381,8 +386,8 @@ class InstantHMR:
     # Preprocessing
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _preprocess(
+        self,
         image_rgb: np.ndarray,
         bbox: np.ndarray,
         h: int,
@@ -395,11 +400,20 @@ class InstantHMR:
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
 
-        # CLIFF conditioning vector (full-frame coords)
-        cx_norm = 2.0 * (cx / w) - 1.0
-        cy_norm = 2.0 * (cy / h) - 1.0
-        b_scale = max(bw, bh) / max(w, h)
-        cliff_cond = np.array([cx_norm, cy_norm, b_scale], dtype=np.float32)
+        # CLIFF conditioning vector (full-frame coords). Must match the variant
+        # the checkpoint was TRAINED with -- see `cliff_focal` in
+        # instanthmr_distill_train/train_distill_mhr_only.py. A model trained
+        # with the focal-aware form and run with the pixel form (or the other
+        # way round) does not error; it silently mis-places the person in depth.
+        if self.focal is not None:
+            cliff_cond = np.array([math.atan((cx - w / 2.0) / self.focal),
+                                   math.atan((cy - h / 2.0) / self.focal),
+                                   max(bw, bh) / self.focal], dtype=np.float32)
+        else:
+            cx_norm = 2.0 * (cx / w) - 1.0
+            cy_norm = 2.0 * (cy / h) - 1.0
+            b_scale = max(bw, bh) / max(w, h)
+            cliff_cond = np.array([cx_norm, cy_norm, b_scale], dtype=np.float32)
 
         sq_size = max(bw, bh) * CROP_EXPAND
         half = sq_size / 2.0

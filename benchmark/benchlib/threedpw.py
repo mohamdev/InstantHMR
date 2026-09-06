@@ -149,6 +149,9 @@ def build_samples(sequence_dir: str | Path, image_root: str | Path,
                     uv=uv.astype(np.float32),
                     sequence=name, person=pid, frame=f,
                     gender=str(seq["genders"][pid]),
+                    # fy, for the focal-aware CLIFF conditioning. 3DPW is
+                    # calibrated, so this is the real focal, not an estimate.
+                    focal=float(K[1, 1]),
                 ))
                 gts.append(gt_w[f] @ T[:3, :3].T + T[:3, 3])
 

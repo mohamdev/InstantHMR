@@ -182,6 +182,12 @@ class DistillConfig:
                                           # MeTRAbs's quarter-area truncation bound.
     cliff_follows_aug: bool = False       # CLIFF cx/cy/b_scale track the augmented
                                           # crop box, as a real detector box would
+    cliff_focal: bool = False             # perspective-correct CLIFF conditioning:
+                                          # angles off the optical axis and angular
+                                          # box size, instead of image-normalised
+                                          # pixels. Needs cam_focal_length, which
+                                          # every npz carries. See the note in
+                                          # SAM3DStudentDataset.__getitem__.
     occl_p: float = 0.2                   # RandomErasing probability (MeTRAbs: 0.7)
     occl_scale: tuple = (0.02, 0.15)
     jpeg_p: float = 0.0                   # random JPEG re-encode probability
@@ -395,6 +401,7 @@ class SAM3DStudentDataset(Dataset):
                  geom_flip_p: float = 0.5,
                  geom_scale_max: float | None = None,
                  cliff_follows_aug: bool = False,
+                 cliff_focal: bool = False,
                  occl_p: float = 0.2, occl_scale: tuple = (0.02, 0.15),
                  jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90)):
         super().__init__()
@@ -408,6 +415,7 @@ class SAM3DStudentDataset(Dataset):
         self.geom_flip_p = geom_flip_p
         self.geom_scale_max = geom_scale_max
         self.cliff_follows_aug = cliff_follows_aug
+        self.cliff_focal = cliff_focal
 
         tfm_list = [transforms.Resize((image_size, image_size))]
 
@@ -630,9 +638,36 @@ class SAM3DStudentDataset(Dataset):
 
         image = self.transform(img_pil)  
 
-        cx_norm = 2.0 * (cx / orig_w) - 1.0
-        cy_norm = 2.0 * (cy / orig_h) - 1.0
-        cliff_cond = torch.tensor([cx_norm, cy_norm, b_scale], dtype=torch.float32)
+        if self.cliff_focal:
+            # Where the box sits in the FIELD OF VIEW, and how large it is
+            # ANGULARLY -- not in image-normalised pixels.
+            #
+            # Under a fixed focal the two are interchangeable, and the corpus
+            # this trainer was written for had exactly that: every crop from
+            # tools/annotate_dataset.py carries the synthetic f = sqrt(H^2+W^2),
+            # i.e. f/diag = 1.000 with zero spread. The rebuilt corpus carries
+            # the datasets' own focals instead, and those span f/diag 0.6-1.8 on
+            # coco/aic/mpii (sd ~0.35) with harmony4d off at 0.285. There the
+            # pixel version is ambiguous: two crops with identical conditioning
+            # correspond to different depths, the network can only predict the
+            # conditional mean, and the residual leaves as unstable cam_trans
+            # and body scale -- measured on 3DPW test as 220 mm/frame^2 of
+            # translation jitter (98% of it in depth) against 148 for a model
+            # trained on the constant-focal corpus.
+            #
+            # One scalar focal (fy) rather than fx/fy, because the rotation
+            # augmentation mixes the two axes and fx != fy on the calibrated
+            # splits.
+            f = float(ann["cam_focal_length"][1])
+            b_px = b_scale * max(orig_w, orig_h)
+            cliff_cond = torch.tensor(
+                [math.atan((cx - orig_w / 2.0) / f),
+                 math.atan((cy - orig_h / 2.0) / f),
+                 b_px / f], dtype=torch.float32)
+        else:
+            cx_norm = 2.0 * (cx / orig_w) - 1.0
+            cy_norm = 2.0 * (cy / orig_h) - 1.0
+            cliff_cond = torch.tensor([cx_norm, cy_norm, b_scale], dtype=torch.float32)
 
         return {
             "image": image,                                                          
@@ -659,6 +694,7 @@ def build_dataloaders(cfg):
                 geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
                 geom_scale_max=cfg.geom_scale_max,
                 cliff_follows_aug=cfg.cliff_follows_aug,
+                cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
     full_dataset = SAM3DStudentDataset(

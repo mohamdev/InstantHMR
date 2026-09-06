@@ -136,6 +136,24 @@ float64 the unregularised fit reaches landmarks through ±2000 weights on
 fingers; `RCOND` in `eval_3dpw.fit_adapter` truncates it to a rank-24 map with
 weights under 1 at no measurable cost.
 
+**The CLIFF conditioning is computed in three places and they must agree.**
+`SAM3DStudentDataset.__getitem__`, `val3dpw._preprocess` and
+`instanthmr.inference.InstantHMR._preprocess` each build the 3-vector
+separately. Feeding a model trained on one variant with the other raises
+nothing — it silently mis-places the person in depth. Since 2026-09-06 the
+perspective-correct variant (`--cliff-focal`, config `cliff_focal`) is
+mandatory for new runs, because the rebuilt corpus carries real per-image
+focals spanning `f/diag` 0.6-1.8 where the pixel form is ambiguous; the old
+corpus was constant at 1.000. See `instanthmr_distill_train/README.md`.
+
+**PA-MPJPE is blind to half of what a demo shows.** Procrustes removes
+translation, rotation and scale, so `cam_trans` drift, body-size error and
+temporal jitter are all invisible to it — and to root-relative MPJPE for the
+first two. A change can be worth shipping on stability and move the benchmark
+by 0.1 mm. Measure jitter directly (frame-to-frame acceleration on 3DPW's
+consecutive frames, and the variance of rigid bone lengths within a person
+track, which cannot change and so is pure noise).
+
 **Seed spread is wide.** Observed 70-keypoint PA-MPJPE varies 34–49 mm across
 seeds, which is larger than several of the changes on the roadmap. A single-run
 comparison proves nothing; use 2–3 seeds.

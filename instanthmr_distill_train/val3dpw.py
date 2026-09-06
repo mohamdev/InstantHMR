@@ -61,7 +61,8 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 MM = 1000.0
 
 
-def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int):
+def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int,
+                focal: float | None = None):
     """Square 1.2x crop + ImageNet normalise + CLIFF conditioning.
 
     A transcription of ``instanthmr.inference.InstantHMR._preprocess``. It is
@@ -74,9 +75,17 @@ def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int):
     bw, bh = x2 - x1, y2 - y1
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
-    cliff = np.array([2.0 * (cx / w) - 1.0,
-                      2.0 * (cy / h) - 1.0,
-                      max(bw, bh) / max(w, h)], dtype=np.float32)
+    # Must match SAM3DStudentDataset.__getitem__ exactly, including which
+    # variant. Feeding a model trained on one and evaluated on the other is a
+    # silent distribution shift, not an error.
+    if focal is not None:
+        cliff = np.array([math.atan((cx - w / 2.0) / focal),
+                          math.atan((cy - h / 2.0) / focal),
+                          max(bw, bh) / focal], dtype=np.float32)
+    else:
+        cliff = np.array([2.0 * (cx / w) - 1.0,
+                          2.0 * (cy / h) - 1.0,
+                          max(bw, bh) / max(w, h)], dtype=np.float32)
 
     sq = max(bw, bh) * CROP_EXPAND
     half = sq / 2.0
@@ -106,12 +115,13 @@ class ThreeDPWValSet(Dataset):
     def __init__(self, sequence_dir: str, image_root: str,
                  split: str = "validation", stride: int = 5,
                  bbox_scale: float = 1.2, gt: str = "h36m",
-                 gt_dir: str | None = None):
+                 gt_dir: str | None = None, cliff_focal: bool = False):
         self.samples, self.gt = P.build_samples(
             sequence_dir, image_root, split=split,
             stride=stride, bbox_scale=bbox_scale, gt=gt, gt_dir=gt_dir)
         self.gt = np.asarray(self.gt, dtype=np.float32)
         self.gt_source = gt
+        self.cliff_focal = cliff_focal
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -128,7 +138,8 @@ class ThreeDPWValSet(Dataset):
                     "ok": torch.tensor(0.0)}
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
-        crop, cliff = _preprocess(rgb, s["bbox"], h, w)
+        crop, cliff = _preprocess(rgb, s["bbox"], h, w,
+                                  s["focal"] if self.cliff_focal else None)
         return {"image": torch.from_numpy(crop),
                 "cliff_cond": torch.from_numpy(cliff),
                 "gt": torch.from_numpy(self.gt[i]),

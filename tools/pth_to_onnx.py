@@ -34,9 +34,9 @@ Usage
     python tools/pth_to_onnx.py
 
     # or point at a specific checkpoint / output
-    python tools/pth_to_onnx.py \
-        --ckpt   instanthmr_distill_train/runs/distill_mhr_only/distill_mhr_only/best_student_model_ema.pth \
-        --output models/instanthmr_mhr_only.onnx
+    python ./tools/pth_to_onnx.py \
+        --ckpt   ./instanthmr_distill_train/runs/b2_s0/b2_s0/best_student_model_ema.pth \
+        --output ./models/instanthmr_mhr_only.onnx
 """
 import argparse
 import importlib
