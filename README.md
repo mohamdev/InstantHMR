@@ -212,6 +212,7 @@ per frame than InstantHMR. The two flags below target that bottleneck.
 | `--device coreml` | On macOS, route the InstantHMR ONNX through `CoreMLExecutionProvider`. |
 | `--max-persons N` | Maximum number of persons processed per frame (default: **2**). See below. |
 | `--no-batch-persons` | Disable batched multi-person HMR (one ONNX call per person). The default is batched. |
+| `--focal PX` | Your camera's focal length **in pixels**, when you know it. Models exported from a `--cliff-focal` checkpoint are conditioned on *angles*, so they need a focal; without one the demo falls back to `1.05 x` the image diagonal, which is a reasonable phone/webcam stand-in but mis-places the person in depth on any camera whose true focal differs. Older pixel-conditioned graphs ignore it and are unaffected. |
 
 ### `--max-persons` and why it matters
 

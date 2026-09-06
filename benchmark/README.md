@@ -154,6 +154,41 @@ python benchmark/eval_3dpw_ckpt.py \
 
 Both write a JSON report to `benchmark/results/`.
 
+### The evaluator configures itself from the checkpoint (fixed 2026-09-06)
+
+`eval_3dpw_ckpt.py` used to build a **default** `DistillConfig`, which silently
+disagreed with any run that used one of the 2026-09-06 flags:
+
+* `--bound-scales` puts a `tanh` remap of the 77 body-size parameters inside
+  `forward()`. Exporting or scoring without it reads the head's raw pre-`tanh`
+  numbers as bone scales — **21.0 mm MPJPE / 14.4 mm PA-MPJPE** of corruption,
+  measured on 64 COCO teacher targets.
+* `--cliff-focal` changes what the conditioning vector *means*, not the graph,
+  so feeding the wrong form raises nothing.
+
+Both are now restored per checkpoint by `T.config_from_checkpoint()`: the
+bounds from the weights (`scale_lo` / `scale_hi` are the flag), the
+conditioning form from the `run_config.json` beside the checkpoint. The script
+prints what it inferred:
+
+```
+[cfg] bno_s0/best_student_model_v3.pth: backbone=repvit_m2_3 bound_scales=True cliff_focal=True [run_config.json]
+[3DPW] test / GT=h36m: 35,463 person-frames (stride 1), CLIFF conditioning angular (real per-sequence focal)
+```
+
+Check that line. `cliff_focal=False [DEFAULT ...]` on a run you launched with
+`--cliff-focal` means `run_config.json` did not travel with the checkpoint —
+pass `--cliff-focal` by hand. The checkpoint load is **strict**, so a bounded
+checkpoint scored through the wrong config raises instead of quietly producing
+a number. Checkpoints that disagree on the conditioning cannot share one
+invocation, because the crops are built once; the script says so and exits.
+
+The focal itself comes from 3DPW's own calibration (`cam_intrinsics`,
+`K[1,1]` = 1969.23 px on 10 of the 12 validation sequences, 1961.85 on the two
+landscape ones) — not a heuristic. The naive `sqrt(H^2+W^2)` stand-in would be
+2202.9 px, 12% high. `eval_3dpw.py` (the ONNX path) now passes the same
+per-frame focal through `benchlib/runner.py`.
+
 ## Current numbers (2026-09-05)
 
 3DPW **test**, all 35,463 person-frames, published-protocol GT, the two Jean Zay

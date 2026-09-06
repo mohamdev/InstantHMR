@@ -72,6 +72,13 @@ class PosePipeline:
             Required for MHR-only graphs, whose 3D keypoints are derived
             from the predicted MHR parameters instead of a 3D head; ignored
             by graphs that carry a ``joints_3d`` output.
+        focal: The camera's focal length in pixels, when known. A graph
+            exported from a ``--cliff-focal`` checkpoint is conditioned on
+            angles rather than pixels, so it needs a focal; without one it
+            falls back to a diagonal-derived stand-in, which mis-places the
+            person in depth on any camera whose true focal differs.
+        cliff_focal: Override the conditioning form; normally read from the
+            ONNX metadata. See :class:`instanthmr.inference.InstantHMR`.
 
     Example
     -------
@@ -91,11 +98,14 @@ class PosePipeline:
         detector_stride: int = 1,
         batch_persons: bool = True,
         mhr: object | None = None,
+        focal: float | None = None,
+        cliff_focal: bool | None = None,
     ):
         if detector_stride < 1:
             raise ValueError("detector_stride must be >= 1")
 
-        self.hmr = InstantHMR(onnx_path, device=device, mhr=mhr)
+        self.hmr = InstantHMR(onnx_path, device=device, mhr=mhr,
+                              focal=focal, cliff_focal=cliff_focal)
         if self.hmr.derives_joints_3d and mhr is None:
             raise ValueError(
                 f"{Path(onnx_path).name} has no 'joints_3d' output (MHR-only student): "

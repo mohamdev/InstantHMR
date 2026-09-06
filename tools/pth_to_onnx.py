@@ -98,6 +98,13 @@ def main() -> None:
     ap.add_argument("--allow-missing", action="store_true",
                     help="Export even if checkpoint weights are missing (NOT recommended).")
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--cliff-focal", dest="cliff_focal", action="store_true",
+                    default=None,
+                    help="Force the focal-aware CLIFF conditioning flag stamped "
+                         "into the ONNX metadata. Normally read from the "
+                         "run_config.json beside the checkpoint.")
+    ap.add_argument("--no-cliff-focal", dest="cliff_focal", action="store_false",
+                    help="Force the pixel-normalised CLIFF conditioning flag.")
     args = ap.parse_args()
 
     if not args.ckpt.exists():
@@ -113,7 +120,20 @@ def main() -> None:
     T = importlib.import_module(ARCH_MODULES[arch])
     print(f"Architecture: {arch}  (from {ARCH_MODULES[arch]}.py)")
 
-    cfg = T.DistillConfig()        # default architecture (matches training)
+    # Restore the configuration the checkpoint was TRAINED with, not the
+    # defaults. `--bound-scales` puts a tanh remap of the 77 body-size
+    # parameters inside forward(); exporting without it leaves the head's raw
+    # pre-tanh numbers to be read as bone scales, which is 21.0 mm MPJPE /
+    # 14.4 mm PA-MPJPE of silent corruption. See T.config_from_checkpoint.
+    if hasattr(T, "config_from_checkpoint"):
+        cfg, prov = T.config_from_checkpoint(
+            state, args.ckpt, cliff_focal=args.cliff_focal)
+    else:                            # older training modules predate the helper
+        cfg, prov = T.DistillConfig(), {}
+    print(f"  bound_scales : {getattr(cfg, 'bound_scales', False)} "
+          f"({prov.get('bound_scales', 'default')})")
+    print(f"  cliff_focal  : {getattr(cfg, 'cliff_focal', False)} "
+          f"({prov.get('cliff_focal', 'default')})")
 
     # SimCC head geometry lives in the checkpoint — mirror it so the graph and
     # the bin centres agree with what was actually trained.
@@ -129,7 +149,15 @@ def main() -> None:
     print(f"Loaded {args.ckpt.name} | epoch {ckpt.get('epoch', '?')} "
           f"| PA-MPJPE {ckpt.get('val_pa_mpjpe', '?')} | source {ckpt.get('source', '?')}")
     if unexpected:
-        print(f"  unexpected keys: {len(unexpected)} -> {unexpected[:8]}")
+        # Fatal, not a note. An unexpected key means the checkpoint carries
+        # state this architecture has no slot for, i.e. the config above is
+        # wrong -- exactly how `scale_lo`/`scale_hi` used to be dropped.
+        sys.exit(
+            f"\n[error] {len(unexpected)} key(s) in the checkpoint have no "
+            f"home in the model built here:\n        {unexpected[:8]}\n"
+            f"        The exported graph would silently differ from the "
+            f"trained one. Fix the config, do not ignore this."
+        )
     if missing:
         print(f"  missing keys   : {len(missing)} -> {missing[:8]}")
         if not args.allow_missing:
@@ -170,6 +198,23 @@ def main() -> None:
         input_names=["image", "cliff_cond"], output_names=output_keys,
         dynamic_axes=dynamic_axes, opset_version=args.opset,
     )
+    # Stamp which CLIFF conditioning this graph expects. The vector has the
+    # same shape either way, so a consumer that guesses wrong gets no error --
+    # only a person placed at the wrong depth. instanthmr.inference reads this.
+    try:
+        import onnx
+        m = onnx.load(str(args.output))
+        for k, v in (("cliff_focal", str(bool(getattr(cfg, "cliff_focal", False))).lower()),
+                     ("bound_scales", str(bool(getattr(cfg, "bound_scales", False))).lower()),
+                     ("arch", arch)):
+            e = m.metadata_props.add()
+            e.key, e.value = k, v
+        onnx.save(m, str(args.output))
+        print(f"  metadata: cliff_focal={getattr(cfg, 'cliff_focal', False)} "
+              f"bound_scales={getattr(cfg, 'bound_scales', False)} arch={arch}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warning] could not stamp ONNX metadata: {e}")
+
     print(f"\n✅ Wrote {args.output}  ({args.output.stat().st_size / 1e6:.1f} MB)")
 
     # --- Sanity check: run once through onnxruntime and verify I/O ---
@@ -183,6 +228,22 @@ def main() -> None:
         for o, v in zip(sess.get_outputs(), outs):
             v = np.asarray(v)
             print(f"    {o.name:14s} {list(v.shape)}  std={v.std():.4f}")
+
+        # Parity against the configured PyTorch model on the SAME input. This
+        # is the check that catches a config-level export defect: identical
+        # weights, different forward. A dropped tanh remap shows up here as a
+        # large mhr_params delta while every tensor keeps its right shape.
+        with torch.no_grad():
+            ref = deploy(dummy_img, dummy_cliff)
+        worst = max(float(np.abs(np.asarray(o) - r.numpy()).max())
+                    for o, r in zip(outs, ref))
+        print(f"  torch<->onnx max abs diff: {worst:.3e}")
+        if worst > 1e-3:
+            sys.exit(
+                f"\n[error] the ONNX graph disagrees with the PyTorch model it "
+                f"was built from by {worst:.3e}.\n        Identical weights, "
+                f"different forward -- the exported configuration is wrong."
+            )
         # A dead 2D head (wrong arch, weights left at init) predicts every joint
         # at the crop centre; real predictions spread over normalised [-1, 1].
         j2d = np.asarray(outs[output_keys.index("joints_2d")])

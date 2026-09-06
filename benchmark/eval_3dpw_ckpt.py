@@ -54,7 +54,15 @@ def parse_args():
     p.add_argument("--fit-adapter", default=None,
                    help="fit that regressor on THIS split and write it here "
                         "(run on train, never on test)")
-    p.add_argument("--backbone", default="repvit_m2_3")
+    p.add_argument("--backbone", default=None,
+                   help="override the backbone; normally read from the "
+                        "run_config.json beside the checkpoint")
+    p.add_argument("--cliff-focal", dest="cliff_focal", action="store_true",
+                   default=None,
+                   help="force the focal-aware CLIFF conditioning; normally "
+                        "read from run_config.json")
+    p.add_argument("--no-cliff-focal", dest="cliff_focal", action="store_false",
+                   help="force the pixel-normalised CLIFF conditioning")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--device", default="cuda")
@@ -94,7 +102,35 @@ def predict(model, loader, mhr_module, device, use_amp: bool = True):
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    cfg = T.DistillConfig(backbone=args.backbone)
+
+    # Rebuild each checkpoint's real training configuration instead of the
+    # defaults: `--bound-scales` changes the forward pass and `--cliff-focal`
+    # changes what the conditioning vector means. Getting either wrong scores
+    # a different model than the one that was trained. See
+    # T.config_from_checkpoint.
+    cfgs = {}
+    for ck_path in args.ckpt:
+        st = torch.load(ck_path, map_location="cpu", weights_only=False)
+        st = st.get("model_state_dict", st)
+        cfgs[ck_path], prov = T.config_from_checkpoint(
+            st, ck_path, backbone=args.backbone, cliff_focal=args.cliff_focal)
+        print(f"[cfg] {Path(ck_path).parent.name}/{Path(ck_path).name}: "
+              f"backbone={cfgs[ck_path].backbone} "
+              f"bound_scales={cfgs[ck_path].bound_scales} "
+              f"cliff_focal={cfgs[ck_path].cliff_focal} "
+              f"[{prov.get('cliff_focal', 'default')}]")
+        del st
+
+    # One shared 3DPW loader, so every checkpoint must agree on the conditioning.
+    focals = {c.cliff_focal for c in cfgs.values()}
+    if len(focals) > 1:
+        raise SystemExit(
+            "the checkpoints disagree on --cliff-focal, and the crop/"
+            "conditioning is built once for all of them.\n"
+            "Evaluate the two groups in separate invocations.")
+    cliff_focal = focals.pop()
+
+    cfg = next(iter(cfgs.values()))
     mhr = T.MHRForwardPass(cfg.mhr_model_path, device,
                            kp_regressor=np.load(cfg.kp_regressor_path))
     W_adapt = W_adapt_gt = None
@@ -108,10 +144,13 @@ def main():
     for gt in args.gt:
         ds = val3dpw.ThreeDPWValSet(args.sequence_dir, args.image_root,
                                     split=args.split, stride=args.stride,
-                                    gt=gt, gt_dir=args.gt_dir)
+                                    gt=gt, gt_dir=args.gt_dir,
+                                    cliff_focal=cliff_focal)
         sets[gt] = ds
         print(f"[3DPW] {args.split} / GT={gt}: {len(ds):,} person-frames "
-              f"(stride {args.stride})", flush=True)
+              f"(stride {args.stride}), CLIFF conditioning "
+              f"{'angular (real per-sequence focal)' if cliff_focal else 'pixel-normalised'}",
+              flush=True)
     first = sets[args.gt[0]]
     loader = torch.utils.data.DataLoader(
         first, batch_size=args.batch_size, shuffle=False,
@@ -124,8 +163,10 @@ def main():
     print(hdr)
 
     for ck_path in args.ckpt:
-        model = T.InstantHMRStudent(cfg, pretrained=False).to(device)
+        model = T.InstantHMRStudent(cfgs[ck_path], pretrained=False).to(device)
         ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+        # Strict: an unexpected key means the config restored above is wrong
+        # and the model being scored is not the model that was trained.
         model.load_state_dict(ck["model_state_dict"])
         pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp)
         del model

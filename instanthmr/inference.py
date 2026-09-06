@@ -36,6 +36,17 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 INPUT_SIZE = 224
 CROP_EXPAND = 1.2  # square crop around the detector bbox, matching training
+# Focal used when the camera is uncalibrated, as a multiple of the image
+# diagonal. A focal-aware checkpoint needs a number here whatever happens --
+# the conditioning is an ANGLE, so there is no "unknown" to pass. 1.05x diag
+# (~50 degrees horizontal FOV on 16:9) is the usual stand-in for a phone or
+# webcam; pass the real value through `focal=` whenever it is known.
+#
+# It applies to focal-aware graphs ONLY. A pixel-conditioned checkpoint was
+# trained on a corpus whose annotations set f = sqrt(H^2+W^2) exactly (see
+# tools/annotate_dataset.py), so 1.0x diag IS that model's camera and using
+# anything else would put a 5% error into its rendered depth.
+FOCAL_FALLBACK_DIAG = 1.05
 
 
 def onnx_output_names(onnx_path: str | Path) -> Optional[list[str]]:
@@ -70,7 +81,9 @@ class HMRPrediction:
         joints_3d_cam: (70, 3) joints in camera space (= local + cam_trans).
         joints_2d: (70, 2) joints projected into full-frame pixel coords.
         cam_trans: (3,) camera translation [tx, ty, tz], metres.
-        focal_length: (2,) [fx, fy] full-frame virtual focal = sqrt(H^2+W^2).
+        focal_length: (2,) [fx, fy] full-frame focal in pixels -- the camera
+            this prediction is expressed in. The real focal when one was
+            supplied, else the diagonal stand-in ``_focal_px`` picks.
         principal_point: (2,) [cx, cy] = full-frame centre.
         image_shape: (H, W) of the source frame.
         mhr_params: (204,) MHR pose parameters (34 joints × 6-D rotation).
@@ -105,6 +118,14 @@ class InstantHMR:
             head. Any object exposing ``keypoints(mhr_params, shape_params)``
             works; see :func:`instanthmr.mhr_renderer.build_mhr`. Ignored for
             5-output graphs.
+        focal: the camera's focal length in pixels, when it is known. Used by
+            the focal-aware conditioning and reported back in
+            ``HMRPrediction.focal_length``. Left unset, an uncalibrated
+            stand-in of ``FOCAL_FALLBACK_DIAG * sqrt(H^2+W^2)`` is used.
+        cliff_focal: which conditioning form the checkpoint was trained with.
+            Read from the ONNX metadata that ``tools/pth_to_onnx.py`` stamps,
+            so it normally needs no setting; pass it explicitly for a graph
+            exported before that existed.
 
     Example
     -------
@@ -120,6 +141,7 @@ class InstantHMR:
         providers: Optional[list[str]] = None,
         mhr: object | None = None,
         focal: float | None = None,
+        cliff_focal: bool | None = None,
     ):
         import onnxruntime as ort
 
@@ -162,10 +184,36 @@ class InstantHMR:
         self._out_names = out_names
         self.has_joints_3d_head = "joints_3d" in out_names or len(out_names) >= 5
         self._mhr = mhr
-        # None -> the image-normalised CLIFF conditioning the model was trained
-        # with by default. Set it to the camera's focal length in pixels for a
-        # checkpoint trained with --cliff-focal.
+
+        # Two independent things, and conflating them is what made this wrong:
+        #
+        #   cliff_focal -- WHICH conditioning form the checkpoint was trained
+        #     with. Angles off the optical axis, or image-normalised pixels.
+        #     The vector is 3 floats either way, so feeding a model the wrong
+        #     one raises nothing; it silently mis-places the person in depth.
+        #     tools/pth_to_onnx.py stamps it into the graph metadata, so a
+        #     freshly exported model configures itself.
+        #   focal -- WHAT the camera's focal length is, in pixels. Only used by
+        #     the angular form. Unknown is not an option there, so an
+        #     uncalibrated camera falls back to FOCAL_FALLBACK_DIAG * diagonal.
+        #
+        # Passing `focal=` alone still implies the angular form, which is how
+        # this argument behaved before `cliff_focal` existed.
+        meta = self.session.get_modelmeta().custom_metadata_map or {}
+        if cliff_focal is None:
+            cliff_focal = (str(meta.get("cliff_focal", "")).lower() == "true"
+                           or focal is not None)
+        self.cliff_focal = bool(cliff_focal)
         self.focal = focal
+
+    def _focal_px(self, h: int, w: int, focal: float | None = None) -> float:
+        """The camera focal in pixels: this call's, the session's, or a
+        stand-in -- in that order."""
+        f = focal if focal is not None else self.focal
+        if f is not None:
+            return float(f)
+        diag = math.sqrt(h * h + w * w)
+        return (FOCAL_FALLBACK_DIAG * diag) if self.cliff_focal else diag
 
     @property
     def derives_joints_3d(self) -> bool:
@@ -207,6 +255,7 @@ class InstantHMR:
         image_rgb: np.ndarray,
         bbox: np.ndarray | list[float],
         confidence: float = 1.0,
+        focal: float | None = None,
     ) -> HMRPrediction:
         """Run InstantHMR on a single person.
 
@@ -214,6 +263,9 @@ class InstantHMR:
             image_rgb: (H, W, 3) uint8 RGB full-frame image.
             bbox: tight person bbox [x1, y1, x2, y2] in pixel coords.
             confidence: detection confidence to attach to the output.
+            focal: this frame's focal length in pixels, overriding the one
+                given to the constructor. Use it when the focal varies per
+                image, as it does across calibrated benchmark sequences.
 
         Returns:
             ``HMRPrediction`` with joints in full-frame coordinates.
@@ -223,7 +275,7 @@ class InstantHMR:
         bbox_arr = np.asarray(bbox, dtype=np.float32).reshape(4)
 
         crop, sq_x1, sq_y1, sq_size, cliff_cond = self._preprocess(
-            image_rgb, bbox_arr, h, w
+            image_rgb, bbox_arr, h, w, focal
         )
 
         outs = self.session.run(
@@ -253,8 +305,9 @@ class InstantHMR:
 
         joints_3d_cam = joints_3d_local + cam_trans
 
-        # Full-frame virtual pinhole: focal = sqrt(H^2 + W^2), principal = centre.
-        f = math.sqrt(h * h + w * w)
+        # Report the focal actually used, so anything that unprojects or
+        # renders these joints uses the same camera the model was conditioned on.
+        f = self._focal_px(h, w, focal)
         focal_length = np.array([f, f], dtype=np.float32)
         principal_point = np.array([w / 2.0, h / 2.0], dtype=np.float32)
 
@@ -277,6 +330,7 @@ class InstantHMR:
         image_rgb: np.ndarray,
         detections: list[dict],
         padded_to: int | None = None,
+        focal: float | None = None,
     ) -> list[HMRPrediction]:
         """Run InstantHMR on multiple persons in a single ONNX call.
 
@@ -287,6 +341,8 @@ class InstantHMR:
                 (zero-padded if fewer detections).  Keeping a constant batch
                 size prevents CUDA from re-compiling kernels each time the
                 person count changes.
+            focal: this frame's focal length in pixels, overriding the one
+                given to the constructor.
 
         Returns:
             One ``HMRPrediction`` per input detection, in the same order.
@@ -306,7 +362,7 @@ class InstantHMR:
         for i, det in enumerate(detections):
             bbox_arr = np.asarray(det["bbox"], dtype=np.float32).reshape(4)
             crop, sq_x1, sq_y1, sq_size, cliff = self._preprocess(
-                image_rgb, bbox_arr, h, w,
+                image_rgb, bbox_arr, h, w, focal,
             )
             crops[i] = crop
             cliffs[i] = cliff
@@ -327,7 +383,7 @@ class InstantHMR:
             # including the zero-padded slots — they are discarded below.
             joints_3d_local_b = self._joints_3d(mhr_params_b, shape_params_b)
 
-        f = math.sqrt(h * h + w * w)
+        f = self._focal_px(h, w, focal)
         focal_length = np.array([f, f], dtype=np.float32)
         principal_point = np.array([w / 2.0, h / 2.0], dtype=np.float32)
 
@@ -392,6 +448,7 @@ class InstantHMR:
         bbox: np.ndarray,
         h: int,
         w: int,
+        focal: float | None = None,
     ) -> tuple[np.ndarray, float, float, float, np.ndarray]:
         """Square 1.2x crop, ImageNet normalise, and CLIFF conditioning."""
         x1, y1, x2, y2 = bbox.astype(float)
@@ -405,10 +462,11 @@ class InstantHMR:
         # instanthmr_distill_train/train_distill_mhr_only.py. A model trained
         # with the focal-aware form and run with the pixel form (or the other
         # way round) does not error; it silently mis-places the person in depth.
-        if self.focal is not None:
-            cliff_cond = np.array([math.atan((cx - w / 2.0) / self.focal),
-                                   math.atan((cy - h / 2.0) / self.focal),
-                                   max(bw, bh) / self.focal], dtype=np.float32)
+        if self.cliff_focal:
+            f = self._focal_px(h, w, focal)
+            cliff_cond = np.array([math.atan((cx - w / 2.0) / f),
+                                   math.atan((cy - h / 2.0) / f),
+                                   max(bw, bh) / f], dtype=np.float32)
         else:
             cx_norm = 2.0 * (cx / w) - 1.0
             cy_norm = 2.0 * (cy / h) - 1.0

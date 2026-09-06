@@ -111,6 +111,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable batched multi-person HMR (one ONNX call per person).",
     )
     p.add_argument(
+        "--focal", type=float, default=None,
+        help="Camera focal length in PIXELS, when it is known. A graph exported "
+             "from a --cliff-focal checkpoint is conditioned on angles, so it "
+             "needs one; without it the demo falls back to 1.05x the image "
+             "diagonal, which mis-places the person in depth on any camera "
+             "whose true focal differs.",
+    )
+    p.add_argument(
         "--smoothing-filter", action="store_true",
         help="Temporally smooth per-person predictions with a moving-average "
              "filter (see instanthmr/smoothing.py). Non-learned and free; NLF "
@@ -211,6 +219,7 @@ def build_pipeline(args: argparse.Namespace, mhr=None) -> PosePipeline:
         detector_stride=args.detector_stride,
         batch_persons=not args.no_batch_persons,
         mhr=mhr,
+        focal=args.focal,
     )
 
 

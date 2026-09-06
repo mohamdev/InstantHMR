@@ -108,6 +108,7 @@ Docs are the source of truth; the code is bigger than any context window.
 | 4 | `benchmark/README.md` | how published numbers are produced; the 3DPW GT (SMPL forward + H36M regressor), the MHR->J14 adapter, and why **J14+adapter** is the row to quote |
 | 5 | `datasets_pipeline/README.md` | how the corpus is built, including the SA-1B visibility mask |
 | 6 | `docs/architecture.md` | the student model |
+| 7 | `docs/todo.md` | open defects and opportunities from the 2026-09-06 audit, each with the measurement behind it |
 
 `datasets_pipeline/jeanzay/` and `JEAN_ZAY.md` are in `.git/info/exclude` on
 purpose — they carry the login name, jump host and project code. Keep
@@ -207,6 +208,20 @@ perspective-correct variant (`--cliff-focal`, config `cliff_focal`) is
 mandatory for new runs, because the rebuilt corpus carries real per-image
 focals spanning `f/diag` 0.6-1.8 where the pixel form is ambiguous; the old
 corpus was constant at 1.000. See `instanthmr_distill_train/README.md`.
+
+**Never rebuild a config from `DistillConfig()` defaults to load a checkpoint.**
+Two 2026-09-06 flags make the defaults wrong, in opposite ways.
+`--bound-scales` puts a `tanh` remap inside `forward()`, so a default-config
+export reads the head's raw pre-`tanh` numbers as bone scales — measured 21.0
+mm MPJPE / 14.4 mm PA-MPJPE of silent corruption. `--cliff-focal` changes what
+the conditioning vector *means*, not the graph, so a mismatch raises nothing.
+Use `T.config_from_checkpoint()`: it reads the bounds out of the weights
+(`scale_lo`/`scale_hi` are the flag) and the conditioning form out of the
+`run_config.json` beside the checkpoint, and `tools/pth_to_onnx.py` stamps the
+latter into the ONNX metadata so `instanthmr.inference` configures itself.
+Deployment has no annotation to read a focal from, so it falls back to
+`1.05 x diag` for focal-aware graphs and `1.00 x diag` for pixel-conditioned
+ones (that IS the old corpus's synthetic focal); `demo.py --focal` overrides.
 
 **One reported number: J14 PA-MPJPE, adapter-applied, on the H36M GT.** The
 training log, `summarize_runs.py` and `benchmark/eval_3dpw_ckpt.py` all print

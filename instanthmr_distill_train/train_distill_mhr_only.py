@@ -45,6 +45,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import io
+import json
 import math
 import random
 import gc
@@ -293,6 +294,28 @@ class DistillConfig:
     bound_scales: bool = False
     scale_bound_margin: float = 0.5
     scale_bounds_path: str = str(PROJECT_ROOT / "assets/mhr_size_bounds.npz")
+    # Stop the 2D SimCC head from shaping the shared trunk (backbone + decoder).
+    # It keeps its full supervision and stays a deployed output -- only the
+    # gradient path back into the decoder is cut, so the trunk is trained by the
+    # 3D pathway alone.
+    #
+    # Measured on the converged b3_s1 checkpoint over real augmented batches:
+    # of the gradient reaching backbone+decoder, loss_2d_simcc owns 47.6% and
+    # loss_2d_native 8.6%, loss_cam 22.3%, and all seven 3D body-pose terms
+    # together 20.7%.  The dominant term is also the most exhausted and the
+    # noisiest: loss_2d_simcc sits at 2.227 nats against an irreducible floor of
+    # 2.112 (the entropy of its own Gaussian soft label at sigma = 2 bins), so
+    # only 5.2% of it is reducible, and its trunk gradient has the worst
+    # signal-to-noise of any term (|mean g| / mean |g| = 0.28 against the pose
+    # group's 0.39) at a +0.21 per-batch cosine with it.
+    #
+    # The 70 SimCC queries keep receiving gradient through the decoder's
+    # self-attention with the global token, so they do not go dead -- they stop
+    # being *forced* to encode 2D image-plane positions and become free capacity
+    # for the token the parameters are read from.
+    #
+    # Default off: --preset baseline and --losses legacy must stay bit-identical.
+    detach_2d_head: bool = False
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -371,6 +394,58 @@ def apply_rebalanced_losses(cfg) -> None:
     cfg.w_keypoints3d = 0.35    # re-scaled for the new form; see docstring
     cfg.finger_weight = 0.2     # 40 of 70 keypoints, none of them in J12/J14
 
+
+def config_from_checkpoint(state, ckpt_path=None, **overrides):
+    """Rebuild the DistillConfig a checkpoint was actually trained with.
+
+    Two sources, because the checkpoint dict carries neither.
+
+    * The ARCHITECTURE flags are readable from the weights. ``--bound-scales``
+      registers ``scale_lo`` / ``scale_hi`` buffers, so their presence in the
+      state dict IS the flag. Building the default config instead drops the
+      tanh remap while the head still emits pre-tanh values -- measured on 64
+      COCO teacher targets, that is 21.0 mm MPJPE / 14.4 mm PA-MPJPE of silent
+      corruption on a model whose benchmark is 41.8 mm.
+    * The INPUT-PIPELINE flags are not. ``--cliff-focal`` changes what the
+      conditioning vector MEANS, not the graph, so nothing in the weights
+      records it; it is read from the ``run_config.json`` that
+      train_distill_jz.py writes beside the checkpoint. Feeding a focal-aware
+      model the pixel form (or the reverse) raises nothing -- it silently
+      mis-places the person in depth.
+
+    Returns ``(cfg, provenance)``; *provenance* maps each restored field to
+    where it came from, so a caller can print what it inferred rather than
+    leaving the user to trust it.
+    """
+    cfg = DistillConfig()
+    prov = {}
+
+    cfg.bound_scales = "scale_lo" in state
+    prov["bound_scales"] = "checkpoint weights"
+
+    run_cfg = {}
+    if ckpt_path is not None:
+        rc = Path(ckpt_path).resolve().parent / "run_config.json"
+        if rc.is_file():
+            run_cfg = json.loads(rc.read_text())
+    for k in ("cliff_focal", "backbone", "scale_bound_margin"):
+        if k in run_cfg:
+            setattr(cfg, k, run_cfg[k])
+            prov[k] = "run_config.json"
+
+    for k, v in overrides.items():
+        if v is not None:
+            setattr(cfg, k, v)
+            prov[k] = "command line"
+
+    if "cliff_focal" not in prov:
+        # Either no run_config.json beside the checkpoint, or one written
+        # before --cliff-focal existed. Both mean "assume the old pixel form",
+        # which is right for those runs but must be visible, not assumed.
+        prov["cliff_focal"] = ("DEFAULT -- run_config.json is missing or "
+                               "predates the flag; pass --cliff-focal / "
+                               "--no-cliff-focal if that is wrong")
+    return cfg, prov
 
 # ============================================================
 # Cell 3 — Dataset and Data Augmentation
@@ -828,6 +903,7 @@ class InstantHMRStudent(nn.Module):
 
         self.kp2d_bins = getattr(cfg, 'kp2d_bins', 96)
         self.kp2d_range = getattr(cfg, 'kp2d_range', 1.5)
+        self.detach_2d_head = bool(getattr(cfg, "detach_2d_head", False))
         self.head_2d_feat = nn.Sequential(
             nn.Linear(cfg.d_model, 256),
             nn.GELU()
@@ -915,6 +991,12 @@ class InstantHMRStudent(nn.Module):
             if prev < pred_mhr_params.shape[1]:
                 parts.append(pred_mhr_params[:, prev:])
             pred_mhr_params = torch.cat(parts, dim=1)
+
+        # Cut the 2D head's gradient into the shared trunk. Forward values are
+        # untouched, so the deployed joints_2d output and the ONNX graph are
+        # unchanged; only what the backbone and decoder are trained FOR changes.
+        if self.detach_2d_head:
+            feat_2d = feat_2d.detach()
 
         feat_2d_processed = self.head_2d_feat(feat_2d)
         logits_2d = self.head_2d_logits(feat_2d_processed)
@@ -2303,6 +2385,10 @@ def parse_args():
                    action="store_true",
                    help="On an anomalous batch, step on the non-FK terms "
                         "instead of discarding the batch.")
+    p.add_argument("--detach-2d-head", dest="detach_2d_head", action="store_true",
+                   help="Stop the 2D SimCC head from shaping the backbone and "
+                        "decoder. It keeps full supervision and stays a deployed "
+                        "output; only its gradient into the shared trunk is cut.")
     p.add_argument("--kp3d-warmup-steps", dest="kp3d_warmup_steps", type=int, default=None,
                    help="Optimiser steps over which the FK-path losses ramp from 0 to full weight.")
     p.add_argument("--w_keypoints3d", type=float, default=None,
@@ -2358,6 +2444,7 @@ def main():
     if args.no_resume:                  cfg.resume = False
     if args.bound_scales: cfg.bound_scales = True
     if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
+    if args.detach_2d_head: cfg.detach_2d_head = True
     if args.scale_bound_margin is not None: cfg.scale_bound_margin = args.scale_bound_margin
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
     if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)

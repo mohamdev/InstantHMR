@@ -648,6 +648,12 @@ def train(args, cfg, rank, local_rank, world):
             "bound_scales": cfg.bound_scales,
             "scale_bound_margin": cfg.scale_bound_margin,
             "anomaly_safe_fallback": cfg.anomaly_safe_fallback,
+            # getattr, not attribute access: the two files are rsynced
+            # separately, so a job can start with this driver already updated
+            # and train_distill_mhr_only.py still on the old revision. Reading
+            # the field directly would raise and, because the self-chain only
+            # resubmits on rc == 0, kill the run outright.
+            "detach_2d_head": getattr(cfg, "detach_2d_head", False),
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
     ema_rollbacks = 0
@@ -959,6 +965,15 @@ def parse_args():
                    action="store_true",
                    help="on an anomalous batch, step on the non-FK terms "
                         "instead of discarding the batch")
+    p.add_argument("--detach-2d-head", dest="detach_2d_head", action="store_true",
+                   help="stop the 2D SimCC head from shaping the shared trunk "
+                        "(backbone + decoder). It keeps full supervision and "
+                        "stays a deployed output; only its gradient into the "
+                        "trunk is cut. On the converged b3_s1 checkpoint the 2D "
+                        "terms own 56.2%% of the trunk's gradient against 20.7%% "
+                        "for all seven 3D body-pose terms, while loss_2d_simcc "
+                        "is 95%% irreducible label entropy. Off by default so "
+                        "existing runs stay bit-identical.")
     p.add_argument("--mhr_model_path", default=None)
     p.add_argument("--kp_regressor_path", default=None)
 
@@ -1074,6 +1089,7 @@ def build_cfg(args):
     if args.output_dir:       cfg.log_dir = args.output_dir
     if args.bound_scales:          cfg.bound_scales = True
     if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
+    if args.detach_2d_head:        cfg.detach_2d_head = True
     if args.scale_bound_margin is not None:
         cfg.scale_bound_margin = args.scale_bound_margin
     if args.mhr_model_path:   cfg.mhr_model_path = args.mhr_model_path
@@ -1194,6 +1210,9 @@ def main():
         + (f" (margin {cfg.scale_bound_margin})" if cfg.bound_scales else "")
         + f" | safe_fallback={cfg.anomaly_safe_fallback}"
         + f" | rollback@{cfg.anomaly_skip_patience} x{cfg.max_ema_rollbacks}")
+    log(f"trunk     detach_2d_head={getattr(cfg, 'detach_2d_head', False)}"
+        + (" (2D head keeps its loss but no longer trains backbone/decoder)"
+           if getattr(cfg, "detach_2d_head", False) else ""))
     log(f"seed      {args.seed} | mix {args.mix} | "
         f"samples/epoch {args.samples_per_epoch:,}")
     log("=" * 66)

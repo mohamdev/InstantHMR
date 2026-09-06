@@ -153,10 +153,44 @@ stability and bone-length variance, never on the benchmark.
 
 **Three places compute this vector and all three must agree**:
 `SAM3DStudentDataset.__getitem__`, `val3dpw._preprocess` (which takes the real
-`fy` from 3DPW's `cam_intrinsics`), and `instanthmr.inference.InstantHMR`
-(pass `focal=` for a checkpoint trained with the flag). Mismatching them raises
-nothing; it silently mis-places the person in depth. `run_config.json` records
-`cliff_focal`.
+`fy` from 3DPW's `cam_intrinsics`), and `instanthmr.inference.InstantHMR`.
+Mismatching them raises nothing; it silently mis-places the person in depth.
+
+### Carrying the flag past training (fixed 2026-09-06)
+
+Until 2026-09-06 nothing outside the trainer knew about it: the checkpoint
+evaluator and the ONNX exporter both built a default `DistillConfig`, so a
+focal-aware model was scored and deployed with the pixel form. Two lookups
+close that, and neither needs a flag in the normal case:
+
+| consumer | how it learns the form |
+|---|---|
+| `train_distill_jz.py` validation | `cfg.cliff_focal` directly |
+| `benchmark/eval_3dpw_ckpt.py` | `run_config.json` beside the checkpoint |
+| `instanthmr.inference.InstantHMR` | `cliff_focal` in the ONNX metadata, stamped by `tools/pth_to_onnx.py` |
+
+`T.config_from_checkpoint()` in `train_distill_mhr_only.py` is the single
+implementation. It also restores `bound_scales` — from the weights, since
+`--bound-scales` registers `scale_lo`/`scale_hi` buffers and their presence
+*is* the flag. Both scripts print what they inferred and where it came from;
+`--cliff-focal` / `--no-cliff-focal` override it for a checkpoint whose
+`run_config.json` is missing or predates the flag.
+
+**The value of `f`, once the form is known, is a separate question.** Training
+and both 3DPW evaluators use the dataset's own focal — `cam_focal_length[1]`
+per annotation, and 3DPW's calibrated `K[1,1]` (1969.23 px on 10 of the 12
+validation sequences, 1961.85 on the two landscape ones). Deployment has no
+annotation, so `instanthmr.inference` falls back to
+`FOCAL_FALLBACK_DIAG * sqrt(H^2+W^2)` with `FOCAL_FALLBACK_DIAG = 1.05`, and
+`demo.py --focal <px>` supplies the real one. The fallback applies to
+focal-aware graphs **only**: a pixel-conditioned checkpoint was trained on a
+corpus where `cam_focal_length = sqrt(H^2+W^2)` exactly, so `1.00 x diag` is
+that model's camera and is left untouched.
+
+Measured cost of getting the form wrong: **0.13 mm** J14+adapter PA-MPJPE on a
+170-frame 3DPW validation probe (47.46 vs 47.33) — consistent with the ~0.1 mm
+above. Like the flag itself, this matters for absolute placement and jitter,
+not for the headline number.
 
 The default is `False` and is bit-identical to the pre-flag trainer, verified
 over augmented samples tensor by tensor.
@@ -256,6 +290,114 @@ dimensions of solver-arbitrary teacher noise that no image can determine.
 Confirmed directly: pushing `scale_spine_length` to 20.3 along a null direction
 moves the skeleton by 1.2e-7 m. The bound now keeps that wandering finite;
 collapsing the redundancy properly would be a separate change.
+
+## `--detach-2d-head` (added 2026-09-06, experimental)
+
+Stops the 2D SimCC head from training the **shared trunk** — the backbone plus
+the decoder, i.e. everything that builds the representation. The head keeps its
+full loss, keeps its weights trainable, and stays a deployed ONNX output; the
+only thing that changes is that its gradient no longer flows back into the
+decoder. One line in `InstantHMRStudent.forward`: `feat_2d = feat_2d.detach()`.
+
+### Why
+
+The trunk is being trained mostly for an output the benchmark does not measure.
+Back-propagating each loss term separately through the converged `b3_s1`
+checkpoint, over real augmented batches, gives the share of the gradient that
+reaches backbone + decoder:
+
+| term | share of the trunk's gradient |
+|---|---|
+| `loss_2d_simcc` | **47.6%** |
+| `loss_2d_native` | 8.6% |
+| `loss_cam` | 22.3% |
+| all seven 3D body-pose terms together | **20.7%** |
+
+The dominant term is also the most exhausted and the noisiest. `loss_2d_simcc`
+sits at **2.227 nats against an irreducible floor of 2.112** — that floor is the
+entropy of its own Gaussian soft label at `sigma = 2 * bin_w`, which no model can
+go below.
+
+> **Correction (2026-09-06).** An earlier version of this section read "only
+> 5.2% of the term is reducible, i.e. a task already 95% converged". That does
+> not follow. `CE = H(target) + KL(target || prediction)`, and `H` is a
+> constant with **zero gradient**, so the ratio `2.112 / 2.227` says nothing
+> about how much of the *learnable* part is left: the learnable part is the
+> whole of `KL = 0.115` nats, and this number cannot say whether that is close
+> to optimal. Use it only as a scale for reading the `simcc` column — subtract
+> 2.112 to get the part the model is actually being graded on. The gradient
+> measurements below (47.6% share, SNR 0.28, cosine +0.21) are independent of
+> this and stand.
+
+Its trunk gradient has the
+worst signal-to-noise of any term (`|mean g| / mean |g|` = 0.28, against 0.39 for
+the pose group) and only a +0.21 per-batch cosine with the pose gradient. Most of
+what it sends into the backbone is batch noise from a task that is already 95%
+converged.
+
+The same imbalance is in the compute. At 224, batch 1: backbone 9.040 GFLOPs
+(83.8%), the 71-query decoder 1.694 GFLOPs (15.7%), the 2D head 0.025 GFLOPs, and
+the **parameter head 0.0003 GFLOPs — 0.003%**. Seventy of the 71 decoder queries
+serve the 2D output; all 204 MHR parameters are read from the one remaining
+token.
+
+This is a **trade-off, not a free win**: `joints_2d` is a real deployed output
+(`instanthmr/inference.py` consumes `outs[3]`), despite this file's module
+docstring calling the head training-only. Watch `2d` and `simcc` in the epoch log
+— if they regress materially, the flag has cost you the 2D product to buy 3D
+accuracy.
+
+### What it does not do
+
+It does not kill the 70 keypoint queries. They still receive gradient through the
+decoder's self-attention with the global token, so they stay alive and become
+free capacity for the token the parameters are read from — they simply stop being
+*forced* to encode 2D image-plane positions.
+
+### Verified
+
+Flag off is **bit-identical** to the pre-flag code: all five forward tensors
+match to `0.000e+00` over 32 augmented `--preset v2` samples. Flag on leaves
+every forward value unchanged (so the ONNX graph and the deployed output are
+untouched) and takes the 2D losses' gradient into the trunk from `1.9778` to
+exactly `0.000000`, while the 2D head's own gradient is unchanged at `0.8389`.
+Neither mode leaves any parameter without a gradient, so DDP does not need
+`find_unused_parameters`.
+
+### Evidence, and its limits
+
+In a 1500-step fine-tune from `b3_s1` on COCO+AIC, scored on held-out 3DPW crops
+against the teacher (body-30 PA-MPJPE, mm):
+
+| arm | start | 1500 | delta |
+|---|---|---|---|
+| control | 42.34 | 42.13 | −0.21 |
+| **`--detach-2d-head`** | 42.34 | **41.57** | **−0.77** |
+| 2D losses x0.1 | 42.34 | 41.91 | −0.43 |
+| control at LR/4 (step-size control) | 42.34 | 42.47 | +0.13 |
+
+The ordering is monotone in how much 2D gradient reaches the trunk, and the LR
+arm rules out "it just took smaller steps". But 0.5-0.9 mm on one seed from an
+already-converged checkpoint is well inside the 34-49 mm seed spread this repo
+sees, so treat it as a direction to test, not a result. The real test is a
+from-scratch pair of seeds against a matched control.
+
+### The underlying finding
+
+The teacher's own labels in `data/sam3d_gt_3dpw` are **14.5 mm** J14+adapter
+PA-MPJPE from real 3DPW MoCap (sequence-holdout adapter; 12.5 with the shipped
+one), and `b3_s1` disagrees with those labels by **28.5-31.1 mm on COCO / AIC /
+MPII, which it trained on** (39.8 mm on held-out 3DPW). That is underfitting, not
+label noise: there is no variance shrinkage (per-joint student/teacher variance
+ratio 0.94-1.06), the per-frame noise floor is only 10.9 mm (teacher 3.9, real
+motion 7.3 between adjacent 30 fps frames), and averaging over the mirror and
+rotation symmetries makes the error *worse* (46.3 vs 39.9 mm). A frozen-trunk
+probe study says it is not the readout either: a plain `Linear` on the global
+token scores 41.8 mm against 49.9 for an MLP reading all 71 tokens.
+
+Caveat on the ceiling: those teacher labels were fit with ground-truth access, so
+14.5 mm is not a reachable monocular target. Published monocular SOTA (~36-38 mm)
+is the practical floor.
 
 ## The reported number
 

@@ -106,7 +106,12 @@ def run_samples(model: InstantHMR, samples: list[Sample],
             if image is None:
                 continue
             dets = [{"bbox": samples[i].bbox, "confidence": 1.0} for i in idxs]
-            out = model.predict_batch(image, dets)
+            # The dataset's own focal when it has one (3DPW is calibrated), so
+            # a graph exported from a --cliff-focal checkpoint is conditioned
+            # on the real camera rather than a diagonal-derived stand-in. Every
+            # sample in a group is the same frame, hence the same focal.
+            out = model.predict_batch(image, dets,
+                                      focal=samples[idxs[0]].meta.get("focal"))
             for i, p in zip(idxs, out):
                 preds[i] = p
 
