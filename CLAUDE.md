@@ -16,6 +16,35 @@ Keep commit messages to one or two short sentences.
 
 ---
 
+## 0.5 Write for a human, not a compiler
+
+**The user is a person reading a terminal, not a log parser.** Answers that are
+technically correct and unreadable are failures. This has come up more than
+once — take it seriously.
+
+- **Define every name before you use it.** `scale_lo`, `m_noflip`, `fk_scale`,
+  `n_skip_run` mean nothing to someone who has not just read that function. If
+  a variable, flag or file has to appear, say what it *is* in plain words
+  first, once.
+- **Give commands in the form the user actually runs them.** This repo launches
+  through `datasets_pipeline/jeanzay/52_train_ddp.slurm` with `RUN_NAME=... MIX=...
+  EXTRA_TRAIN_ARGS=... sbatch`. Read the launcher and match it. A bare `srun
+  python ...` line the user has never typed is not an answer.
+- **Say what to run, in what order, and what happens next.** If a command is
+  optional, say so. If you offer a check, say what a good result looks like.
+- **Lead with the answer.** The finding first, the evidence after. Do not make
+  the user read a derivation to learn whether it worked.
+- **Explain the mechanism, don't just name it.** "The bone scales enter the
+  kinematics multiplicatively, so +10 makes a 336 m skeleton" teaches
+  something; "unbounded scale parameters caused divergence" does not.
+- **Cut the ceremony.** No restating the request, no listing what you are about
+  to do, no summary of the summary.
+
+If the user says they cannot follow an answer, that is a defect to fix in the
+next answer, not a preference to note.
+
+---
+
 ## 1. Think before coding
 
 Don't assume. Don't hide confusion. Surface tradeoffs.
@@ -113,6 +142,39 @@ augmentation, so it never needed the `m_ident` mask; and the 45 `shape_params`
 move the 127-joint skeleton by `0.00e+00 cm`, so they are mesh-only and every
 loss and metric in the trainer is blind to them.
 
+**The student's MHR outputs are unbounded and 77 of them are body SIZE.** The
+head is a plain `nn.Linear`. `0:3` root translation (exactly `0.000e+00` in all
+24,000 sampled annotations — the person is placed by `cam_trans`), `130:136`
+the `*_length/_width_flexible` parameters, and `136:204` the 68 bone scales all
+scale the skeleton, the last **multiplicatively along the kinematic chain**:
+uniform +10 gives a 336 m skeleton, +25 gives 28,300 km. That, not the learning
+rate, killed four 300-epoch runs at epochs 24-32 on 2026-09-06. Watch for the
+two traps: `130:136` *look* like pose parameters (they sit inside `6:136`) but
+drive joint **translation** channels, so bounding only `136:204` still reaches
+375 m; and `6:130` are genuine rotations that stay at ~1.5 m at any magnitude,
+so leave them alone. `--bound-scales` fixes it from
+`assets/mhr_size_bounds.npz`; that file is **new and must be rsynced** or the
+job dies at startup.
+
+**The anomaly guard deletes the gradient that would fix the anomaly.** A batch
+over `anomaly_loss_threshold` was skipped whole — but `loss_scale`/`loss_pose`
+in that same batch are the only force pulling the sizes back, so the sample was
+quarantined for good. Worse, `bad` is all-reduced with `MAX`: one bad sample in
+4x64 = 256 vetoes the step for every rank, so 2% runaway samples stop 99.4% of
+steps. Use `--anomaly-safe-fallback`, which steps on the non-FK terms instead
+(`safe_loss_subset`, cosine +1.0000 with `teacher - prediction`). Never "fix" a
+divergence here by lowering the LR alone: `OneCycleLR(pct_start=0.1)` peaks at
+10% of the run, so a lower peak only moves *when* it dies.
+
+**`parameter_transform[:, :204]` has rank 192, not 204.** Twelve directions
+move the parameters and leave the skeleton *exactly* unchanged — each
+`*_flexible` parameter against its `scale_*` partner, plus the spine rotations.
+Along them every geometric loss has zero gradient, so the model is regressing
+12 dimensions of solver-arbitrary teacher noise that no image can determine.
+Do **not** "fix" this by zeroing the `*_flexible` parameters even though the rig
+pins them to `[0,0]`: the teacher genuinely uses them (`leg_length_flexible`
+mean 0.32, max 1.64), so zeroing shortens every leg.
+
 **`DistillationLoss` is never `.to(device)`'d.** `run_overfit_test`,
 `run_self_tests`, `train_instant_hmr` and `train_distill_jz.train` all construct
 it bare, so any buffer you register lands on the CPU and raises on step 1. Build
@@ -145,6 +207,13 @@ perspective-correct variant (`--cliff-focal`, config `cliff_focal`) is
 mandatory for new runs, because the rebuilt corpus carries real per-image
 focals spanning `f/diag` 0.6-1.8 where the pixel form is ambiguous; the old
 corpus was constant at 1.000. See `instanthmr_distill_train/README.md`.
+
+**One reported number: J14 PA-MPJPE, adapter-applied, on the H36M GT.** The
+training log, `summarize_runs.py` and `benchmark/eval_3dpw_ckpt.py` all print
+it and they agree to the decimal. J12 was removed on 2026-09-06 — it was the
+rig-clean row against the old GT and is not against this one. Runs started
+before that date recorded J14 *without* the adapter, ~26 mm higher; do not put
+old and new rows in one table.
 
 **PA-MPJPE is blind to half of what a demo shows.** Procrustes removes
 translation, rotation and scale, so `cam_trans` drift, body-size error and

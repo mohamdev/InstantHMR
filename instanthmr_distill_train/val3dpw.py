@@ -27,12 +27,12 @@ rsynced next to ``sequenceFiles``. ``gt="jointpositions"`` restores the raw
 pickle field the harness used before; the two are several mm apart, so numbers
 from the two sources must never be compared to each other.
 
-Selection metric is **PA-MPJPE on J12**. J12 is limbs only, where MHR and SMPL
-mean the same anatomical points; J14 adds neck and head, which the two rigs
-place differently and which therefore carry a systematic penalty unrelated to
-model quality. Procrustes alignment additionally removes any residual
-coordinate-frame convention mismatch between the rig-local prediction and 3DPW's
-camera space, so the number is comparable across runs without further care.
+Selection metric is **J14 PA-MPJPE with the MHR70 -> J14 adapter applied** —
+the same quantity `benchmark/eval_3dpw_ckpt.py` reports and a paper quotes, so
+the training log, the run summary and the results table all carry one number.
+The adapter (`benchmark/results/adapter_j14_h36m_teacher.npz`) is a fixed 14x70
+map fitted from the teacher's MHR labels, independent of any student, so it
+does not move between checkpoints or between runs.
 """
 
 from __future__ import annotations
@@ -148,8 +148,8 @@ class ThreeDPWValSet(Dataset):
 
 @torch.no_grad()
 def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
-             gt: str = "h36m") -> dict:
-    """PA-MPJPE and MPJPE in mm on J12 and J14, from the MHR forward pass.
+             gt: str = "h36m", adapter: np.ndarray | None = None) -> dict:
+    """J14 PA-MPJPE and MPJPE in mm, adapter-applied — the paper number.
 
     Predictions come from ``mhr_params`` through the same FK + (70, 127)
     regressor the training loss uses, so this measures exactly the geometry the
@@ -187,10 +187,9 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
     # Always return the SAME key set. train_distill_jz.all_reduce_mean builds a
     # tensor from sorted(keys) and all-reduces it, so a rank returning a short
     # dict while the others return a full one is a size mismatch -> NCCL hang.
-    res: dict[str, float] = {"n": 0.0, "n_dropped": float(n_dropped)}
-    for name in ("J12", "J14"):
-        res[f"{name}_MPJPE"] = float("inf")
-        res[f"{name}_PA_MPJPE"] = float("inf")
+    res: dict[str, float] = {"n": 0.0, "n_dropped": float(n_dropped),
+                             "J14_MPJPE": float("inf"),
+                             "J14_PA_MPJPE": float("inf")}
     if not preds:
         # inf, not 0: this epoch's 3DPW number must never look like a new best.
         return res
@@ -199,11 +198,16 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
     gt_all = np.concatenate(gts) * MM          # (N, J, 3) camera space, mm
 
     res["n"] = float(len(pred))
-    for name in ("J12", "J14"):
-        spec = J.JOINT_SETS[name]
+    spec = J.JOINT_SETS["J14"]
+    g = gt_all[:, J.gt_index(spec, gt), :]
+    if adapter is not None:
+        # The adapter is fitted on centred keypoints, so apply it to centred
+        # keypoints; both metrics below are translation-invariant anyway.
+        p = np.einsum("jk,nkc->njc", adapter,
+                      pred - pred.mean(axis=1, keepdims=True))
+    else:
         p = pred[:, spec["mhr"], :]
-        g = gt_all[:, J.gt_index(spec, gt), :]
-        rp, rg = J.pelvis(p), J.pelvis(g)
-        res[f"{name}_MPJPE"] = float(M.mpjpe(p, g, root=(rp, rg)).mean())
-        res[f"{name}_PA_MPJPE"] = float(M.pa_mpjpe(p, g).mean())
+    rp, rg = J.pelvis(p), J.pelvis(g)
+    res["J14_MPJPE"] = float(M.mpjpe(p, g, root=(rp, rg)).mean())
+    res["J14_PA_MPJPE"] = float(M.pa_mpjpe(p, g).mean())
     return res

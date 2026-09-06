@@ -161,6 +161,134 @@ nothing; it silently mis-places the person in depth. `run_config.json` records
 The default is `False` and is bit-identical to the pre-flag trainer, verified
 over augmented samples tensor by tensor.
 
+## `--bound-scales` / `--anomaly-safe-fallback` (added 2026-09-06, mandatory)
+
+**Use both on every new run.** They fix the divergence that killed all four
+runs of the 2026-09-06 sweep at epochs 24-32 (`fno_s*`, `fsa_s*`), and every
+earlier sweep that was "fixed" by lowering the peak LR.
+
+### What was actually wrong
+
+`head_global` is a plain `nn.Linear`. 77 of its outputs are **body-size**
+parameters that the MHR forward kinematics multiplies along the kinematic
+chain, and nothing bounded them:
+
+| block | what it is | unbounded behaviour (measured on `checkpoints/mhr_model.pt`) |
+|---|---|---|
+| `0:3` | root translation | linear; +100 -> 22 m skeleton. Teacher value is **exactly 0.000e+00** in all 24,000 sampled annotations across all six splits — the person is placed by `cam_trans`. |
+| `130:136` | `*_length/_width_flexible` | linear, transform weights up to 10.0; +100 -> 32 m |
+| `136:204` | the 68 bone scales | **multiplicative**: +10 -> 336 m, +20 -> 703 km, +25 -> 28,300 km |
+
+Note `130:136`. Those six sit at the end of the *pose* block but they drive
+joint **translation** channels, not rotations, so they are size parameters.
+Bounding only `136:204` still let a blown-up head reach a 375 m skeleton.
+`6:130` are genuine rotations and stay at ~1.5 m at any magnitude — leave them
+alone.
+
+Loss on real teacher targets, with the head drifted by `d` on the size block:
+
+| drift | total loss, unbounded | total loss, `--bound-scales` |
+|---|---|---|
+| 0 | 6.5 | 6.5 |
+| 10 | **140** (over `anomaly_loss_threshold=100`) | 15.6 |
+| 20 | **2.2e5** | 25.1 |
+
+That is where the `4.06e7` / `8.76e13` losses in the dead logs come from.
+
+### Why the guard made it permanent rather than catching it
+
+An anomalous batch was discarded whole. But `loss_scale` / `loss_pose` in that
+same batch are small and point straight back at the teacher — they are the
+**only** force pulling the sizes out of the runaway region — so skipping
+removed the fix along with the fault and quarantined those samples for good.
+Two amplifiers turned that into a dead job:
+
+* `bad` is all-reduced with `MAX`, so **one** bad sample out of 4x64 = 256
+  vetoes the step for every rank. At 1% runaway samples 92% of steps are
+  vetoed; at 2%, 99.4%. The run aborts when 2% of the data is bad, not the model.
+* The EMA rollback (`anomaly_skip_patience`, `max_ema_rollbacks`) existed only
+  in `train_distill_mhr_only`'s single-GPU loop. The DDP path had the abort and
+  **no recovery at all**.
+
+`--anomaly-safe-fallback` steps on `safe_loss_subset(losses)` — everything
+except `FK_LOSS_KEYS` — instead of discarding the batch. Verified: with the
+scales sitting +20 off the teacher, that gradient has cosine **+1.0000** with
+`teacher - prediction` and moves **100%** of the 68 scales the right way, while
+the full loss is 2.9e5. The rollback is now in the DDP loop too.
+
+### Why lowering the LR never worked
+
+`OneCycleLR(pct_start=0.1)` puts the peak at 10% of the run — epoch 30 of 300.
+The four dead runs died at epochs 24-32. Lowering `max_lr` does not remove the
+peak, it just slows the random walk toward the runaway region.
+
+### The bound
+
+`assets/mhr_size_bounds.npz` holds, per parameter, the union of the rig's own
+`character_torch.parameter_limits` and the observed teacher range; the model
+widens each by `--scale-bound-margin` (0.5) and squashes with `tanh`. The rig
+bounds every one of these to `[-1.1, 1.1]`; the teacher respects that for the
+scales but **not** for `130:136`, which the rig pins to `[0,0]` while the
+teacher uses them up to 1.64 (`leg_length_flexible`) — hence the union.
+
+Measured over 24,000 annotations from all six splits: **0.000000%** of teacher
+targets fall outside the bound and the worst sits at `|atanh| = 0.80`, well
+inside tanh's linear region, so the bound costs nothing. With the flag on, a
+head deliberately blown up to `bias ~ N(0, 5000)` still yields a 1.58 m
+skeleton. Exports to ONNX (matches torch to 1.2e-7).
+
+Regenerate the asset from the rig plus the corpus if either changes; the file
+also stores `rig_lo` / `rig_hi` unmodified for reference.
+
+Both flags default to **off** and are bit-identical to the pre-flag trainer,
+verified tensor by tensor. `run_config.json` records `bound_scales`,
+`scale_bound_margin` and `anomaly_safe_fallback`.
+
+### The 12-dimensional null space (not fixed, know it exists)
+
+`parameter_transform[:, :204]` has **rank 192**. Twelve directions move the
+parameters and leave the skeleton *exactly* unchanged — they pair each
+`*_flexible` parameter against its `scale_*` partner (`scale_spine_length` vs
+`spine_length_flexible`, `scale_hip_width` vs `hip_width_flexible`, and the
+spine rotations). Along those, every geometric loss has zero gradient and only
+`loss_pose` / `loss_scale` act, so the model is being asked to regress 12
+dimensions of solver-arbitrary teacher noise that no image can determine.
+Confirmed directly: pushing `scale_spine_length` to 20.3 along a null direction
+moves the skeleton by 1.2e-7 m. The bound now keeps that wandering finite;
+collapsing the redundancy properly would be a separate change.
+
+## The reported number
+
+One number everywhere: **J14 PA-MPJPE, adapter-applied, against the
+published-protocol 3DPW ground truth.** The training log, `summarize_runs.py`,
+`benchmark/eval_3dpw_ckpt.py` and a paper results table all print the same
+quantity — cross-checked to the decimal (41.71 mm for `b3_s1` on 3DPW test).
+J14 MPJPE rides alongside it. J12 is gone: it was the rig-clean row against the
+old `jointPositions` GT, and against the H36M one it is not (those hips sit
+292 mm apart against the MHR rig's ~120).
+
+The adapter is `benchmark/results/adapter_j14_h36m_teacher.npz`, a fixed 14x70
+map fitted from the teacher's labels and independent of any student, so it does
+not move between checkpoints. `--val-3dpw-adapter none` scores raw MHR joints
+instead; a missing file is a hard error, not a silent fallback.
+
+The epoch log prints two lines because there are **two different datasets**:
+
+```
+held-in (teacher agreement)  RAW loss 5.09 body PA 153.5 | EMA ...
+3DPW-validation  RAW J14 PA 126.0 MPJPE 283.0 | EMA J14 PA 125.7 MPJPE 284.0 mm
+```
+
+`held-in` is a 2% slice of the **training corpus** scored against the
+**teacher's** labels — agreement, not generalisation, and only a training-health
+signal. `3DPW-validation` is 12 held-out sequences against real **MoCap**.
+Before 2026-09-06 both appeared on one line under a single "val" label, because
+`Mesh_PA_MPJPE` is overwritten with the 3DPW number when `--val-3dpw` is on.
+
+**Runs started before 2026-09-06 are not comparable**: their `J14_PA_MPJPE` in
+`history.jsonl` is the raw MHR joint set, ~26 mm higher than the adapter-applied
+one. `summarize_runs.py` still renders them, in the same column.
+
 ## The pair index
 
 `SAM3DStudentDataset` enumerates the corpus with one `glob` plus a `stat()` per

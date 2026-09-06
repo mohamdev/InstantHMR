@@ -272,6 +272,27 @@ class DistillConfig:
     anomaly_skip_patience: int = 50
     anomaly_rollback_lr_decay: float = 0.5
     max_ema_rollbacks: int = 3
+    # On an anomalous batch, back-propagate the terms that do NOT go through the
+    # MHR forward kinematics instead of discarding the batch.  A skipped step
+    # throws away `loss_scale` / `loss_pose` -- the ONLY force pulling the bone
+    # scales back toward the teacher -- so the guard removes exactly the gradient
+    # that would fix the anomaly and the sample is quarantined for good.  Those
+    # parameter-space terms are bounded by the target magnitudes, so stepping on
+    # them is safe even when the FK terms are 1e13.  Default off: `--preset
+    # baseline` and `--losses legacy` must stay bit-identical.
+    anomaly_safe_fallback: bool = False
+    # Squash the 68 bone scales into the rig's OWN parameter_limits (widened by
+    # scale_bound_margin).  mhr_params[136:204] are raw linear outputs today and
+    # they enter the forward kinematics multiplicatively along the kinematic
+    # chain: measured on checkpoints/mhr_model.pt, a uniform +10 turns a 1.5 m
+    # skeleton into 336 m and a +25 into 28,300 km, which is where the 4e7 and
+    # 8.8e13 losses in the diverged runs come from.  The rig bounds every one of
+    # them to [-1.1, 1.1]; measured over 9,000 teacher annotations, 0.0000% of
+    # targets fall outside those limits at margin 0.5 and the worst target sits
+    # at |atanh| = 0.97, so the bound is free.  Default off for bit-identity.
+    bound_scales: bool = False
+    scale_bound_margin: float = 0.5
+    scale_bounds_path: str = str(PROJECT_ROOT / "assets/mhr_size_bounds.npz")
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -825,6 +846,31 @@ class InstantHMRStudent(nn.Module):
         nn.init.normal_(self.head_2d_logits.weight, mean=0.0, std=1e-4)
         nn.init.constant_(self.head_2d_logits.bias, 0.0)
 
+        # Bone-scale bound.  Buffers, not constants, so they survive
+        # state_dict round-trips and bake into the ONNX graph; tanh exports.
+        self.bound_scales = bool(getattr(cfg, "bound_scales", False))
+        if self.bound_scales:
+            b = np.load(cfg.scale_bounds_path)
+            # 130, not pose_dim=136: params 130:136 are the six
+            # *_length/*_width_flexible parameters. They sit at the end of the
+            # pose block but they drive joint TRANSLATION channels with weights
+            # up to 10.0, not rotations, so they are body-size parameters and
+            # are exactly as unbounded as the 68 scales. Leaving them free
+            # still let a blown-up head reach a 59 m skeleton with the scales
+            # already clamped -- measured.
+            # Two slices, not one: 0:3 is root translation (no rig limit, but
+            # exactly 0.000e+00 in all 24,000 sampled annotations across all six
+            # splits -- the person is placed by cam_trans, not by these) and
+            # 130:204 is the size block. Measured: with the size block clamped
+            # but root translation free, a blown-up head still reached a 375 m
+            # skeleton.
+            self.bound_slices = list(zip(b["starts"].tolist(), b["stops"].tolist()))
+            lo = torch.from_numpy(b["lo"]).float()
+            hi = torch.from_numpy(b["hi"]).float()
+            m = torch.clamp(0.25 * (hi - lo), min=float(cfg.scale_bound_margin))
+            self.register_buffer("scale_lo", lo - m)
+            self.register_buffer("scale_hi", hi + m)
+
     def forward(self, images, cliff_cond):
         B = images.shape[0]
         img_feats = self.backbone.forward_features(images)
@@ -850,6 +896,25 @@ class InstantHMRStudent(nn.Module):
         pred_mhr_params = global_preds[:, :idx_mhr]
         pred_shape_params = global_preds[:, idx_mhr : idx_shape]
         pred_cam_trans = global_preds[:, idx_shape :]
+
+        if self.bound_scales:
+            # tanh(0) = 0 maps a zero-init head to the middle of each interval,
+            # which is ~0 because they are near-symmetric, so this does not move
+            # the starting point of a fresh run.  Static python loop over two
+            # slices: it unrolls under tracing, so it exports to ONNX.
+            parts, prev, off = [], 0, 0
+            for a, b_ in self.bound_slices:
+                if a > prev:
+                    parts.append(pred_mhr_params[:, prev:a])
+                n = b_ - a
+                t = torch.tanh(pred_mhr_params[:, a:b_])
+                lo = self.scale_lo[off:off + n]
+                hi = self.scale_hi[off:off + n]
+                parts.append(lo + (hi - lo) * 0.5 * (t + 1.0))
+                prev, off = b_, off + n
+            if prev < pred_mhr_params.shape[1]:
+                parts.append(pred_mhr_params[:, prev:])
+            pred_mhr_params = torch.cat(parts, dim=1)
 
         feat_2d_processed = self.head_2d_feat(feat_2d)
         logits_2d = self.head_2d_logits(feat_2d_processed)
@@ -1210,6 +1275,26 @@ class DistillationLoss(nn.Module):
         losses['total_loss'] = sum(losses.values())
         return losses
 
+# The three terms that back-propagate through the MHR forward kinematics.  They
+# are the only unbounded ones: the parameter regressions are bounded by the
+# target magnitudes and the 2D terms are bounded by construction (SimCC spans
+# +/-kp2d_range and its CE by log(kp2d_bins)).
+FK_LOSS_KEYS = ("loss_3d_native", "loss_mhr_joints", "loss_reproj")
+
+
+def safe_loss_subset(losses):
+    """Total over the terms that do NOT pass through the forward kinematics.
+
+    This is what an anomalous batch should still be allowed to contribute.  A
+    blown-up bone scale makes `loss_3d_native` / `loss_reproj` enormous while
+    `loss_scale` and `loss_pose` stay small and point straight back at the
+    teacher value, so dropping only the FK terms keeps the restoring gradient
+    and discards the exploding one.
+    """
+    return sum(v for k, v in losses.items()
+               if k != "total_loss" and k not in FK_LOSS_KEYS)
+
+
 def format_loss_terms(losses, top_k: int = 5) -> str:
     """The largest individual loss terms, for diagnosing an anomalous batch.
 
@@ -1511,6 +1596,27 @@ def train_instant_hmr():
                 skip_reason = f"anomalous loss {loss_val:.1f} > {cfg.anomaly_loss_threshold}"
 
             if skip_reason is not None:
+                # Same policy as train_distill_jz: an anomalous batch still
+                # carries the restoring gradient in its non-FK terms, so step
+                # on those rather than discarding it. Kept in both loops on
+                # purpose -- the DDP path having a recovery the single-GPU path
+                # lacked (and vice versa) is how this file and its fork drifted.
+                if cfg.anomaly_safe_fallback:
+                    safe = safe_loss_subset(losses)
+                    sv = safe.item()
+                    if math.isfinite(sv) and sv <= cfg.anomaly_loss_threshold:
+                        scaler.scale(safe).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                       cfg.grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        ema_model.update_parameters(model)
+                        global_step += 1
+                        criterion.set_step(global_step)
+                        consecutive_skips = 0
+                        continue
                 consecutive_skips += 1
                 print(f"⚠️ WARNING: {skip_reason} — skipping step. "
                       f"[{consecutive_skips} in a row] {format_loss_terms(losses)}")
@@ -2187,6 +2293,16 @@ def parse_args():
     p.add_argument("--no-export", dest="no_export", action="store_true",
                    help="Skip the ONNX export / quantization step after training.")
     p.add_argument("--gpu", type=int, default=None, help="GPU count (informational).")
+    p.add_argument("--bound-scales", dest="bound_scales", action="store_true",
+                   help="Squash the body-size parameters (root translation and "
+                        "130:204) into the MHR rig's own parameter_limits. "
+                        "Off by default for bit-identity; ON for new runs.")
+    p.add_argument("--scale-bound-margin", dest="scale_bound_margin", type=float,
+                   default=None, help="How far to widen each limit (default 0.5).")
+    p.add_argument("--anomaly-safe-fallback", dest="anomaly_safe_fallback",
+                   action="store_true",
+                   help="On an anomalous batch, step on the non-FK terms "
+                        "instead of discarding the batch.")
     p.add_argument("--kp3d-warmup-steps", dest="kp3d_warmup_steps", type=int, default=None,
                    help="Optimiser steps over which the FK-path losses ramp from 0 to full weight.")
     p.add_argument("--w_keypoints3d", type=float, default=None,
@@ -2240,6 +2356,9 @@ def main():
         else:
             cfg.per_dataset_caps["sam3d_gt_harmony4d"] = args.harmony4d_cap
     if args.no_resume:                  cfg.resume = False
+    if args.bound_scales: cfg.bound_scales = True
+    if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
+    if args.scale_bound_margin is not None: cfg.scale_bound_margin = args.scale_bound_margin
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
     if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)
     # An explicit --w_keypoints3d still wins over the preset.

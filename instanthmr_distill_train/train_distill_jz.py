@@ -460,7 +460,7 @@ def run_validation(eval_model, loader, criterion, cfg, mhr_module, device):
         acc["Mesh_PA_MPJPE"] += bm.get("Mesh_PA_MPJPE", 0.0)
         # Reported only. Mesh_PA_MPJPE is 60% fingers by keypoint count; this is
         # the 30 body/face/foot keypoints. Selection is untouched — and when
-        # --val-3dpw is on, both of these are replaced by the 3DPW J12 numbers.
+        # --val-3dpw is on, both of these are replaced by the 3DPW J14 numbers.
         acc["Mesh_PA_MPJPE_body"] += bm.get("Mesh_PA_MPJPE_body", 0.0)
         n += 1
     out = {k: v / max(n, 1) for k, v in acc.items()}
@@ -486,11 +486,23 @@ def train(args, cfg, rank, local_rank, world):
     train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
     steps_per_epoch = len(train_loader)
 
-    dpw_loader = dpw_test_loader = None
+    dpw_loader = dpw_test_loader = dpw_adapter = None
     if args.val_3dpw:
         if not args.val_3dpw_images:
             raise SystemExit("--val-3dpw needs --val-3dpw-images")
         from val3dpw import ThreeDPWValSet
+        if str(args.val_3dpw_adapter).lower() != "none":
+            ap = Path(args.val_3dpw_adapter)
+            if not ap.is_absolute():
+                ap = Path(__file__).resolve().parent.parent / ap
+            if not ap.is_file():
+                raise SystemExit(
+                    f"3DPW adapter not found: {ap}\nIt ships in the repo as "
+                    "benchmark/results/adapter_j14_h36m_teacher.npz; rsync it, "
+                    "or pass --val-3dpw-adapter none to score raw MHR joints.")
+            dpw_adapter = np.load(ap)["W"]
+            log(f"3DPW adapter: {ap.name} {tuple(dpw_adapter.shape)} "
+                f"-> J14 numbers match benchmark/eval_3dpw_ckpt.py")
         dpw = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
                              split=args.val_3dpw_split, stride=args.val_3dpw_stride,
                              gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal)
@@ -501,7 +513,7 @@ def train(args, cfg, rank, local_rank, world):
             num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
         log(f"3DPW {args.val_3dpw_split}: {len(dpw):,} person-frames "
             f"(stride {args.val_3dpw_stride}, GT {args.val_3dpw_gt}) "
-            f"-> selection metric is J12 PA-MPJPE")
+            f"-> selection metric is J14 PA-MPJPE (adapter-applied)")
 
         # Optional read-only monitor on the split the paper reports. Selection
         # NEVER touches it: picking the best of ~100 epochs on the test split
@@ -633,8 +645,12 @@ def train(args, cfg, rank, local_rank, world):
             "finger_weight": cfg.finger_weight,
             "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
             "cliff_focal": cfg.cliff_focal,
+            "bound_scales": cfg.bound_scales,
+            "scale_bound_margin": cfg.scale_bound_margin,
+            "anomaly_safe_fallback": cfg.anomaly_safe_fallback,
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
+    ema_rollbacks = 0
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         ddp_model.train()
@@ -644,7 +660,7 @@ def train(args, cfg, rank, local_rank, world):
         run = {"total": 0.0, "3d": 0.0, "2d": 0.0, "simcc": 0.0,
                "reproj": 0.0, "cam": 0.0, "pose": 0.0}
         nb = 0
-        n_skip = n_skip_run = 0
+        n_skip = n_skip_run = n_repair = 0
         t_epoch = time.time()
         criterion.set_step(epoch * steps_per_epoch)
         for i, batch in enumerate(train_loader):
@@ -667,6 +683,45 @@ def train(args, cfg, rank, local_rank, world):
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX)
                 bad = int(flag.item())
             if bad:
+                # An anomalous batch is anomalous because the FK terms blew up.
+                # `loss_scale` / `loss_pose` in the SAME batch are small and
+                # point straight back at the teacher — they are the only force
+                # that pulls the bone scales out of the runaway region — so
+                # discarding the batch wholesale removes the fix along with the
+                # fault and quarantines those samples permanently. Step on the
+                # non-FK subset instead when it is finite. Every rank must take
+                # the same branch or the all-reduce deadlocks, so vote again.
+                safe_ok, safe = 0, None
+                if cfg.anomaly_safe_fallback:
+                    safe = T.safe_loss_subset(losses)
+                    sv = safe.item()
+                    safe_ok = int(math.isfinite(sv)
+                                  and sv <= cfg.anomaly_loss_threshold)
+                    if world > 1:
+                        f2 = torch.tensor([safe_ok], device=device)
+                        dist.all_reduce(f2, op=dist.ReduceOp.MIN)
+                        safe_ok = int(f2.item())
+                if safe_ok:
+                    scaler.scale(safe).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(),
+                                                   cfg.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    ema.update_parameters(unwrap(ddp_model))
+                    n_repair += 1
+                    if n_repair == 1 or n_repair % 200 == 0:
+                        log(f"🩹 repaired step {i}: FK terms dropped "
+                            f"(total {lv:.1f}), stepped on the bounded terms "
+                            f"({sv:.3f}) [{n_repair} this epoch]")
+                    # A repaired step DID update the weights in the corrective
+                    # direction, so it is progress, not a skip: the consecutive
+                    # counter that drives rollback/abort resets.
+                    n_skip_run = 0
+                    del preds, losses, loss, safe
+                    continue
+
                 n_skip += 1
                 n_skip_run += 1
                 # Step the schedule ANYWAY. Skipping it freezes the LR, and a
@@ -684,6 +739,38 @@ def train(args, cfg, rank, local_rank, world):
                 if n_skip_run == 1 or n_skip_run % 100 == 0:
                     log(f"⚠️  skipping step {i} (loss {lv:.1f}) "
                         f"[{n_skip_run} consecutive]")
+
+                # EMA rollback. This existed only in train_distill_mhr_only's
+                # single-GPU loop; the DDP path had the abort and no recovery,
+                # so every Jean Zay divergence burned the whole allocation.
+                # Both branches are driven by the already-all-reduced skip
+                # count, so all ranks roll back on the same step, and the EMA
+                # is bit-identical across ranks (DDP keeps the weights in sync
+                # and every rank averages the same thing).
+                if n_skip_run >= cfg.anomaly_skip_patience:
+                    if ema_rollbacks >= cfg.max_ema_rollbacks:
+                        raise RuntimeError(
+                            f"still stuck after {cfg.max_ema_rollbacks} EMA "
+                            f"rollback(s) at epoch {epoch + 1}. The best RAW / "
+                            f"EMA checkpoints on disk are unaffected. Exiting "
+                            f"rather than burning the remaining "
+                            f"{args.epochs - epoch} epochs.")
+                    ema_rollbacks += 1
+                    log(f"🚑 {n_skip_run} consecutive anomalous steps: rolling "
+                        f"the raw weights back to the EMA copy "
+                        f"(attempt {ema_rollbacks}/{cfg.max_ema_rollbacks}), "
+                        f"scaling the LR by {cfg.anomaly_rollback_lr_decay} "
+                        f"and clearing the optimiser moments.")
+                    unwrap(ddp_model).load_state_dict(ema.module.state_dict())
+                    # The Adam moments are what drove the model out of the
+                    # valid region; carrying them over walks straight back out.
+                    optimizer.state.clear()
+                    T.scale_lr(optimizer, cfg.anomaly_rollback_lr_decay,
+                               scheduler)
+                    log(f"   LR is now {optimizer.param_groups[0]['lr']:.2e}")
+                    n_skip_run = 0
+                    continue
+
                 if n_skip_run >= cfg.max_consecutive_skips:
                     raise RuntimeError(
                         f"{n_skip_run} consecutive anomalous steps at epoch "
@@ -731,41 +818,49 @@ def train(args, cfg, rank, local_rank, world):
             import val3dpw
             dpw_raw = all_reduce_mean(
                 val3dpw.evaluate(ddp_model, dpw_loader, mhr_module, device,
-                                 cfg.use_amp, gt=args.val_3dpw_gt),
+                                 cfg.use_amp, gt=args.val_3dpw_gt,
+                                 adapter=dpw_adapter),
                 device)
             dpw_em = all_reduce_mean(
                 val3dpw.evaluate(ema, dpw_loader, mhr_module, device,
-                                 cfg.use_amp, gt=args.val_3dpw_gt),
+                                 cfg.use_amp, gt=args.val_3dpw_gt,
+                                 adapter=dpw_adapter),
                 device)
             if dpw_test_loader is not None:
                 dpw_test_raw = all_reduce_mean(val3dpw.evaluate(
                     ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp,
-                    gt=args.val_3dpw_gt), device)
+                    gt=args.val_3dpw_gt, adapter=dpw_adapter), device)
                 dpw_test_em = all_reduce_mean(val3dpw.evaluate(
                     ema, dpw_test_loader, mhr_module, device, cfg.use_amp,
-                    gt=args.val_3dpw_gt), device)
+                    gt=args.val_3dpw_gt, adapter=dpw_adapter), device)
             raw["Mesh_PA_MPJPE"], em["Mesh_PA_MPJPE"] = (
-                dpw_raw["J12_PA_MPJPE"], dpw_em["J12_PA_MPJPE"])
+                dpw_raw["J14_PA_MPJPE"], dpw_em["J14_PA_MPJPE"])
             raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
-                dpw_raw["J12_MPJPE"], dpw_em["J12_MPJPE"])
+                dpw_raw["J14_MPJPE"], dpw_em["J14_MPJPE"])
 
         log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}"
             f" | peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
         log(f"   train  total {tr['total']:.4f} | 3d {tr['3d']:.4f} | "
             f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f} | "
             f"reproj {tr['reproj']:.4f} | cam {tr['cam']:.4f} "
-            f"| skipped {n_skip}/{steps_per_epoch} | {time.time() - t_epoch:.0f}s")
-        log(f"   valRAW loss {raw['loss']:.4f} | PA-MPJPE {raw['Mesh_PA_MPJPE']:.1f} | "
-            f"MPJPE {raw['Mesh_MPJPE']:.1f} mm | held-in body PA "
-            f"{raw['Mesh_PA_MPJPE_body']:.1f} mm")
-        log(f"   valEMA loss {em['loss']:.4f} | PA-MPJPE {em['Mesh_PA_MPJPE']:.1f} | "
-            f"MPJPE {em['Mesh_MPJPE']:.1f} mm | held-in body PA "
-            f"{em['Mesh_PA_MPJPE_body']:.1f} mm")
+            f"| skipped {n_skip}/{steps_per_epoch}"
+            f"{f' | repaired {n_repair}' if n_repair else ''}"
+            f" | {time.time() - t_epoch:.0f}s")
+        # Two different datasets, so two lines. The held-in slice scores
+        # against the TEACHER's labels on training-corpus data (agreement);
+        # 3DPW scores against real MoCap on sequences never seen
+        # (generalisation). With --val-3dpw on, Mesh_PA_MPJPE / Mesh_MPJPE are
+        # overwritten above with the 3DPW J14 numbers, so they are not printed
+        # under a held-in label there.
         if dpw_raw is not None:
-            log(f"   3DPW-{args.val_3dpw_split} RAW  J12 PA {dpw_raw['J12_PA_MPJPE']:.1f} "
-                f"MPJPE {dpw_raw['J12_MPJPE']:.1f} | J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} mm")
-            log(f"   3DPW-{args.val_3dpw_split} EMA  J12 PA {dpw_em['J12_PA_MPJPE']:.1f} "
-                f"MPJPE {dpw_em['J12_MPJPE']:.1f} | J14 PA {dpw_em['J14_PA_MPJPE']:.1f} mm")
+            log(f"   held-in (teacher agreement)  RAW loss {raw['loss']:.4f} "
+                f"body PA {raw['Mesh_PA_MPJPE_body']:.1f} | EMA loss "
+                f"{em['loss']:.4f} body PA {em['Mesh_PA_MPJPE_body']:.1f} mm")
+            log(f"   3DPW-{args.val_3dpw_split}  "
+                f"RAW J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} "
+                f"MPJPE {dpw_raw['J14_MPJPE']:.1f} | "
+                f"EMA J14 PA {dpw_em['J14_PA_MPJPE']:.1f} "
+                f"MPJPE {dpw_em['J14_MPJPE']:.1f} mm")
             # Non-finite predictions are dropped rather than crashing the metric
             # (see val3dpw.evaluate). Say so — a handful at epoch 1 is the raw
             # branch still settling, a rising count is a real instability.
@@ -774,6 +869,13 @@ def train(args, cfg, rank, local_rank, world):
                 log(f"   ⚠️  3DPW: {nd:.0f} non-finite prediction(s) dropped "
                     f"(raw {dpw_raw.get('n_dropped', 0.0):.0f} / "
                     f"ema {dpw_em.get('n_dropped', 0.0):.0f})")
+        else:
+            log(f"   held-in RAW loss {raw['loss']:.4f} | PA-MPJPE "
+                f"{raw['Mesh_PA_MPJPE']:.1f} | MPJPE {raw['Mesh_MPJPE']:.1f} mm | "
+                f"body PA {raw['Mesh_PA_MPJPE_body']:.1f} mm")
+            log(f"   held-in EMA loss {em['loss']:.4f} | PA-MPJPE "
+                f"{em['Mesh_PA_MPJPE']:.1f} | MPJPE {em['Mesh_MPJPE']:.1f} mm | "
+                f"body PA {em['Mesh_PA_MPJPE_body']:.1f} mm")
         if dpw_test_raw is not None:
             log(f"   3DPW-TEST (report only, not used for selection)")
             log(f"     RAW  J14 MPJPE {dpw_test_raw['J14_MPJPE']:.1f} | "
@@ -845,6 +947,18 @@ def parse_args():
     p.add_argument("--data_root", default=os.environ.get("DATA_ROOT"))
     p.add_argument("--output_dir", required=False,
                    default=os.environ.get("OUTPUT_DIR"))
+    p.add_argument("--bound-scales", dest="bound_scales", action="store_true",
+                   help="squash the 68 bone scales into the MHR rig's own "
+                        "parameter_limits (widened by --scale-bound-margin). "
+                        "Off by default so --preset baseline stays "
+                        "bit-identical; ON for every new run.")
+    p.add_argument("--scale-bound-margin", dest="scale_bound_margin",
+                   type=float, default=None,
+                   help="how far to widen each rig limit (default 0.5)")
+    p.add_argument("--anomaly-safe-fallback", dest="anomaly_safe_fallback",
+                   action="store_true",
+                   help="on an anomalous batch, step on the non-FK terms "
+                        "instead of discarding the batch")
     p.add_argument("--mhr_model_path", default=None)
     p.add_argument("--kp_regressor_path", default=None)
 
@@ -868,7 +982,7 @@ def parse_args():
                         "not a generalisation measure. 0 disables it.")
     p.add_argument("--val-3dpw", default=os.environ.get("THREEDPW_SEQ"),
                    help="3DPW sequenceFiles/ directory. When given, PA-MPJPE on "
-                        "J12 becomes the checkpoint-selection metric.")
+                        "J14 (adapter-applied) becomes the checkpoint-selection metric.")
     p.add_argument("--val-3dpw-images", default=os.environ.get("THREEDPW_IMG"),
                    help="3DPW imageFiles/ directory.")
     p.add_argument("--val-3dpw-split", default="validation",
@@ -882,6 +996,12 @@ def parse_args():
     p.add_argument("--val-3dpw-test-stride", type=int, default=5)
     p.add_argument("--val-3dpw-stride", type=int, default=5,
                    help="3DPW is 30 fps; neighbouring frames are near-duplicates.")
+    p.add_argument("--val-3dpw-adapter",
+                   default="benchmark/results/adapter_j14_h36m_teacher.npz",
+                   help="Fixed MHR70->J14 map applied before scoring, so the "
+                        "training log reports the same number as "
+                        "benchmark/eval_3dpw_ckpt.py and the paper table. "
+                        "'none' scores the raw MHR joints instead.")
     p.add_argument("--cliff-focal", action="store_true",
                    help="Perspective-correct CLIFF conditioning: angles off the "
                         "optical axis and angular box size instead of "
@@ -952,6 +1072,10 @@ def build_cfg(args):
     cfg = T.DistillConfig()
     if args.data_root:        cfg.data_root = args.data_root
     if args.output_dir:       cfg.log_dir = args.output_dir
+    if args.bound_scales:          cfg.bound_scales = True
+    if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
+    if args.scale_bound_margin is not None:
+        cfg.scale_bound_margin = args.scale_bound_margin
     if args.mhr_model_path:   cfg.mhr_model_path = args.mhr_model_path
     if args.kp_regressor_path: cfg.kp_regressor_path = args.kp_regressor_path
     cfg.batch_size = args.batch_size
@@ -1066,6 +1190,10 @@ def main():
            f"pose_beta={cfg.pose_beta} kp3d={cfg.kp3d_loss}@{cfg.w_keypoints3d} "
            f"finger_w={cfg.finger_weight}"
            if args.losses != "legacy" else ""))
+    log(f"stability bound_scales={cfg.bound_scales}"
+        + (f" (margin {cfg.scale_bound_margin})" if cfg.bound_scales else "")
+        + f" | safe_fallback={cfg.anomaly_safe_fallback}"
+        + f" | rollback@{cfg.anomaly_skip_patience} x{cfg.max_ema_rollbacks}")
     log(f"seed      {args.seed} | mix {args.mix} | "
         f"samples/epoch {args.samples_per_epoch:,}")
     log("=" * 66)
