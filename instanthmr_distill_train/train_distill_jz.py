@@ -332,6 +332,7 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
                 geom_scale_max=cfg.geom_scale_max,
                 cliff_follows_aug=cfg.cliff_follows_aug,
+                crop_centre_fix=cfg.crop_centre_fix,
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
@@ -480,7 +481,8 @@ def train(args, cfg, rank, local_rank, world):
         out_dir.mkdir(parents=True, exist_ok=True)
 
     W = np.load(cfg.kp_regressor_path)
-    mhr_module = T.MHRForwardPass(cfg.mhr_model_path, device, kp_regressor=W)
+    mhr_module = T.MHRForwardPass(cfg.mhr_model_path, device, kp_regressor=W,
+                                  n_verts=cfg.n_verts if cfg.w_verts > 0 else 0)
     criterion = T.DistillationLoss(cfg, mhr_module)
 
     train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
@@ -645,6 +647,8 @@ def train(args, cfg, rank, local_rank, world):
             "finger_weight": cfg.finger_weight,
             "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
             "cliff_focal": cfg.cliff_focal,
+            "w_verts": cfg.w_verts, "n_verts": cfg.n_verts,
+            "crop_centre_fix": cfg.crop_centre_fix,
             "bound_scales": cfg.bound_scales,
             "scale_bound_margin": cfg.scale_bound_margin,
             "anomaly_safe_fallback": cfg.anomaly_safe_fallback,
@@ -659,6 +663,10 @@ def train(args, cfg, rank, local_rank, world):
         # history.jsonl and you would have to guess from the total.
         run = {"total": 0.0, "3d": 0.0, "2d": 0.0, "simcc": 0.0,
                "reproj": 0.0, "cam": 0.0, "pose": 0.0}
+        # The surface term is worth its own column: at w_verts=1 it reads
+        # directly as mean PVE in metres, so verts/w_verts*1000 is millimetres.
+        if cfg.w_verts > 0:
+            run["verts"] = 0.0
         nb = 0
         n_skip = n_skip_run = n_repair = 0
         t_epoch = time.time()
@@ -795,6 +803,8 @@ def train(args, cfg, rank, local_rank, world):
             run["2d"] += losses.get("loss_2d_native", torch.zeros(())).item()
             run["simcc"] += losses.get("loss_2d_simcc", torch.zeros(())).item()
             run["reproj"] += losses.get("loss_reproj", torch.zeros(())).item()
+            if "verts" in run:
+                run["verts"] += losses.get("loss_verts", torch.zeros(())).item()
             run["cam"] += losses.get("loss_cam", torch.zeros(())).item()
             # Under cfg.pose_split, loss_pose is the local half and loss_pose_root
             # the other; summing keeps history.jsonl's "pose" column comparable
@@ -1046,6 +1056,25 @@ def parse_args():
                         "prerequisites, plus absolute-pose supervision. "
                         "'baseline' reproduces the pre-v2 trainer exactly.")
     p.add_argument("--w_reproj", type=float, default=None)
+    p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
+                   help="Divide the CLIFF crop-centre correction by the zoom. "
+                        "Only affects --preset v2 (cliff_follows_aug). Without "
+                        "it the box centre the network is told is off by 7.73 px "
+                        "mean / 21.0 px p95 at v2 zoom strength. Default "
+                        "off so generation 5 reproduces bit-for-bit.")
+    p.add_argument("--w-verts", dest="w_verts", type=float, default=None,
+                   help="Weight on the surface (PVE) term: unsquared Euclidean "
+                        "distance, in metres, between predicted and teacher mesh "
+                        "vertices. 0 (the default) disables it and every code "
+                        "path it touches. This is the only geometric loss that "
+                        "sees shape_params, which move the skeleton by exactly "
+                        "0 cm. Try 0.35, the same scale as --preset v2's "
+                        "w_keypoints3d.")
+    p.add_argument("--n-verts", dest="n_verts", type=int, default=None,
+                   help="How many mesh vertices the surface term uses: a "
+                        "farthest-point subset of the rig's own 18,439-vertex "
+                        "mesh (default 595, lod6's count). Costs 0.6 ms per "
+                        "batch-64 step against 16.7 ms for the full mesh.")
     p.add_argument("--losses", choices=("legacy", "rebalanced"), default="legacy",
                    help="Orthogonal to --preset, which only controls the input "
                         "pipeline and the absolute-pose terms. 'rebalanced' applies "
@@ -1084,6 +1113,9 @@ def build_cfg(args):
     cfg.epochs = args.epochs
     cfg.per_dataset_caps = {}            # replaced by the weighted sampler
     if args.backbone:               cfg.backbone = args.backbone
+    if args.crop_centre_fix:        cfg.crop_centre_fix = True
+    if args.w_verts is not None:    cfg.w_verts = args.w_verts
+    if args.n_verts is not None:    cfg.n_verts = args.n_verts
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
@@ -1190,6 +1222,9 @@ def main():
            f"pose_beta={cfg.pose_beta} kp3d={cfg.kp3d_loss}@{cfg.w_keypoints3d} "
            f"finger_w={cfg.finger_weight}"
            if args.losses != "legacy" else ""))
+    log(f"surface   w_verts={cfg.w_verts}"
+        + (f" over {cfg.n_verts} mesh vertices" if cfg.w_verts > 0 else " (off)")
+        + f" | crop_centre_fix={cfg.crop_centre_fix}")
     log(f"stability bound_scales={cfg.bound_scales}"
         + (f" (margin {cfg.scale_bound_margin})" if cfg.bound_scales else "")
         + f" | safe_fallback={cfg.anomaly_safe_fallback}"

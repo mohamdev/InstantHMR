@@ -291,6 +291,117 @@ Confirmed directly: pushing `scale_spine_length` to 20.3 along a null direction
 moves the skeleton by 1.2e-7 m. The bound now keeps that wandering finite;
 collapsing the redundancy properly would be a separate change.
 
+## `--w-verts` — the surface (PVE) term (added 2026-09-07)
+
+Every geometric loss in this trainer is blind to body shape. `get_joints` zeroes
+the 45 `shape_params` before the forward pass, and that is not a shortcut — the
+identity coefficients move the 127-joint skeleton by **exactly** `0.000e+00 cm`.
+They are mesh-only. So `w_shape` in parameter space was the only thing
+supervising them, and at `--losses rebalanced` that weight is 0.03, carrying
+0.2% of the trunk gradient.
+
+`--w-verts W` adds a term that skins the rig and compares vertices, which is the
+only route by which a geometric gradient can reach shape. Measured
+`d(loss)/d(shape_params)`: **8.9e-03** through vertices, **exactly 0.000e+00**
+through joints.
+
+**What it costs to ignore shape.** Running the rig on real teacher parameters
+with the identity zeroed against the true identity: **5.95 mm mean, 22.68 mm max
+per-vertex error**. That is a floor a shape-blind model cannot perceive, let
+alone fix.
+
+### It uses the rig's own mesh, not a separate LOD
+
+The obvious way to make this cheap is to load `lod6.fbx` (595 vertices against
+lod0's 18,439). Don't — it needs `pymomentum` to parse, which segfaults against
+the torch in this environment, and lod6 is a *different topology*, so the
+teacher correspondence would have to be fitted rather than being exact.
+
+Instead `n_verts` picks a farthest-point subset of the rig's **own** 18,439
+vertices and rewrites the three flattened influence tables of the rig's own
+`linear_blend_skinning` — `(vertex, bone, weight)` triples — to reference only
+those, under a compacted index. The skinning op is untouched, so the result is
+the full mesh's answer restricted to those vertices, **verified bit-exact to
+4.6e-05 cm**. Same topology, same vertex ids as the teacher: the correspondence
+is exact, not fitted. The default `n_verts=595` is lod6's vertex count, chosen
+so the sampling density matches what the LOD would have given.
+
+Measured at batch 64 on an RTX 4070:
+
+| path | fwd+bwd | vs skeleton-only |
+|---|---|---|
+| skeleton FK only (what the trainer already did) | 4.85 ms | — |
+| + 595-vertex subset | 5.44 ms | **+0.6 ms** |
+| + all 18,439 vertices | 21.6 ms | +16.7 ms |
+
+Against a 207 ms step that is **+0.3%** for the subset and +8.1% for the full
+mesh. On a real training step, end to end: **+0.9% wall time and +0 MiB peak
+GPU** — the backbone activations dominate and the vertex tensors fit in slack.
+
+### Choosing the weight
+
+The term is an unsquared Euclidean distance in **metres**, the same form as
+`loss_3d_native` under `--losses rebalanced`, so the weights are directly
+comparable and `loss_verts / w_verts * 1000` reads as mean PVE in millimetres.
+Per-term gradient norm on the trunk, pretrained backbone, `v2 + rebalanced`:
+
+| term | \|grad\| | share |
+|---|---|---|
+| `loss_reproj` | 33.97 | 61.3% |
+| `loss_verts` (at w=1.0) | 7.21 | 13.0% |
+| `loss_cam` | 4.51 | 8.1% |
+| `loss_3d_native` | 3.74 | 6.7% |
+| `loss_pose` | 2.93 | 5.3% |
+| `loss_shape` | 0.12 | **0.2%** |
+
+**`--w-verts 0.35` is the recommended setting**: `|grad| = 2.52`, 5.0% of the
+update, just under `loss_3d_native` and nowhere near `loss_reproj`. At 1.0 it
+would be the second-largest term in the budget, which is not what a first trial
+should do.
+
+`loss_verts` is in `FK_LOSS_KEYS`, so `--anomaly-safe-fallback` drops it along
+with the other forward-kinematics terms on an anomalous batch — a blown-up bone
+scale explodes the vertices exactly as it explodes the joints. It is also
+multiplied by `fk_scale`, so it ramps over `kp3d_warmup_steps` (2000) like
+`loss_3d_native` and `loss_reproj`; a PVE read from the first epoch is
+suppressed by that ramp, not genuinely small.
+
+`w_verts = 0.0` is the default and disables the term **and every code path it
+touches** — `MHRForwardPass` is then constructed with `n_verts=0` and builds no
+subset at all. Verified: every loss term matches `git show HEAD` to the last
+printed digit on 48 real augmented samples, under both `baseline/legacy` and
+`v2/rebalanced`.
+
+**There is no PVE metric yet, only the loss.** See `docs/todo.md` item 13.
+
+## `--crop-centre-fix` (added 2026-09-07)
+
+`--preset v2` sets `cliff_follows_aug`, which moves the CLIFF conditioning to
+describe the *augmented* box. The crop-centre half of that correction was
+missing a division by the zoom: the warp is `u' = s*R*(u - c) + c + t`, so
+inverting it puts the visible window's centre at `-t/s`, not `-t`.
+
+Verified against the exact preimage of the crop centre under the real
+`M_total` that `cv2.warpAffine` was called with, over 400 augmented COCO crops
+at v2 strength, rotation disabled so the zoom is the only variable:
+
+| | mean | p95 | max |
+|---|---|---|---|
+| off (the gen-5 behaviour) | 7.73 px | 21.00 px | 34.93 px |
+| **on** | **0.68 px** | 1.12 px | 1.50 px |
+
+The residual is the bbox-rounding floor. **Default off** so generation 5 and
+`--preset baseline` reproduce bit-for-bit; it is a no-op under `--preset
+baseline`, which does not set `cliff_follows_aug` at all. Pass it for every new
+`v2` run.
+
+This is a wrong **input**, not a wrong label — the reprojection chain is exact
+to 0.000 px — and it only affects lateral placement, which PA-MPJPE cannot see.
+Do not expect the benchmark to move; expect the conditioning to stop lying.
+
+The rotation half of the same correction is **not** settled: see `docs/todo.md`
+item 11.
+
 ## Tried and rejected: detaching the 2D head (2026-09-06 / 09-07)
 
 **Do not retry this without reading the failure mode.** The flag is gone from
@@ -483,6 +594,16 @@ python3 train_distill.py \
     --self-test     # run arch + perfect-student loss sanity checks first
     --no-resume     # ignore any existing checkpoint, train from scratch
     --no-export     # skip ONNX export/quantization after training
+```
+
+On the cluster, flags go through `EXTRA_TRAIN_ARGS` on
+`datasets_pipeline/jeanzay/52_train_ddp.slurm`, not on a bare command line. The
+generation-6 set is:
+
+```
+--preset {baseline|v2} --losses rebalanced \
+--cliff-focal --bound-scales --anomaly-safe-fallback --crop-centre-fix \
+--w-verts {0|0.35}
 ```
 
 Training auto-resumes from `runs/<name>/best_student_model_v3.pth` if present.

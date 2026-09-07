@@ -167,6 +167,22 @@ steps. Use `--anomaly-safe-fallback`, which steps on the non-FK terms instead
 divergence here by lowering the LR alone: `OneCycleLR(pct_start=0.1)` peaks at
 10% of the run, so a lower peak only moves *when* it dies.
 
+**Body shape is invisible to every geometric loss, and the fix is a vertex
+term.** `MHRForwardPass.get_joints` zeroes the 45 `shape_params`, and that is
+not a shortcut: they move the 127-joint skeleton by *exactly* `0.000e+00 cm`.
+Measured `d(loss)/d(shape_params)` is `8.9e-03` through vertices and
+`0.000e+00` through joints, so `--w-verts` is the ONLY route by which shape gets
+a geometric gradient; ignoring identity costs 5.95 mm mean / 22.68 mm max PVE.
+Do **not** reach for `models/mhr_assets/assets/lod6.fbx` to make it cheap — it
+needs `pymomentum` (which segfaults here) and it is a different topology, so the
+teacher correspondence would have to be fitted. `n_verts` instead takes a
+farthest-point subset of the rig's OWN 18,439-vertex mesh and rewrites the three
+flattened influence tables of the rig's own `linear_blend_skinning`; the op is
+untouched, so the answer is bit-exact against the full mesh (4.6e-05 cm) and the
+vertex ids match the teacher's. 595 vertices cost +0.6 ms per batch-64 step
+against 16.7 ms for all 18,439. `loss_verts` belongs in `FK_LOSS_KEYS` — a
+blown-up bone scale explodes vertices exactly as it explodes joints.
+
 **`parameter_transform[:, :204]` has rank 192, not 204.** Twelve directions
 move the parameters and leave the skeleton *exactly* unchanged — each
 `*_flexible` parameter against its `scale_*` partner, plus the spine rotations.

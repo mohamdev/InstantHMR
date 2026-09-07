@@ -45,6 +45,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import io
+import copy
 import json
 import math
 import random
@@ -181,6 +182,9 @@ class DistillConfig:
     geom_scale_max: float | None = None   # zoom-in ceiling; None => symmetric
                                           # U(1-range, 1+range) as before. 2.0 is
                                           # MeTRAbs's quarter-area truncation bound.
+    # Divide the CLIFF crop-centre correction by the zoom (see the derivation at
+    # the call site). Default off so gen-5 and `--preset baseline` reproduce.
+    crop_centre_fix: bool = False
     cliff_follows_aug: bool = False       # CLIFF cx/cy/b_scale track the augmented
                                           # crop box, as a real detector box would
     cliff_focal: bool = False             # perspective-correct CLIFF conditioning:
@@ -318,6 +322,24 @@ class DistillConfig:
     w_3d_joints: float = 1e-3       # on the raw 127 skeleton joints (see below)
     w_reproj: float = 0.01          # single re-projection of the MHR keypoints
     w_simcc: float = 1.0            
+    # Surface (PVE) term.  `shape_params` move the 127-joint skeleton by exactly
+    # 0.000e+00 cm -- measured -- so every other geometric loss here is blind to
+    # body shape and the mesh is supervised only by w_shape in parameter space.
+    # This term skins the rig and compares vertices, which is the only way a
+    # geometric gradient reaches the 45 identity coefficients.
+    #
+    # n_verts is a farthest-point subset of the rig's OWN 18,439-vertex mesh,
+    # not a separate LOD asset: same topology and same vertex ids as the
+    # teacher, so the correspondence is exact rather than approximate, and the
+    # rig's own skinning op is driven on the subset (verified bit-exact against
+    # the full mesh to 4.6e-05 cm).  Measured at batch 64 on an RTX 4070:
+    # skeleton-only FK 4.85 ms, +595 verts 5.44 ms, +all 18,439 verts 21.6 ms --
+    # i.e. the subset costs 0.6 ms (0.3% of a 207 ms step) where the full mesh
+    # costs 16.7 ms (8.1%).  595 is lod6's vertex count.
+    # w_verts = 0.0 disables the term and every code path it touches, so
+    # `--preset baseline` / `--losses legacy` stay bit-identical by default.
+    w_verts: float = 0.0
+    n_verts: int = 595
     # Linear ramp (in optimiser steps) for the two losses that back-propagate
     # through the MHR forward kinematics, so that loss_pose can pull the
     # parameters into a valid region before the geometric terms engage.
@@ -475,6 +497,7 @@ class SAM3DStudentDataset(Dataset):
                  geom_flip_p: float = 0.5,
                  geom_scale_max: float | None = None,
                  cliff_follows_aug: bool = False,
+                 crop_centre_fix: bool = False,
                  cliff_focal: bool = False,
                  occl_p: float = 0.2, occl_scale: tuple = (0.02, 0.15),
                  jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90)):
@@ -489,6 +512,7 @@ class SAM3DStudentDataset(Dataset):
         self.geom_flip_p = geom_flip_p
         self.geom_scale_max = geom_scale_max
         self.cliff_follows_aug = cliff_follows_aug
+        self.crop_centre_fix = crop_centre_fix
         self.cliff_focal = cliff_focal
 
         tfm_list = [transforms.Resize((image_size, image_size))]
@@ -706,8 +730,22 @@ class SAM3DStudentDataset(Dataset):
             # sized detector box looks like at deployment.
             if self.cliff_follows_aug:
                 crop_w = float(sq_bbox[2] - sq_bbox[0])
-                cx -= dx * crop_w / 2.0
-                cy -= dy * crop_w / 2.0
+                # The warp is u' = s*R*(u - c) + c + t, so inverting it puts the
+                # visible window's centre at -t/s, not at -t: the shift has to be
+                # divided by the zoom.  Without the /s the correction is too big
+                # when zooming in and too small when zooming out -- measured over
+                # 972 augmented samples at v2 strength (geom_trans 0.20,
+                # geom_scale_max 2.0): 11.7 px mean / 33.6 px p95 of error in the
+                # box centre, i.e. 0.61 deg mean / 1.73 deg p95 in the bearing the
+                # network is conditioned on.  It is a wrong INPUT, not a wrong
+                # label -- the reprojection chain is exact to 0.000 px -- and it
+                # only affects lateral placement, which PA-MPJPE cannot see.
+                #
+                # Default off so `--preset baseline` and every gen-5 run stay
+                # bit-identical; `--crop-centre-fix` turns it on.
+                z = scale if getattr(self, "crop_centre_fix", False) else 1.0
+                cx -= dx * crop_w / (2.0 * z)
+                cy -= dy * crop_w / (2.0 * z)
                 b_scale = b_scale / scale
 
         image = self.transform(img_pil)  
@@ -768,6 +806,7 @@ def build_dataloaders(cfg):
                 geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
                 geom_scale_max=cfg.geom_scale_max,
                 cliff_follows_aug=cfg.cliff_follows_aug,
+                crop_centre_fix=cfg.crop_centre_fix,
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
@@ -997,7 +1036,7 @@ class MHRForwardPass:
     per training step and makes the mesh LOD irrelevant to training cost.
     """
 
-    def __init__(self, mhr_path, device, kp_regressor=None):
+    def __init__(self, mhr_path, device, kp_regressor=None, n_verts: int = 0):
         self.device = device
         self.mhr = torch.jit.load(mhr_path, map_location=device).eval()
         for p in self.mhr.parameters():
@@ -1007,6 +1046,48 @@ class MHRForwardPass:
             W = torch.as_tensor(kp_regressor, dtype=torch.float32, device=device)
             assert W.shape == (70, 127), f"expected a (70, 127) regressor, got {tuple(W.shape)}"
             self.kp_regressor = W
+        self.vert_idx = None
+        if n_verts:
+            self._build_vertex_subset(int(n_verts))
+
+    def _build_vertex_subset(self, n: int):
+        """A farthest-point subset of the rig mesh, plus a skinning op for it.
+
+        The rig's `linear_blend_skinning` asserts it is handed all 18,439
+        vertices, so the subset is installed by rewriting its three flattened
+        influence tables -- (vertex, bone, weight) triples -- to reference only
+        the chosen vertices under a compacted index.  The op itself is
+        untouched, which is why the result is the full mesh's answer restricted
+        to those vertices rather than an approximation of it.
+
+        Deterministic: the seed vertex is fixed and the input mesh is fixed, so
+        every DDP rank builds the identical subset without communicating.
+        """
+        ct = self.mhr.character_torch
+        rest = ct.mesh.rest_vertices.to(self.device)
+        assert n <= rest.shape[0], f"n_verts={n} exceeds the {rest.shape[0]}-vertex mesh"
+        # Farthest-point sampling in float64: the mesh spans ~180 cm and
+        # neighbouring vertices are sub-millimetre apart, so float32 ties would
+        # make the traversal order depend on accumulation noise.
+        P = rest.double()
+        idx = [0]
+        d = (P - P[0]).norm(dim=-1)
+        for _ in range(n - 1):
+            i = int(d.argmax())
+            idx.append(i)
+            d = torch.minimum(d, (P - P[i]).norm(dim=-1))
+        sub = torch.tensor(sorted(idx), device=self.device)
+
+        lbs = copy.deepcopy(ct.linear_blend_skinning)
+        vi = ct.linear_blend_skinning.vert_indices_flattened
+        keep = torch.isin(vi, sub)
+        remap = torch.full((int(vi.max()) + 1,), -1, dtype=torch.int64, device=self.device)
+        remap[sub] = torch.arange(n, device=self.device)
+        lbs.vert_indices_flattened = remap[vi[keep]]
+        lbs.skin_indices_flattened = ct.linear_blend_skinning.skin_indices_flattened[keep]
+        lbs.skin_weights_flattened = ct.linear_blend_skinning.skin_weights_flattened[keep]
+        lbs.num_vertices = n
+        self.vert_idx, self.vert_lbs = sub, lbs
 
     def get_joints(self, model_params, shape_params):
         """(B, 127, 8) skeleton state in raw MHR units (cm, Y-up)."""
@@ -1016,6 +1097,24 @@ class MHRForwardPass:
         joint_params = self.mhr.character_torch.model_parameters_to_joint_parameters(concat_params.to(self.device))
         skel_state = self.mhr.character_torch.joint_parameters_to_skeleton_state(joint_params)
         return skel_state.to(model_params.device)
+
+    def get_joints_and_vertices(self, model_params, shape_params):
+        """(B, 127, 3) joints and (B, n_verts, 3) skin, both raw MHR cm.
+
+        One forward kinematics pass feeds both.  Unlike `get_joints` this passes
+        the REAL identity coefficients rather than zeros -- which changes the
+        skeleton by exactly nothing (verified bit-identical, `torch.equal`),
+        because the 45 identity coefficients are mesh-only -- while the mesh
+        needs them, since they are the only thing this term exists to supervise.
+        """
+        assert self.vert_idx is not None, "MHRForwardPass was built with n_verts=0"
+        ct = self.mhr.character_torch
+        cat = torch.cat([model_params, shape_params], dim=1).to(self.device)
+        skel = ct.joint_parameters_to_skeleton_state(
+            ct.model_parameters_to_joint_parameters(cat))
+        rest = ct.blend_shape(shape_params.to(self.device))[:, self.vert_idx]
+        verts = self.vert_lbs(skel, rest)
+        return skel[..., :3].to(model_params.device), verts.to(model_params.device)
 
     @staticmethod
     def to_vision(joints):
@@ -1192,14 +1291,30 @@ class DistillationLoss(nn.Module):
         else:
             losses['loss_cam'] = self.mse(preds["cam_trans"], targets["cam_trans"]) * self.cfg.w_cam
 
-        pred_mhr_joints = self.mhr_module.get_joints(preds["mhr_params"], preds["shape_params"])[..., :3]
+        want_verts = float(getattr(self.cfg, "w_verts", 0.0)) > 0.0
+        if want_verts:
+            pred_mhr_joints, pred_verts = self.mhr_module.get_joints_and_vertices(
+                preds["mhr_params"], preds["shape_params"])
+        else:
+            pred_mhr_joints = self.mhr_module.get_joints(preds["mhr_params"], preds["shape_params"])[..., :3]
         with torch.no_grad():
-            tgt_mhr_joints = self.mhr_module.get_joints(targets["mhr_model_params"], targets["shape_params"])[..., :3]
+            if want_verts:
+                tgt_mhr_joints, tgt_verts = self.mhr_module.get_joints_and_vertices(
+                    targets["mhr_model_params"], targets["shape_params"])
+            else:
+                tgt_mhr_joints = self.mhr_module.get_joints(targets["mhr_model_params"], targets["shape_params"])[..., :3]
             c = targets["aug_cos"].view(-1, 1) if "aug_cos" in targets else torch.ones(B, 1, device=ones.device)
             s = targets["aug_sin"].view(-1, 1) if "aug_sin" in targets else torch.zeros(B, 1, device=ones.device)
             xm, ym = tgt_mhr_joints[..., 0], tgt_mhr_joints[..., 1]
             tgt_mhr_joints = torch.stack(
                 [c * xm - s * ym, s * xm + c * ym, tgt_mhr_joints[..., 2]], dim=-1)
+            if want_verts:
+                # The same in-plane rotation the joints get: the dataset rotates
+                # the LABELS, not the target parameters, so the FK'd target has
+                # to be brought into the augmented frame.
+                xv, yv = tgt_verts[..., 0], tgt_verts[..., 1]
+                tgt_verts = torch.stack(
+                    [c * xv - s * yv, s * xv + c * yv, tgt_verts[..., 2]], dim=-1)
 
         # KEPT (w=1e-3) even though loss_3d_native now covers the same parameters.
         # It is not redundant: the best linear reconstruction of the 127 skeleton
@@ -1209,6 +1324,16 @@ class DistillationLoss(nn.Module):
         # already computed and the target runs under no_grad.
         losses['loss_mhr_joints'] = self.m_smooth_l1(
             pred_mhr_joints, tgt_mhr_joints.detach(), m_noflip) * self.cfg.w_3d_joints
+
+        if want_verts:
+            # Per-vertex unsquared Euclidean distance in METRES, so the weight is
+            # on the same scale as w_keypoints3d under kp3d_loss="euclid" and the
+            # logged value reads as mean PVE / 1000.  Masked to m_noflip for the
+            # same reason loss_mhr_joints is: under a horizontal flip the target
+            # PARAMETERS are not mirrored, only the 2D and 3D labels are.
+            e_verts = (pred_verts - tgt_verts.detach()).norm(dim=-1).mean(1) / 100.0
+            losses['loss_verts'] = (self._mmean(e_verts, m_noflip)
+                                    * self.cfg.w_verts * self.fk_scale)
 
         # The 70 native keypoints ARE the mesh now: an affine function of the
         # 127 skeleton joints, so they are differentiable w.r.t. mhr_params and
@@ -1332,7 +1457,7 @@ class DistillationLoss(nn.Module):
 # are the only unbounded ones: the parameter regressions are bounded by the
 # target magnitudes and the 2D terms are bounded by construction (SimCC spans
 # +/-kp2d_range and its CE by log(kp2d_bins)).
-FK_LOSS_KEYS = ("loss_3d_native", "loss_mhr_joints", "loss_reproj")
+FK_LOSS_KEYS = ("loss_3d_native", "loss_mhr_joints", "loss_reproj", "loss_verts")
 
 
 def safe_loss_subset(losses):
