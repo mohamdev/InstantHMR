@@ -294,28 +294,6 @@ class DistillConfig:
     bound_scales: bool = False
     scale_bound_margin: float = 0.5
     scale_bounds_path: str = str(PROJECT_ROOT / "assets/mhr_size_bounds.npz")
-    # Stop the 2D SimCC head from shaping the shared trunk (backbone + decoder).
-    # It keeps its full supervision and stays a deployed output -- only the
-    # gradient path back into the decoder is cut, so the trunk is trained by the
-    # 3D pathway alone.
-    #
-    # Measured on the converged b3_s1 checkpoint over real augmented batches:
-    # of the gradient reaching backbone+decoder, loss_2d_simcc owns 47.6% and
-    # loss_2d_native 8.6%, loss_cam 22.3%, and all seven 3D body-pose terms
-    # together 20.7%.  The dominant term is also the most exhausted and the
-    # noisiest: loss_2d_simcc sits at 2.227 nats against an irreducible floor of
-    # 2.112 (the entropy of its own Gaussian soft label at sigma = 2 bins), so
-    # only 5.2% of it is reducible, and its trunk gradient has the worst
-    # signal-to-noise of any term (|mean g| / mean |g| = 0.28 against the pose
-    # group's 0.39) at a +0.21 per-batch cosine with it.
-    #
-    # The 70 SimCC queries keep receiving gradient through the decoder's
-    # self-attention with the global token, so they do not go dead -- they stop
-    # being *forced* to encode 2D image-plane positions and become free capacity
-    # for the token the parameters are read from.
-    #
-    # Default off: --preset baseline and --losses legacy must stay bit-identical.
-    detach_2d_head: bool = False
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -903,7 +881,6 @@ class InstantHMRStudent(nn.Module):
 
         self.kp2d_bins = getattr(cfg, 'kp2d_bins', 96)
         self.kp2d_range = getattr(cfg, 'kp2d_range', 1.5)
-        self.detach_2d_head = bool(getattr(cfg, "detach_2d_head", False))
         self.head_2d_feat = nn.Sequential(
             nn.Linear(cfg.d_model, 256),
             nn.GELU()
@@ -991,12 +968,6 @@ class InstantHMRStudent(nn.Module):
             if prev < pred_mhr_params.shape[1]:
                 parts.append(pred_mhr_params[:, prev:])
             pred_mhr_params = torch.cat(parts, dim=1)
-
-        # Cut the 2D head's gradient into the shared trunk. Forward values are
-        # untouched, so the deployed joints_2d output and the ONNX graph are
-        # unchanged; only what the backbone and decoder are trained FOR changes.
-        if self.detach_2d_head:
-            feat_2d = feat_2d.detach()
 
         feat_2d_processed = self.head_2d_feat(feat_2d)
         logits_2d = self.head_2d_logits(feat_2d_processed)
@@ -2385,10 +2356,6 @@ def parse_args():
                    action="store_true",
                    help="On an anomalous batch, step on the non-FK terms "
                         "instead of discarding the batch.")
-    p.add_argument("--detach-2d-head", dest="detach_2d_head", action="store_true",
-                   help="Stop the 2D SimCC head from shaping the backbone and "
-                        "decoder. It keeps full supervision and stays a deployed "
-                        "output; only its gradient into the shared trunk is cut.")
     p.add_argument("--kp3d-warmup-steps", dest="kp3d_warmup_steps", type=int, default=None,
                    help="Optimiser steps over which the FK-path losses ramp from 0 to full weight.")
     p.add_argument("--w_keypoints3d", type=float, default=None,
@@ -2444,7 +2411,6 @@ def main():
     if args.no_resume:                  cfg.resume = False
     if args.bound_scales: cfg.bound_scales = True
     if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
-    if args.detach_2d_head: cfg.detach_2d_head = True
     if args.scale_bound_margin is not None: cfg.scale_bound_margin = args.scale_bound_margin
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
     if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)

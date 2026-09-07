@@ -159,7 +159,8 @@ def main():
     report = {}
     hdr = (f"\n  {'run':<24s} {'ckpt':<6s} {'ep':>4s} {'GT':<15s} {'J12 PA':>8s} "
            f"{'J12 MPJPE':>10s} {'J14 PA':>8s} {'J14 MPJPE':>10s}"
-           + (f" {'J14+ad PA':>10s}" if W_adapt is not None else ""))
+           + (f" {'J14+ad PA':>10s} {'J14+ad MPJPE':>13s}"
+              if W_adapt is not None else ""))
     print(hdr)
 
     for ck_path in args.ckpt:
@@ -191,9 +192,15 @@ def main():
                     f"{rows['J12']['PA_MPJPE_mm']:8.2f} {rows['J12']['MPJPE_mm']:10.2f} "
                     f"{rows['J14']['PA_MPJPE_mm']:8.2f} {rows['J14']['MPJPE_mm']:10.2f}")
             if W_adapt is not None:
+                # Both metrics adapter-applied. The raw J14 columns read ~35 mm
+                # higher on MPJPE because they compare the MHR rig's own joint
+                # positions against the H36M convention; the adapter is what
+                # removes that fixed convention offset, so it belongs on MPJPE
+                # every bit as much as on PA-MPJPE.
                 line += (f" {rows['J14+adapter']['PA_MPJPE_mm']:10.2f}"
+                         f" {rows['J14+adapter']['MPJPE_mm']:13.2f}"
                          if "J14+adapter" in rows
-                         else f" {'n/a':>10s}")
+                         else f" {'n/a':>10s} {'n/a':>13s}")
             print(line + (f"   ({n_dropped} dropped)" if n_dropped else ""), flush=True)
 
             if args.fit_adapter:

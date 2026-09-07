@@ -291,113 +291,79 @@ Confirmed directly: pushing `scale_spine_length` to 20.3 along a null direction
 moves the skeleton by 1.2e-7 m. The bound now keeps that wandering finite;
 collapsing the redundancy properly would be a separate change.
 
-## `--detach-2d-head` (added 2026-09-06, experimental)
+## Tried and rejected: detaching the 2D head (2026-09-06 / 09-07)
 
-Stops the 2D SimCC head from training the **shared trunk** — the backbone plus
-the decoder, i.e. everything that builds the representation. The head keeps its
-full loss, keeps its weights trainable, and stays a deployed ONNX output; the
-only thing that changes is that its gradient no longer flows back into the
-decoder. One line in `InstantHMRStudent.forward`: `feat_2d = feat_2d.detach()`.
+**Do not retry this without reading the failure mode.** The flag is gone from
+the code; this section is the record of why.
 
-### Why
+The idea was to stop the 2D SimCC head from training the **shared trunk** —
+backbone plus decoder — with one line in `InstantHMRStudent.forward`,
+`feat_2d = feat_2d.detach()`. The head kept its full loss and stayed a deployed
+output; only its gradient into the trunk was cut. The motivation was a real
+measurement: on the converged `b3_s1` checkpoint, of the gradient reaching
+backbone + decoder, `loss_2d_simcc` owned 47.6% and `loss_2d_native` 8.6%
+against 20.7% for all seven 3D body-pose terms together, and the 2D gradient had
+the worst signal-to-noise of any term (`|mean g| / mean |g|` 0.28 against the
+pose group's 0.39) at only +0.21 per-batch cosine with it.
 
-The trunk is being trained mostly for an output the benchmark does not measure.
-Back-propagating each loss term separately through the converged `b3_s1`
-checkpoint, over real augmented batches, gives the share of the gradient that
-reaches backbone + decoder:
+**It failed on both axes.** Two matched seeds each (`dt` = detached, `bno` =
+control), identical mixture, LR and flags, scored at epoch 83-87 of 300 on 3DPW
+test (35,463 person-frames, published-protocol GT, adapter applied) and COCO
+val2017 (6,352 persons, GT boxes):
 
-| term | share of the trunk's gradient |
-|---|---|
-| `loss_2d_simcc` | **47.6%** |
-| `loss_2d_native` | 8.6% |
-| `loss_cam` | 22.3% |
-| all seven 3D body-pose terms together | **20.7%** |
+| arm | 3DPW PA-MPJPE | 3DPW MPJPE | COCO OKS AP | COCO PCK@0.05 |
+|---|---|---|---|---|
+| `bno` (control) | **44.45 ± 0.90** | **71.37 ± 1.04** | **39.4** | **73.5%** |
+| `dt` (detached) | 45.53 ± 0.30 | 79.61 ± 3.86 | **0.00** | 3.1% |
 
-The dominant term is also the most exhausted and the noisiest. `loss_2d_simcc`
-sits at **2.227 nats against an irreducible floor of 2.112** — that floor is the
-entropy of its own Gaussian soft label at `sigma = 2 * bin_w`, which no model can
-go below.
+**The 2D head does not degrade — it collapses.** Measured over 48 COCO crops,
+the spread of the 70 predicted keypoints *within* one crop:
 
-> **Correction (2026-09-06).** An earlier version of this section read "only
-> 5.2% of the term is reducible, i.e. a task already 95% converged". That does
-> not follow. `CE = H(target) + KL(target || prediction)`, and `H` is a
-> constant with **zero gradient**, so the ratio `2.112 / 2.227` says nothing
-> about how much of the *learnable* part is left: the learnable part is the
-> whole of `KL = 0.115` nats, and this number cannot say whether that is close
-> to optimal. Use it only as a scale for reading the `simcc` column — subtract
-> 2.112 to get the part the model is actually being graded on. The gradient
-> measurements below (47.6% share, SNR 0.28, cosine +0.21) are independent of
-> this and stand.
+| arm | within-crop spread (x, y) | across-crop centroid spread (x, y) |
+|---|---|---|
+| `bno_s0` / `bno_s1` | 0.226 / 0.311, 0.251 / 0.310 | 0.123 / 0.271, 0.129 / 0.287 |
+| `dt_s0` / `dt_s1` | **0.013 / 0.011**, **0.020 / 0.023** | 0.140 / 0.231, 0.155 / 0.232 |
 
-Its trunk gradient has the
-worst signal-to-noise of any term (`|mean g| / mean |g|` = 0.28, against 0.39 for
-the pose group) and only a +0.21 per-batch cosine with the pose gradient. Most of
-what it sends into the backbone is batch noise from a task that is already 95%
-converged.
+A 15-25x collapse within the crop, on both seeds, while the across-crop spread
+is unchanged — the head still tracks *where the person is*, but predicts all 70
+keypoints at the same point. Hence OKS AP of exactly 0.00: no prediction ever
+clears the lowest threshold.
 
-The same imbalance is in the compute. At 224, batch 1: backbone 9.040 GFLOPs
-(83.8%), the 71-query decoder 1.694 GFLOPs (15.7%), the 2D head 0.025 GFLOPs, and
-the **parameter head 0.0003 GFLOPs — 0.003%**. Seventy of the 71 decoder queries
-serve the 2D output; all 204 MHR parameters are read from the one remaining
-token.
+**Why, and this is the part worth remembering.** `head_2d_feat` and
+`head_2d_logits` are **shared across all 70 queries**, applied per token. For
+the output to differ per keypoint, query *k*'s feature must encode keypoint *k*
+— and the only thing that ever forced that was the 2D loss. Detach it and the
+70 query features are shaped solely by what helps the *global* token through
+self-attention, where per-keypoint identity is worth nothing. They converge on
+each other and the shared head has nothing left to distinguish. Nothing in the
+objective pushes it back, so more epochs do not recover it.
 
-This is a **trade-off, not a free win**: `joints_2d` is a real deployed output
-(`instanthmr/inference.py` consumes `outs[3]`), despite this file's module
-docstring calling the head training-only. Watch `2d` and `simcc` in the epoch log
-— if they regress materially, the flag has cost you the 2D product to buy 3D
-accuracy.
+An earlier note in this file claimed the queries "stay alive and become free
+capacity for the token the parameters are read from". Alive, yes. Still
+keypoint-specific, no.
 
-### What it does not do
+**Two secondary lessons.**
 
-It does not kill the 70 keypoint queries. They still receive gradient through the
-decoder's self-attention with the global token, so they stay alive and become
-free capacity for the token the parameters are read from — they simply stop being
-*forced* to encode 2D image-plane positions.
+*Early epochs lied.* At epoch 9 `dt` led by 5.6 mm J14 PA. By epoch 84 it
+trailed. `OneCycleLR(pct_start=0.1)` peaks at epoch 30 of 300, and an arm
+spending less on the fast-converging 2D task looks good before the LR anneals.
+Do not read a 300-epoch A/B before the peak.
 
-### Verified
+*The entropy argument behind it was wrong.* `loss_2d_simcc` sits at 2.227 nats
+against an irreducible floor of 2.112 — the entropy of its own Gaussian soft
+label at `sigma = 2 * bin_w`, computed directly. That was read as "only 5.2% of
+the term is reducible, so the task is 95% converged". It does not follow:
+`CE = H(target) + KL(target || prediction)` and `H` is a constant with **zero
+gradient**, so the ratio says nothing about how much of the *learnable* part is
+left. The learnable part is the whole of `KL = 0.115` nats. Use the floor only
+as a scale for reading the `simcc` column — subtract 2.112 to get what the model
+is actually graded on. The gradient measurements above are independent of this
+and still stand.
 
-Flag off is **bit-identical** to the pre-flag code: all five forward tensors
-match to `0.000e+00` over 32 augmented `--preset v2` samples. Flag on leaves
-every forward value unchanged (so the ONNX graph and the deployed output are
-untouched) and takes the 2D losses' gradient into the trunk from `1.9778` to
-exactly `0.000000`, while the 2D head's own gradient is unchanged at `0.8389`.
-Neither mode leaves any parameter without a gradient, so DDP does not need
-`find_unused_parameters`.
-
-### Evidence, and its limits
-
-In a 1500-step fine-tune from `b3_s1` on COCO+AIC, scored on held-out 3DPW crops
-against the teacher (body-30 PA-MPJPE, mm):
-
-| arm | start | 1500 | delta |
-|---|---|---|---|
-| control | 42.34 | 42.13 | −0.21 |
-| **`--detach-2d-head`** | 42.34 | **41.57** | **−0.77** |
-| 2D losses x0.1 | 42.34 | 41.91 | −0.43 |
-| control at LR/4 (step-size control) | 42.34 | 42.47 | +0.13 |
-
-The ordering is monotone in how much 2D gradient reaches the trunk, and the LR
-arm rules out "it just took smaller steps". But 0.5-0.9 mm on one seed from an
-already-converged checkpoint is well inside the 34-49 mm seed spread this repo
-sees, so treat it as a direction to test, not a result. The real test is a
-from-scratch pair of seeds against a matched control.
-
-### The underlying finding
-
-The teacher's own labels in `data/sam3d_gt_3dpw` are **14.5 mm** J14+adapter
-PA-MPJPE from real 3DPW MoCap (sequence-holdout adapter; 12.5 with the shipped
-one), and `b3_s1` disagrees with those labels by **28.5-31.1 mm on COCO / AIC /
-MPII, which it trained on** (39.8 mm on held-out 3DPW). That is underfitting, not
-label noise: there is no variance shrinkage (per-joint student/teacher variance
-ratio 0.94-1.06), the per-frame noise floor is only 10.9 mm (teacher 3.9, real
-motion 7.3 between adjacent 30 fps frames), and averaging over the mirror and
-rotation symmetries makes the error *worse* (46.3 vs 39.9 mm). A frozen-trunk
-probe study says it is not the readout either: a plain `Linear` on the global
-token scores 41.8 mm against 49.9 for an MLP reading all 71 tokens.
-
-Caveat on the ceiling: those teacher labels were fit with ground-truth access, so
-14.5 mm is not a reachable monocular target. Published monocular SOTA (~36-38 mm)
-is the practical floor.
+**If you want the trunk's capacity back, the cost is not the head.** It is
+0.025 of ~10.8 GFLOPs, 0.23%. The 15.7% is the **70 decoder queries** that feed
+it, and removing those is a different architecture that no run has tested. See
+`docs/todo.md`.
 
 ## The reported number
 

@@ -136,11 +136,16 @@ score dropped frames at a fixed penalty so the population is constant.
 The graph emits 2D keypoints two ways, and only one is measured today:
 
 1. `joints_2d` — the SimCC head. This is what `benchmark/eval_coco.py` scores
-   (`p.joints_2d[COCO17_FROM_MHR70]`) and what `--detach-2d-head` degrades.
+   (`p.joints_2d[COCO17_FROM_MHR70]`).
 2. `mhr_params` + `cam_trans` -> forward kinematics -> project with the focal.
-   Governed by `loss_reproj`, which the `dt` runs leave **unchanged** to within
-   seed noise, so the trunk has not lost image-plane localisation — only the
-   SimCC readout of it has.
+   Governed by `loss_reproj`.
+
+The detach experiment is what makes this worth measuring: it showed the two
+routes are genuinely independent. `loss_reproj` was unchanged between the arms
+to within seed noise while the SimCC head collapsed to a point, so the trunk
+kept its image-plane localisation and only the readout lost it. Route 2 may
+therefore be usable when route 1 is not — see
+`instanthmr_distill_train/README.md` §"Tried and rejected".
 
 The logged columns cannot settle which is better: `loss_reproj` is an L1 with
 fingers down-weighted to 0.2 and `w_reproj = 0.5` folded in, while
@@ -159,8 +164,7 @@ make.** The head is 0.025 of ~10.8 GFLOPs — 0.23%, nothing. The cost is in the
 different architecture that no run has tested, and the standing hypothesis is
 that they *help* the global token via self-attention. Sequence: finish the
 runs, score both routes, then a separate ablation with the 70 queries removed.
-Dropping `loss_2d_simcc` / `loss_2d_native` under `--detach-2d-head` is the one
-free part — they already contribute exactly zero trunk gradient there.
+(`--detach-2d-head` is gone; it was tried and rejected, see the trainer README.)
 
 ### 6. `n_repair` overstates successful updates
 

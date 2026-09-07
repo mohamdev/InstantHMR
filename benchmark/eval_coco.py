@@ -135,6 +135,11 @@ def main():
     summary = {
         "num_samples": len(kept),
         "mean_OKS": float(np.nanmean(sample_oks)),
+        # 0.05 is the threshold most 2D-pose papers quote; 0.1/0.2 are kept so
+        # older reports in benchmark/results/ stay comparable. All three are
+        # normalised by the BBOX DIAGONAL -- a paper normalising by head
+        # segment (PCKh) or torso is not comparable at the same threshold.
+        "PCK@0.05_bboxdiag": M.pck2d(pred_kp, gt_xy, valid, diag, 0.05),
         "PCK@0.1_bboxdiag": M.pck2d(pred_kp, gt_xy, valid, diag, 0.1),
         "PCK@0.2_bboxdiag": M.pck2d(pred_kp, gt_xy, valid, diag, 0.2),
         "NME_bboxdiag": M.nme2d(pred_kp, gt_xy, valid, diag),
@@ -142,11 +147,12 @@ def main():
     per_kp = {}
     for i, name in enumerate(J.COCO17_NAMES):
         v = valid[:, i]
+        d_i = (np.linalg.norm(pred_kp[v, i] - gt_xy[v, i], axis=-1) / diag[v]
+               if v.any() else None)
         per_kp[name] = {
             "n": int(v.sum()),
-            "PCK@0.1": float("nan") if not v.any() else
-            float((np.linalg.norm(pred_kp[v, i] - gt_xy[v, i], axis=-1)
-                   / diag[v] < 0.1).mean()),
+            "PCK@0.05": float("nan") if d_i is None else float((d_i < 0.05).mean()),
+            "PCK@0.1": float("nan") if d_i is None else float((d_i < 0.1).mean()),
         }
 
     # --- OKS AP through the official evaluator ---------------------------
@@ -180,7 +186,8 @@ def main():
           f"AP50 {summary['oks_ap']['AP50']*100:6.2f}   "
           f"AP75 {summary['oks_ap']['AP75']*100:6.2f}")
     print(f"  mean OKS    {summary['mean_OKS']:6.4f}")
-    print(f"  PCK@0.1     {summary['PCK@0.1_bboxdiag']*100:6.2f} %   "
+    print(f"  PCK@0.05    {summary['PCK@0.05_bboxdiag']*100:6.2f} %   "
+          f"PCK@0.1 {summary['PCK@0.1_bboxdiag']*100:6.2f} %   "
           f"PCK@0.2 {summary['PCK@0.2_bboxdiag']*100:6.2f} %")
     print(f"  NME         {summary['NME_bboxdiag']:6.4f}  (bbox-diagonal units)")
     print("=" * 68)
