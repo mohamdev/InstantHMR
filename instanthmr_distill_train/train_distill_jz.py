@@ -139,6 +139,59 @@ def dataset_of(npz_path: Path) -> str:
 INDEX_VERSION = 2
 
 
+class PairIndex:
+    """(image, npz) pairs held as numpy byte arrays instead of Path objects.
+
+    A plain ``list`` of 4.2 M ``(PosixPath, PosixPath)`` tuples is ~2 GB of
+    Python objects, and `build_jz_loaders` runs `persistent_workers=True` with
+    9 workers per rank -- 36 forked processes per node. Fork gives them
+    copy-on-write pages, but CPython writes a refcount into an object's header
+    just to *read* it, so every worker steadily converts the shared index into
+    a private copy of itself. Measured on Jean Zay: 74-76 GiB resident per node
+    against a 160 GB cgroup, and the OOM-killer firing mid-epoch at epochs
+    14-33 with no Python traceback.
+
+    Three contiguous numpy arrays carry no per-element refcounts, so a fork
+    shares them and keeps sharing them. Paths are rebuilt on access -- ~2 us
+    against a ~6 ms __getitem__, i.e. free.
+
+    Indexing and iteration yield the same ``(Path, Path)`` tuples the list did,
+    so `build_mixture_weights`, `__len__` and `__getitem__` are unchanged.
+    """
+    __slots__ = ("root", "_sub", "_stem", "_ext")
+
+    def __init__(self, root, entries):
+        self.root = Path(root)
+        # 'S' (bytes) not 'U': numpy stores UTF-32 for 'U', 4x the memory, and
+        # these are filesystem paths that round-trip through UTF-8 exactly.
+        self._sub = np.array([e[0] for e in entries], dtype="S")
+        self._stem = np.array([e[1] for e in entries], dtype="S")
+        self._ext = np.array([e[2] for e in entries], dtype="S")
+
+    def __len__(self):
+        return len(self._stem)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            # Stay compact through --max_images too, or the one configuration
+            # that slices is the one that reintroduces the Path list.
+            out = PairIndex.__new__(PairIndex)
+            out.root = self.root
+            out._sub, out._stem, out._ext = self._sub[i], self._stem[i], self._ext[i]
+            return out
+        sub = self._sub[i].decode(); stem = self._stem[i].decode()
+        d = self.root / sub
+        return (d / "images" / f"{stem}{self._ext[i].decode()}",
+                d / "annotations" / f"{stem}.npz")
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def nbytes(self):
+        return self._sub.nbytes + self._stem.nbytes + self._ext.nbytes
+
+
 def _index_fingerprint(data_root: Path) -> list:
     """Cheap identity for the corpus: the sub-folders and their mtimes.
 
@@ -173,9 +226,7 @@ def build_pair_index(data_root: str, cache: Path | None = None,
             with cache.open("rb") as fh:
                 blob = pickle.load(fh)
             if blob.get("version") == INDEX_VERSION and blob.get("fingerprint") == fp:
-                pairs = [(root / sub / "images" / f"{stem}{ext}",
-                          root / sub / "annotations" / f"{stem}.npz")
-                         for sub, stem, ext in blob["entries"]]
+                pairs = PairIndex(root, blob["entries"])
                 # One stat() against millions saved. Catches a cache written by
                 # an older build whose stored sub-folder does not round-trip
                 # under this data_root -- silently wrong paths would otherwise
@@ -186,7 +237,8 @@ def build_pair_index(data_root: str, cache: Path | None = None,
                            f"{root} (first entry {pairs[0][0]}) — rebuilding")
                     raise FileNotFoundError(cache)
                 log_fn(f"  pair index: {len(pairs):,} crops from cache {cache} "
-                       f"(built {blob.get('built', '?')})")
+                       f"(built {blob.get('built', '?')}, "
+                       f"{pairs.nbytes()/2**20:.0f} MiB resident)")
                 return pairs
             log_fn(f"  pair index: {cache} is stale (corpus changed) — rebuilding")
         except Exception as e:                      # truncated / half-written
@@ -217,7 +269,9 @@ def build_pair_index(data_root: str, cache: Path | None = None,
         # again next time. Say so rather than dying an hour into startup.
         log_fn(f"  pair index: could NOT cache to {cache} ({e}); "
                f"every job will repeat the scan")
-    return ds.pairs
+    # Return the compact form, not ds.pairs: a cold start must not be the one
+    # configuration that still hands 4.2 M Path objects to 36 forked workers.
+    return PairIndex(root, entries)
 
 
 def build_mixture_weights(dataset, mix: str | None) -> tuple[torch.Tensor, str]:
@@ -848,8 +902,26 @@ def train(args, cfg, rank, local_rank, world):
             raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
                 dpw_raw["J14_MPJPE"], dpw_em["J14_MPJPE"])
 
+        # Peak GPU across ALL ranks, not just rank 0.  Rank 0 is not the
+        # hungriest rank: on 2026-09-08 four gen-6 jobs died of CUDA OOM on a
+        # 16 GB V100 reporting 14.99 GiB allocated, while this line -- rank 0
+        # only -- printed a flat 9.3 GiB for 32 straight epochs.  The "measured
+        # peak use is 9.3 GiB" note that justified running without
+        # --constraint=v100-32g came from exactly this blind number.
+        _pk = torch.cuda.max_memory_allocated() / 2**30
+        pk_max, pk_rank = _pk, 0
+        if dist.is_initialized() and world > 1:
+            t = torch.tensor([_pk], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            pk_max = float(t.item())
+            # Which rank owns the max, so a lopsided rank is named not guessed.
+            r = torch.tensor([rank if abs(_pk - pk_max) < 1e-6 else world],
+                             device=device)
+            dist.all_reduce(r, op=dist.ReduceOp.MIN)
+            pk_rank = int(r.item())
         log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}"
-            f" | peak GPU {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+            f" | peak GPU {pk_max:.1f} GiB (max over {world} rank(s), "
+            f"rank {pk_rank}; rank 0 {_pk:.1f})")
         log(f"   train  total {tr['total']:.4f} | 3d {tr['3d']:.4f} | "
             f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f} | "
             f"reproj {tr['reproj']:.4f} | cam {tr['cam']:.4f} "

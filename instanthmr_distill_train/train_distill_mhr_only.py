@@ -545,7 +545,13 @@ class SAM3DStudentDataset(Dataset):
         # startup, so having every DDP rank redo it is the largest fixed cost of
         # a cluster run. See build_pair_index() in train_distill_jz.py.
         if pairs is not None:
-            self.pairs = list(pairs)
+            # Keep a compact index (train_distill_jz.PairIndex) AS IS. Calling
+            # list() on it would materialise 4.2 M Path pairs -- ~2 GB of Python
+            # objects that 36 forked dataloader workers then copy page by page
+            # through refcount writes, which is what OOM-killed four Jean Zay
+            # jobs at 74-76 GiB. Only copy a real list, which is the local /
+            # single-process path and small.
+            self.pairs = list(pairs) if isinstance(pairs, (list, tuple)) else pairs
             print(f"  Prebuilt index: {len(self.pairs)} (image, npz) pairs "
                   f"(augment={augment}).")
             return

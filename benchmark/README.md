@@ -2,15 +2,15 @@
 
 Evaluation harness for publishing numbers on `models/instanthmr_mhr_only_ckpt90.onnx`.
 
-Two benchmarks are implemented, chosen because they are the two cheapest paths
-to a credible table — one 3D, one 2D:
+Three benchmarks are implemented — two 3D, one 2D:
 
 | Benchmark | What it measures | Data cost | Status |
 |---|---|---|---|
 | **3DPW** test | MPJPE / PA-MPJPE, the standard in-the-wild 3D HMR metric | 4.6 GB images + 30 MB GT + 500 MB SMPL | ready — published-protocol GT; **check contamination below** |
+| **EMDB-1** | MPJPE / PA-MPJPE on the 24 SMPL joints, the "EMDB (24)" column | 16 GB images (of a 50 GB download) + 7 MB GT | ready — **and genuinely clean**, see below |
 | **COCO** val2017 | OKS AP / PCK, 2D keypoint localisation in the wild | 820 MB, direct download, no registration | ready — clean |
 
-## Why these two
+## Why these three
 
 **3DPW** is the benchmark essentially every monocular HMR paper reports, so it
 is the one that makes your numbers comparable. The GT pickles store
@@ -19,6 +19,14 @@ tempting and wrong — published numbers use SMPL run *forward* on the GT
 `poses`/`betas` with the Human3.6M regressor applied to the vertices. The two
 references are **46 mm apart in J12 PA-MPJPE**, so the harness builds the real
 one once with `make_3dpw_gt.py` and scores against that.
+
+**EMDB-1** is the newer of the two 3D benchmarks and the one this repo can
+report honestly. Every recent paper carries an "EMDB (24)" column (SAM 3D Body
+Table 2, NLF Table 3, Fast SAM 3D Body Table 1), it is out-of-domain for almost
+all of them, and — unlike 3DPW — **no EMDB frame appears in any corpus this
+repo trains on**, so it is the only 3D number here with no contamination
+caveat attached. It is structurally a simpler 3DPW: one subject per sequence,
+provided person boxes, real calibration.
 
 **COCO val2017** needs no registration at all and the joint mapping is free:
 MHR70 indices 0–14 already follow COCO's ordering, with the wrists at 41/62.
@@ -36,15 +44,12 @@ MHR70 indices 0–14 already follow COCO's ordering, with the wrists at 41/62.
   out-of-domain for every method in it.
 - **MPII** — 2D only, so it adds little once COCO is in.
 
-### Next: EMDB — waiting on registration (asked 2026-09-05)
+### EMDB-1 — the joint convention, settled against the data
 
-**Status: blocked on the application at `emdb.ait.ethz.ch`** (a form, approved
-by email). Nothing else is missing — the two blockers this file used to list,
-the SMPL body model and their toolkit, are gone: `benchmark/data/smpl/` holds
-the gendered models and the toolkit is only a viewer, not a format we need.
-
-Use **EMDB-1** (17 sequences, 13.5 min), the camera-frame pose split every paper
-reports. EMDB-2 (25 sequences) is global-trajectory and not what this model does.
+Use **EMDB-1** (17 sequences, 24,323 frames), the camera-frame pose split every
+paper reports. EMDB-2 (25 sequences) is global-trajectory and not what this
+model does. Three sequences are in both; `benchlib/emdb.py` selects on the
+pickles' own `emdb1` flag and asserts it finds exactly 17.
 
 It is structurally a simpler 3DPW, one subject per sequence:
 
@@ -56,33 +61,119 @@ It is structurally a simpler 3DPW, one subject per sequence:
 | `bboxes` (N,4) xyxy — **provided** | derived from projected joints |
 
 `betas` is 10-dim, exactly the count the published protocol uses, so
-`make_3dpw_gt.py`'s forward pass drops in unchanged.
+`make_3dpw_gt.py`'s forward pass drops in unchanged, and EMDB's `gender` field
+picks the same gendered pair 3DPW needs.
 
 **The protocol is the 24 SMPL joints, mid-hip aligned — not the H36M
 regressor.** NLF's Table 3 reads "Results on EMDB1 (24j)" and its metrics
 section states that "on 3DPW and EMDB the reference point is the midpoint
 between the two hip joints"; SAM 3D Body's Table 2 column header is "EMDB (24)".
-Those 24 joints are what `smpl_forward` already returns as its second output.
 
-Two things already done, so the integration is a loader and nothing else:
+**Which 24, though — and which way the extrinsics point — came from the data,
+not the docs.** Both would have produced quietly wrong numbers rather than a
+crash, and EMDB's own `kp2d` field settles both at once, because it is the 24
+joints already projected:
 
-- `benchmark/results/adapter_smpl24_teacher.npz` — the MHR70 → SMPL-24
-  conversion, fitted the same student-free way as the J14 one, from 22,209
-  teacher/GT pairs on 3DPW train (where `jointPositions` **is** the SMPL-24 set,
-  verified to 0.001 mm). Reads anatomically: `pelvis = 0.38 right_hip + 0.34
-  left_hip`, `left_knee = 0.93 left_knee`, `left_ankle` from heel + ankle + toe.
-- **The conversion floor: 25.11 mm MPJPE / 18.77 mm PA-MPJPE** on a held-out
-  half. That is what an MHR-rigged model carries on a 24-joint benchmark before
-  it makes a single mistake — an *upper* bound, since it also contains the
-  teacher's own 3DPW error, which cannot be separated without perfect MHR GT.
-  Quote it next to the result: the table it joins runs 61.7 (SAM 3D Body) to
-  118.5 (HMR2.0b) MPJPE, so ~25 mm of rig overhead is material.
+| hypothesis | reprojection error vs `kp2d` |
+|---|---|
+| `extrinsics` as world→camera, **kinematic** joints | **0.00 px** ✅ |
+| `extrinsics` as world→camera, `J_regressor @ vertices` | 1.04 px |
+| `inv(extrinsics)` as world→camera | 3477 px, every joint behind the camera |
 
-What is left is `benchlib/emdb.py`, ~80 lines mirroring `threedpw.py`. It was
-deliberately **not** written ahead of the data: `dataset.md` does not say
-whether `extrinsics` is world→camera or camera→world, and guessing wrong gives
-quietly wrong numbers rather than a crash. Thirty seconds with a real pkl
-settles it.
+So `extrinsics` is world→camera (3DPW's sense), and "EMDB (24)" means the SMPL
+**kinematic-tree** joints — `smpl_forward`'s second output — not the regressed
+ones, which sit 3.8 mm away on average and 19.3 mm at worst. This is the same
+distinction that bites on 3DPW, pointing the other way: there the published GT
+*is* the regressed one.
+
+`make_emdb_gt.py --check` re-runs that comparison over all 24,323 frames and
+reports **0.0024 px mean / 0.095 px max**, which certifies the SMPL forward, the
+gendered model choice, the beta padding and the world frame in one number.
+
+**The MHR70 → SMPL-24 adapter is required, not optional.** Ten of SMPL's 24
+joints — the three spines, the collars, the feet, the hands — have no MHR
+landmark at all, so there is no raw row to fall back on.
+`benchmark/results/adapter_smpl24_teacher.npz` is the student-free conversion,
+fitted by `fit_adapter_mhr.py --target smpl24` from 22,209 annotation/GT pairs
+on 3DPW **train** (where `jointPositions` **is** the SMPL-24 kinematic set,
+verified to 0.001 mm). EMDB is a different dataset, so it is a real holdout.
+It reads anatomically: `pelvis = 0.38 right_hip + 0.34 left_hip`, `left_knee =
+0.93 left_knee`, `left_ankle` from heel + ankle + toe.
+
+**The conversion floor: 25.11 mm MPJPE / 18.77 mm PA-MPJPE** on a held-out half.
+That is what an MHR-rigged model carries on a 24-joint benchmark before it makes
+a single mistake, using this linear conversion. Quote it next to the result: the table it joins runs 61.7 (SAM 3D Body) to 118.5 (HMR2.0b)
+MPJPE, so ~25 mm of rig overhead is material.
+
+### Two routes into SMPL space, and why the mesh one wins
+
+The linear adapter above converts *joints*. `benchmark/eval_smpl_fit.py`
+converts the **mesh** instead — the route SAM 3D Body and Fast SAM 3D Body use
+for this same rig — which lowers the conversion floor ~2x and is the only way
+to reach PVE at all:
+
+| conversion | MPJPE floor | PA-MPJPE floor | PVE floor |
+|---|---|---|---|
+| linear MHR70 → SMPL24 adapter | 25.11 | 18.77 | not possible |
+| **mesh fit** (`eval_smpl_fit.py`) | **11.44** | **10.66** | **13.61** |
+
+Measured as a round trip through the rig: GT SMPL → fit MHR to that surface →
+convert back → score against the untouched GT. Every stage is cold-started, so
+this is the floor the evaluator actually operates at, not a best case.
+
+**The direction is the part that makes it publishable.** The prediction is
+fitted into SMPL and the ground truth is left exactly as the benchmark defines
+it, so MPJPE/PA-MPJPE/PVE mean what they mean in every published table. The
+tempting inverse — solving an MHR ground truth for EMDB and scoring in MHR
+space — removes the conversion entirely and is **not** a comparable number: it
+changes the joint set (MPJPE is not rig-independent), it averages error over 40
+finger joints millimetres apart, and it scores against a reference we generated
+with an optimiser told to look like an MHR model, so whatever MHR cannot
+represent silently leaves the error term. Keep that as a diagnostic if you want
+it; do not put it in the table.
+
+**Three components, and the one that was hard.**
+
+1. The student's MHR parameters → the rig's own 18,439-vertex mesh.
+2. **Meta's official barycentric surface map**
+   (`facebookresearch/MHR`, `tools/mhr_smpl_conversion/assets`, Apache-2.0) →
+   the same surface resampled in SMPL topology. Copy
+   `{mhr2smpl,smpl2mhr}_mapping.npz` into
+   `benchmark/data/mhr_smpl_conversion/`.
+3. A labelled fit for SMPL `theta`/`beta`/`trans`.
+
+Step 2 is what makes step 3 tractable, and it is worth being explicit about
+why. Fitting the surface by ICP has to *discover* the correspondence, and its
+search has a local minimum that its own residual cannot detect: the mesh
+settles overlapping the target while limbs are matched to the **wrong limbs**,
+which measured a healthy-looking 12 mm surface residual alongside 76 mm
+PA-MPJPE. Three attempts to build a correspondence here all failed — a mean
+offset in camera space is not pose-invariant (60 mm), an affine combination of
+the K nearest MHR vertices is ill-conditioned because a local neighbourhood on
+a smooth mesh spans a tangent plane and leaves the normal unresolved (65 mm,
+weights reaching 405), and a surface-frame offset is sensitive to
+under-converged fits. With the official map, correspondence is **known** —
+vertex i pairs with vertex i — and the failure mode does not exist.
+
+Verify the map against this rig before trusting it: triangle ids top out at
+36,871 against the rig's 36,874 faces, barycentric rows sum to 1, and the
+reconstructed SMPL-topology mesh has a mean nearest-vertex spacing of 13.88 mm
+against real SMPL's 14.37 mm. A map built for a different mesh would scatter
+neighbouring vertices onto unrelated triangles.
+
+**PVE is the first metric in this repo that can see body shape at all.** The
+45 MHR `shape_params` move the 127-joint skeleton by exactly `0.00e+00 cm`, so
+every joint metric here — MPJPE, PA-MPJPE, the adapter rows, the training
+losses — is blind to identity by construction (see the note in `CLAUDE.md`).
+The mesh conversion feeds those parameters into `MHRRig.vertices`, so they
+reach the SMPL surface and PVE responds to them. If `--w-verts` is doing
+anything, this is the benchmark row where it shows up.
+
+One more detail in step 3: **solve the global orientation in closed form.**
+Known correspondence makes that a plain Procrustes between SMPL's rest mesh and
+the target. Without it, Adam starts from identity and has to walk the whole way
+through axis-angle, and the same fit stalls at 40-51 mm of vertex residual
+instead of 13 mm.
 
 ## Setup
 
@@ -125,7 +216,51 @@ this is a one-time step, not something to repeat per checkpoint:
 ```bash
 python benchmark/fit_adapter_mhr.py \
     --sequence-dir /path/to/3DPW/sequenceFiles \
-    --out benchmark/results/adapter_j14_h36m_teacher.npz
+    --target j14 --out benchmark/results/adapter_j14_h36m_teacher.npz
+```
+
+### EMDB
+
+Registration is a form at `emdb.ait.ethz.ch`, approved by email; the download is
+ten per-subject zips, 50 GB. **Only EMDB-1 is needed** — 17 of the 81 sequences,
+16 GB of images — so unpack selectively rather than extracting all ten zips:
+
+```python
+# python3, from the download directory
+import zipfile, pickle
+out = '/path/to/EMDB'
+for p in range(10):
+    z = zipfile.ZipFile(f'P{p}.zip')
+    for n in z.namelist():                      # pass 1: the annotations
+        if n.endswith('.pkl'):
+            z.extract(n, out)
+want = {'/'.join(f.split('/')[-3:-1])
+        for f in __import__('glob').glob(out + '/P*/*/*.pkl')
+        if pickle.load(open(f, 'rb'))['emdb1']}
+for p in range(10):                             # pass 2: only EMDB-1 frames
+    z = zipfile.ZipFile(f'P{p}.zip')
+    for i in z.infolist():
+        if i.filename.endswith('.jpg') and '/'.join(i.filename.split('/')[:2]) in want:
+            z.extract(i, out)
+```
+
+Then build the GT — the same gendered SMPL models as 3DPW, nothing new to fetch:
+
+```bash
+python benchmark/make_emdb_gt.py --emdb-root /path/to/EMDB \
+    --smpl-dir benchmark/data/smpl --check
+```
+
+That writes `<EMDB root>/gt_smpl24/emdb1.npz` (7 MB, 24 world joints per frame).
+`--check` must print a reprojection error of ~0.00 px against EMDB's `kp2d`; a
+larger number means the extrinsics or the joint convention moved.
+
+The MHR70 → SMPL-24 adapter is fitted once, from 3DPW train, student-free:
+
+```bash
+python benchmark/fit_adapter_mhr.py \
+    --sequence-dir /path/to/3DPW/sequenceFiles \
+    --target smpl24 --out benchmark/results/adapter_smpl24_teacher.npz
 ```
 
 ## Running
@@ -152,7 +287,30 @@ python benchmark/eval_3dpw_ckpt.py \
     --adapter benchmark/results/adapter_j14_h36m_teacher.npz
 ```
 
-Both write a JSON report to `benchmark/results/`.
+```bash
+# EMDB-1, all 17 sequences (~4 min on an RTX 4070). --adapter defaults to the
+# committed SMPL-24 map, so the short form is the full protocol.
+python benchmark/eval_emdb_ckpt.py \
+    --ckpt instanthmr_distill_train/runs/*/*/best_student_model_v3.pth \
+    --emdb-root /path/to/EMDB \
+    --out benchmark/results/emdb1.json
+
+# ...and again with EMDB's own person boxes, which is what published
+# "Oracle: annotated bounding boxes" rows use. State which one you quote.
+python benchmark/eval_emdb_ckpt.py --ckpt <ckpt> --emdb-root /path/to/EMDB \
+    --bbox annotated
+```
+
+```bash
+# EMDB-1 in SMPL space via the mesh conversion: MPJPE, PA-MPJPE and PVE.
+# ~25 min for all 24,103 frames on an RTX 4070 (fit is 16 min of that).
+python benchmark/eval_smpl_fit.py \
+    --ckpt instanthmr_distill_train/runs/*/*/best_student_model_v3.pth \
+    --emdb-root /path/to/EMDB --fit-batch 128 \
+    --out benchmark/results/emdb1_smplfit.json
+```
+
+All four write a JSON report to `benchmark/results/`.
 
 ### The evaluator configures itself from the checkpoint (fixed 2026-09-06)
 
@@ -189,7 +347,9 @@ landscape ones) — not a heuristic. The naive `sqrt(H^2+W^2)` stand-in would be
 2202.9 px, 12% high. `eval_3dpw.py` (the ONNX path) now passes the same
 per-frame focal through `benchlib/runner.py`.
 
-## Current numbers (2026-09-05)
+## Current numbers
+
+### 3DPW (2026-09-05)
 
 3DPW **test**, all 35,463 person-frames, published-protocol GT, the two Jean Zay
 checkpoints pulled at ~epoch 130. Full reports in
@@ -211,6 +371,104 @@ only numbers here that are genuinely held out: both checkpoints were trained on
 Jean Zay, whose corpus is coco/mpii/aic/sa1b/harmony4d with `3dpw_train`
 annotations-only, so all 24 test sequences are unseen. The local `data/` corpus
 is **not** clean — see the contamination section.
+
+### EMDB-1 (2026-09-07)
+
+All 17 EMDB-1 sequences, all 24,103 evaluatable frames (24,323 total, minus 206
+where `good_frames_mask` is 0 and 14 where the subject is under 60 % inside the
+frame), `b3_s1` at epoch 137 — the same checkpoint as the 3DPW table above.
+Reports in `benchmark/results/emdb1_b3_s1_{gt-joints,annotated}.json`.
+
+| person box | **SMPL24+adapter PA** | SMPL24+adapter MPJPE | PCK@50 | PCK@100 |
+|---|---|---|---|---|
+| projected GT joints ×1.2 (this repo's 3DPW convention) | **53.82** | 79.90 | 0.632 | 0.900 |
+| EMDB's own `bboxes` (published "Oracle" protocol) | **60.69** | 87.51 | 0.582 | 0.863 |
+| *rig conversion floor (teacher, held-out half)* | *18.77* | *25.11* | | |
+
+Where that sits in the published EMDB (24) table — Fast SAM 3D Body Table 1,
+which is the most recent one carrying every baseline:
+
+| method | PA-MPJPE | MPJPE |
+|---|---|---|
+| Fast SAM 3D Body (oracle) | 37.3 | 64.3 |
+| SAM 3D Body (oracle) | 38.2 | 61.7 |
+| NLF-L +fit | 40.9 | 68.4 |
+| PromptHMR | 41.0 | 71.7 |
+| GENMO | 42.5 | 73.0 |
+| CameraHMR | 43.3 | 70.3 |
+| TRAM | 45.7 | 74.4 |
+| WHAM | 50.4 | 79.7 |
+| **InstantHMR b3_s1** | **53.8 / 60.7** | **79.9 / 87.5** |
+| SMPLer-X-H | 64.5 | 92.7 |
+| HMR2.0b | 79.2 | 118.5 |
+
+Read that with the 18.8 mm conversion floor in mind: those baselines all predict
+SMPL directly and pay no rig-conversion cost, and the floor already contains the
+teacher's own error. It is not separable from the model's error without perfect
+MHR ground truth, so the honest statement is "53.8 mm, of which up to 18.8 mm is
+the MHR→SMPL conversion", not a corrected number.
+
+**The box convention is worth 6.9 mm, so state it.** EMDB's own boxes are 17.5 %
+larger than the projected-joint boxes (mean crop side 1248 vs 1069 px) and their
+centre sits 5.7 % of a crop away, so the person lands ~15 % smaller and
+off-centre in a 224² crop the model was trained to see filled. That is framing
+sensitivity, not a modelling difference — but it means the row that belongs next
+to the published "Oracle" numbers is the 60.69 one, and the 53.82 one is what
+compares to this repo's own 3DPW numbers.
+
+**The whole EMDB path was cross-checked against 3DPW.** Scoring the same
+checkpoint on 3DPW test under the *same* GT convention (`--gt jointpositions`,
+i.e. SMPL kinematic joints) gives J14 PA 55.81 / J12 PA 49.26, against EMDB-1's
+60.17 / 55.55 on the identical rows. A 4-6 mm gap is what a harder dataset
+looks like — EMDB has handstands, cartwheels and dancing where 3DPW mostly
+walks. A wrong extrinsics sense or a mismatched joint convention would show up
+as hundreds of millimetres, not four.
+
+**EMDB is the one clean 3D number here.** The corpus is coco / mpii / aic / sa1b
+/ harmony4d / 3dpw; no EMDB frame appears in any of it, at any split. Contrast
+the 3DPW section below, where the local corpus contains crops from all 24 test
+sequences.
+
+Hardest sequences are the ones you would guess: `P5_42_indoor_dancing` (75.4 mm)
+and `P8_68_outdoor_handstand` (75.0 mm), against 44.5 mm on `P1_14_outdoor_climb`.
+Per-joint, the error is concentrated in the extremities the adapter has to
+extrapolate — `left/right_hand` at 97-98 mm and the wrists at 79-82 mm, against
+30-40 mm at the collars, neck, pelvis and hips.
+
+### EMDB-1, SMPL space via mesh conversion (2026-09-08)
+
+All 17 sequences, all 24,103 frames, projected-GT-joint boxes, `--fit-iters 400`.
+Report in `benchmark/results/emdb1_smplfit_gt-joints.json`.
+
+| run | epoch | MPJPE | **PA-MPJPE** | PVE | PA-PVE | mean fit residual |
+|---|---|---|---|---|---|---|
+| b3_s1 (baseline) | 137 | 77.38 | **52.00** | 92.25 | 62.57 | 14.61 |
+| bno_s0 (v2, `--cliff-focal --bound-scales`) | 85 | 79.55 | **54.23** | 94.44 | 64.82 | 14.72 |
+| *conversion floor (round trip)* | | *11.44* | *10.66* | *13.61* | | |
+
+**The two runs are not comparable to each other.** bno_s0 is at epoch 85 against
+b3_s1's 137, so this is a maturity difference as much as a configuration one —
+and with one seed per arm it would prove nothing even at matched epochs (seed
+spread in this repo is 34-49 mm on the 70-keypoint metric).
+
+Against the published EMDB (24) table (Fast SAM 3D Body Table 1), b3_s1 lands
+next to **WHAM** — ahead of it on MPJPE (77.4 vs 79.7) and PVE (92.3 vs 94.4),
+just behind on PA-MPJPE (52.0 vs 50.4) — and well ahead of SMPLer-X-H (64.5 PA)
+and HMR2.0b (79.2 PA). WHAM is a *video* method; this is single-frame.
+
+**The mesh route beats the linear adapter on 16 of 17 sequences**, mean
+−1.73 mm, with per-sequence Pearson r = 0.989 and Spearman r = 0.961 between
+the two. Two conversions sharing no machinery agreeing that closely on the
+ranking is the evidence that neither distorts the result. The gain is largest
+where the pose is unusual — `outdoor_sitting` −4.9 mm, `outdoor_climb`
+−3.8 mm — which is where a fixed linear joint map is furthest from its fitting
+distribution.
+
+Note the headline gain is only ~1.8 mm even though the conversion floor drops
+18.8 -> 10.7 mm. That is arithmetic, not disappointment: floors do not subtract
+linearly. Treating model and conversion error as independent, sqrt(50^2 +
+18.8^2) = 53.4 against sqrt(50^2 + 10.7^2) = 51.1, so ~2.3 mm predicted against
+1.8 mm observed. The real win is that **PVE exists at all**.
 
 ### What these metrics cannot see
 
@@ -252,6 +510,14 @@ projected GT joints padded by `--bbox-scale` (default 1.2), so no detector is in
 the loop. MPJPE is mid-hip-aligned; PA-MPJPE is Procrustes (scale + rotation +
 translation). Predictions use `joints_3d_local`, the rig-local pose, so the
 camera translation never enters the metric.
+
+**EMDB-1.** All 17 sequences of the `emdb1` split, every frame where
+`good_frames_mask` is set and the subject is at least 60 % inside the image.
+Metrics are over the 24 SMPL kinematic joints, aligned at the midpoint of the
+two hips (SMPL indices 1 and 2, not the `pelvis` joint), reached through the
+fixed MHR70 → SMPL-24 map fitted on 3DPW train teacher labels. PA-MPJPE is
+Procrustes with uniform scale. Person boxes: say which of the two conventions
+above you used. PVE is not reported — see the EMDB section for why.
 
 **COCO val2017.** Top-down with **ground-truth boxes**, one crop per annotated
 person with `num_keypoints ≥ 1` and `iscrowd = 0`. These AP numbers are *not*
@@ -334,13 +600,17 @@ nothing to do with model quality. The harness therefore reports three rows:
   specific to one model *and* one GT convention: applying b3_s1's to another
   checkpoint, or an `h36m` one to `jointpositions`, is meaningless.
 
-  **Fit it from the teacher, not from the student.** `--fit-adapter` uses one
+  **Fit it from the dataset annotations, not from the student.** `--fit-adapter` uses one
   checkpoint's own predictions as the input side, so the map can absorb that
   checkpoint's systematic error along with the rig offset — a different adapter
   per checkpoint, and a fair reader will call it tuning.
-  `benchmark/fit_adapter_mhr.py` instead pairs the **teacher's** MHR labels in
-  `data/sam3d_gt_3dpw` with the H36M GT on the same 3DPW train frames, giving
-  one adapter for every checkpoint that never saw a student:
+  `benchmark/fit_adapter_mhr.py` instead pairs the **released dataset's** MHR
+  labels in `data/sam3d_gt_3dpw` with the H36M GT on the same 3DPW train
+  frames, giving one adapter for every checkpoint that never saw a student.
+  (Those are `facebook/sam-3d-body-dataset` annotations built by
+  `datasets_pipeline/build_split.py`; only `data/sam3d_distill_mix` is teacher
+  inference. Earlier revisions of this file called them teacher labels — wrong,
+  and it changed what the residual below means.)
 
   ```bash
   python benchmark/fit_adapter_mhr.py --sequence-dir /path/to/3DPW/sequenceFiles \
@@ -348,7 +618,7 @@ nothing to do with model quality. The harness therefore reports three rows:
   ```
 
   That it is a rig conversion rather than an error sponge is visible two ways.
-  The teacher's own J14 error against the GT drops from **44.90 mm to 14.83 mm**
+  The annotations' own J14 error against the GT drops from **44.90 mm to 14.83 mm**
   on a held-out half — near the teacher's accuracy floor, which absorbing error
   could not reach. And every row reads anatomically:
   `right_hip = +1.16 right_hip - 0.32 left_hip` (widening SMPL's 120 mm hips
@@ -368,7 +638,13 @@ nothing to do with model quality. The harness therefore reports three rows:
 val2017 is a 5k subset of val2014, which is disjoint from train2014. Verified by
 image-id intersection: **0 of 5000** val2017 images appear in training.
 
-**3DPW test is contaminated.** `data/sam3d_gt_3dpw` holds only train sequences,
+**3DPW test is clean for every checkpoint trained on Jean Zay** — that corpus
+is coco/mpii/aic/sa1b/harmony4d plus `3dpw_train`, so the 24 test sequences are
+unseen for `b3_s1`, `v3_s1` and everything after them. The paragraph below
+applies to the **local** corpus and to `distill_mhr_only_ckpt90`, which was
+trained from it.
+
+**The local `data/` corpus is contaminated.** `data/sam3d_gt_3dpw` holds only train sequences,
 but `data/sam3d_distill_mix` contains teacher-distilled crops from **all 60**
 3DPW sequences — including all 24 test sequences (9,060 person-crops, ~28.5k
 distinct frames across the dataset). `--exclude-seen` quantifies this: it splits
@@ -386,13 +662,18 @@ report tells you how large the effect is in the meantime.
 benchmark/
   download.py        COCO fetcher + 3DPW presence check
   make_3dpw_gt.py    SMPL forward + H36M regressor -> <3DPW root>/gt_h36m/
-  fit_adapter_mhr.py MHR70 -> J14 adapter from TEACHER labels (student-free)
+  make_emdb_gt.py    SMPL forward -> <EMDB root>/gt_smpl24/ (+ a kp2d check)
+  fit_adapter_mhr.py MHR70 -> J14 / SMPL24 adapter from TEACHER labels
   eval_3dpw.py       3D from an ONNX graph: MPJPE, PA-MPJPE, PCK3D, AUC
   eval_3dpw_ckpt.py  the same, for a .pth straight out of runs/
+  eval_emdb_ckpt.py  EMDB-1 for a .pth; reuses the 3DPW crop and metrics
+  eval_smpl_fit.py   EMDB-1 in SMPL space via mesh conversion: +PVE, lower floor
+  mhr_smpl.py        the MHR rig, differentiable SMPL, and both fit directions
   eval_coco.py       2D: OKS AP/AR, mean OKS, PCK, NME, per-keypoint breakdown
   benchlib/
     joints.py        MHR70 <-> COCO17 / SMPL24 / H36M17 maps, J14 & J12 sets
     metrics.py       Procrustes alignment and the metric definitions
     threedpw.py      3DPW pickle loading, the GT switch, projection, boxes
+    emdb.py          EMDB-1 loading; extrinsics sense and the 24-joint choice
     runner.py        batched ONNX inference with overlapped image decoding
 ```

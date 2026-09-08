@@ -35,8 +35,8 @@ Usage
 
     # or point at a specific checkpoint / output
     python ./tools/pth_to_onnx.py \
-        --ckpt   ./instanthmr_distill_train/runs/bno_s0/bno_s0/best_student_model_v3.pth \
-        --output ./models/instanthmr_mhr_only.onnx
+        --ckpt   ./instanthmr_distill_train/runs/g6vv_s/g6vv_s/best_student_model_v3.pth \
+        --output ./models/instanthmr.onnx
 """
 import argparse
 import importlib

@@ -167,6 +167,34 @@ steps. Use `--anomaly-safe-fallback`, which steps on the non-FK terms instead
 divergence here by lowering the LR alone: `OneCycleLR(pct_start=0.1)` peaks at
 10% of the run, so a lower peak only moves *when* it dies.
 
+**The pair index is a host-RAM bomb, and it kills jobs with no traceback.**
+Four generation-6 jobs were OOM-killed at 74-76 GiB per node between epochs 14
+and 33 on 2026-09-08. Not CUDA -- `sacct` says `OUT_OF_ME+`, exit `0:125`,
+`Detected N oom_kill events`, and the only Python output is a dataloader worker
+dying of `ConnectionResetError`, which is the symptom. Measured: a list of
+`(PosixPath, PosixPath)` pairs costs **694 bytes per pair**, so 4.2 M crops is
+2.94 GB per process; `build_jz_loaders` runs `persistent_workers=True` with 9
+workers per rank, i.e. 40 processes per node, and CPython writes a refcount into
+an object header just to *read* it, so every worker steadily converts its
+copy-on-write share into a private copy. It grows over epochs, which is why the
+kill lands hours in. `PairIndex` in `train_distill_jz.py` stores the index as
+three contiguous numpy byte arrays instead (87 bytes/pair, 8.0x smaller,
+verified identical on all 961,139 local pairs and in iteration order). Do
+**not** call `list()` on it -- `SAM3DStudentDataset` copies only real lists for
+exactly this reason. Two corollaries: adding *any* per-node memory (the
+`--w-verts` subset costs ~2 GiB across 4 ranks) decides only which arm dies
+first, not whether one does; and `sacct` MaxRSS undersamples at ~30 s, so a
+number well under the `mem=160000M` cgroup limit does not mean you are safe.
+
+**rsync to the cluster lands files where you point it, and a misplaced trainer
+fails silently.** `rsync ... a/b.py c/d.slurm host:REPO/` puts BOTH in
+`REPO/`, not in `REPO/a/` and `REPO/c/`. A stray `train_distill_jz.py` in the
+repo root is simply never imported, so the job runs the old code and raises
+nothing -- on 2026-09-08 that silently discarded both a
+`--constraint=v100-32g` fix and a logging change for a full generation. Check
+the destination directory per file, and verify on the cluster with `grep -c
+'<a string only the new version has>'` before submitting.
+
 **Body shape is invisible to every geometric loss, and the fix is a vertex
 term.** `MHRForwardPass.get_joints` zeroes the 45 `shape_params`, and that is
 not a shortcut: they move the 127-joint skeleton by *exactly* `0.000e+00 cm`.

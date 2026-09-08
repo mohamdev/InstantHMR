@@ -339,34 +339,175 @@ angle, and check that the conditioning the dataset emits equals the conditioning
 that rolled camera would produce for the same box. Until then, do not "fix" the
 rotation — the current form is not shown to be wrong.
 
-### 12. Benchmark HGNetv2 against RepViT — after the baseline lands
+### 12. HGNetv2 vs RepViT — measured 2026-09-08; `hgnetv2_b4` is the challenger
 
-Not to be run now. `repvit_m2_3` is the incumbent and generation 6 exists to
-give it a solid, uncontaminated baseline on the five-split corpus; swapping the
-trunk at the same time would confound both questions.
+**Verdict: adopt `hgnetv2_b4` as the challenger trunk, not the biggest variant.**
+It beats `repvit_m2_3` on every axis measured, with fewer parameters (17.75 M vs
+22.40 M) and less compute (2.728 vs 4.520 GMAC in the backbone). `hgnetv2_b6`
+fits better on larger data but costs 2.9x the training time, 4.2x the mobile-CPU
+latency and quantises worse, so it is a server-side option, not a phone one.
 
-When it is time, the comparison has to cover all four axes, because a backbone
-that wins on one can lose the deployment:
+All numbers below are local, on this corpus and `checkpoints/mhr_model.pt`. The
+cluster run that decides the accuracy question has not been done — see the plan
+at the end.
 
-* **Model sizes** — which HGNetv2 variants exist and their parameter counts
-  against `repvit_m2_3`'s. `--backbone` already takes any timm name, and
-  `config_from_checkpoint` reads it back out of `run_config.json`, so no code
-  change is needed to try one.
-* **Accuracy** — J14 PA-MPJPE with the adapter, 2 to 3 seeds. The documented
-  seed spread is 34–49 mm on the 70-keypoint metric, so a single run proves
-  nothing.
-* **Speed** — ONNX latency on the deployment target, not PyTorch training
-  throughput. `tools/bench_student_arch.py` is the existing harness.
-* **Capabilities** — HGNetv2 is a plain conv stack where RepViT is
-  reparameterisable. Check that the export path survives (`tools/pth_to_onnx.py`
-  has a torch↔ONNX parity gate that exits if the worst output differs by more
-  than 1e-3) and that `backbone.forward_features` returns something the
-  `feat_proj` reshape accepts — the trainer handles both 4-D and 3-D feature
-  maps, but the channel count feeds `backbone_feat_dim` and that is a config
-  field, not inferred.
-* **On our data, locally** — the local corpus plus `checkpoints/mhr_model.pt` is
-  enough to run the 1-batch overfit test and a short run per backbone before
-  spending cluster time. Judge the overfit at ~1k steps.
+**Accuracy — the 1-batch overfit test, run with the gen-6 `g6v_s` config**
+(`--preset v2 --losses rebalanced --cliff-focal --bound-scales
+--anomaly-safe-fallback --crop-centre-fix`), 1000 steps, best Mesh PA-MPJPE over
+the 70 MHR keypoints. Three seeds, because a single run is inside the documented
+34–49 mm spread.
+
+| backbone | 8 crops, 3 seeds | mean | 64 crops, 2 seeds | mean |
+|---|---|---|---|---|
+| `repvit_m2_3` | 47.0 / 51.3 / 43.6 | **47.3** | 28.4 / 29.0 | **28.7** |
+| `hgnetv2_b2` | 40.3 / 43.1 / 37.6 | **40.3** | 26.7 / 24.7 | **25.7** |
+| `hgnetv2_b4` | 39.1 / 30.3 / 34.6 | **34.7** | 24.9 / 24.2 | **24.6** |
+| `hgnetv2_b6` | 34.0 / 45.6 / 35.0 | **38.2** | 23.8 / 20.5 | **22.2** |
+
+The 8-crop and 64-crop orderings disagree at the top: 8 crops is too small to
+need b6's capacity and its fixed-LR trajectory is noisy there. On 64 crops
+capacity orders monotonically. Both agree that every HGNetv2 variant tested
+fits better than `repvit_m2_3`, including b2 at 2.4x fewer parameters and 4x
+less compute.
+
+**The accuracy margin is mostly the checkpoint, not the topology.** Same test
+from random init instead of ImageNet:
+
+| backbone | ImageNet init | random init (2 seeds) |
+|---|---|---|
+| `repvit_m2_3` | 47.3 mm | 42.3 mm (43.1 / 41.4) |
+| `hgnetv2_b4` | 34.7 mm | 40.7 mm (40.5 / 40.8) |
+
+From scratch the two are 1.6 mm apart, inside seed noise. HGNetv2's timm weights
+are Baidu **SSLD** (ImageNet-22k → 1k distillation); RepViT's are the paper's.
+That is a real, free asset — it is the configuration we would train — but the
+honest claim is "better initialisation", not "better architecture for accuracy".
+Note also that RepViT fit *better* from scratch than pretrained: on an 8-crop
+memorisation task a pretrained trunk has to unlearn, which is one more reason
+this test does not settle generalisation.
+
+**Speed.** Whole student, 224 input, RTX 4070. Training is fwd+bwd+AdamW at
+batch 64; the CPU column is single-thread ONNX fp32, the closest mobile-shaped
+number available without a phone.
+
+| backbone | train B64 | peak GPU | ONNX fp16/CUDA B1 | CPU 1-thread |
+|---|---|---|---|---|
+| `repvit_m2_3` (as shipped) | 193.6 ms | 8549 MiB | 4.76 ms | 115.2 ms |
+| `repvit_m2_3` + `.fuse()` | 142.5 ms | 5347 MiB | 3.55 ms | 110.7 ms |
+| `hgnetv2_b2` | 96.5 ms | 2824 MiB | 3.98 ms | 46.9 ms |
+| `hgnetv2_b4` | **97.4 ms** | **3498 MiB** | **3.00 ms** | **72.5 ms** |
+| `hgnetv2_b6` | 315.2 ms | 9444 MiB | 4.16 ms | 302.3 ms |
+
+**Mechanism, since 2x faster on 40% fewer MACs looks wrong.** `repvit_m2_3`
+spends 105 of its convolutions on depthwise kernels that carry only 0.050 of its
+4.520 GMAC. A depthwise convolution moves a whole feature map to do one multiply
+per element, so it is bandwidth-bound and leaves tensor cores — and an NPU's MAC
+array — idle. HGNetv2 is dense 3x3 convolutions in parallel branches that get
+concatenated: high arithmetic per byte moved, which is what the silicon is built
+for.
+
+**Deployability — this is the axis where it is not close.** Backbone-only ONNX
+op counts, after folding the traced shape ops at batch 1:
+
+| | Conv | `Erf` (GELU) | `ReduceMean`+`Sigmoid` (SE) | `BatchNormalization` | nodes |
+|---|---|---|---|---|---|
+| `repvit_m2_3` | 266 | 55 | 24 + 24 | 51 | 789 |
+| `repvit_m2_3` fused | 215 | 55 | 24 + 24 | 0 | 585 |
+| `hgnetv2_b4` | 80 | **0** | **0** | 0 | **144** |
+
+`hgnetv2_b4`'s trunk is `Conv` / `Relu` / `Concat` / `MaxPool` / `Pad` and
+nothing else — the intersection of every accelerator's op set. `Erf` is absent
+from several NPU op sets, so it falls back to CPU or gets approximated.
+Squeeze-excite needs a *global* spatial reduce, which breaks tile-local dataflow
+and forces a full-feature-map round trip through memory.
+
+int8 post-training quantisation, measured as SQNR on the trunk's own feature map
+(ORT `quantize_static`, QDQ, uint8 activations, 64 real COCO crops to calibrate,
+32 held out). SQNR = `10 log10(var(fp32) / var(fp32 - int8))`; higher is better.
+
+| backbone | per-tensor dB / cos | per-channel dB / cos |
+|---|---|---|
+| `repvit_m2_3` | −0.49 / 0.465 | 0.22 / 0.504 |
+| `repvit_m2_3` fused | −0.38 / 0.492 | 0.58 / 0.588 |
+| `hgnetv2_b0` | 3.50 / 0.732 | 5.89 / 0.847 |
+| `hgnetv2_b2` | 2.22 / 0.646 | 9.95 / 0.939 |
+| `hgnetv2_b4` | 7.92 / 0.918 | **15.14 / 0.984** |
+| `hgnetv2_b6` | 5.66 / 0.889 | 9.55 / 0.954 |
+
+A 14.6 dB gap, and fusing barely moves RepViT. At cosine 0.588 the int8 feature
+map is essentially uncorrelated with the fp32 one — RepViT would need
+quantisation-aware training to ship in int8; `hgnetv2_b4` at 0.984 would not.
+**Mechanism:** HGNetv2's activations are all ReLU, so they are non-negative and
+an unsigned int8 grid covers them exactly. RepViT's depthwise kernels have
+per-channel norms spanning orders of magnitude, and its GELU and SE-gate outputs
+are long-tailed, so one scale cannot cover them. These are deliberately naive
+PTQ settings — min/max calibration, 64 images — because that is what a mobile
+toolchain does first; the absolute values are low for everyone and the *gap* is
+the finding.
+
+**The export path survives unchanged.** Built a synthetic `hgnetv2_b4`
+checkpoint plus `run_config.json` and ran `tools/pth_to_onnx.py` on it with no
+edits: torch↔ONNX parity **5.96e-08** against its 1e-3 gate, `cliff_focal` and
+`bound_scales` read back correctly, metadata stamped. `backbone_feat_dim` is
+informational only — `InstantHMRStudent` reads the real width from
+`backbone.num_features` — so the 2048-channel HGNetv2 map needs no config edit.
+
+**Separate finding, independent of which backbone wins: nothing in this repo
+calls `RepViT.fuse()`.** timm ships the multi-branch training graph and the
+exporter never reparameterises it, so every ONNX we have shipped carries 51
+un-foldable `BatchNormalization` nodes and 204 extra nodes. Fusing is free:
+193.6 → 142.5 ms per training step and 4.76 → 3.55 ms ONNX B1. Worth taking even
+if we stay on RepViT.
+
+**Integration cost: zero code.** `--backbone` already exists in
+`train_distill_jz.py`, `run_config.json` records it, and
+`config_from_checkpoint` reads it back, so `benchmark/eval_3dpw_ckpt.py`,
+`benchmark/eval_emdb_ckpt.py`, `tools/pth_to_onnx.py` and
+`instanthmr/inference.py` all need nothing. Two operational steps only:
+
+```sh
+# 1. warm the timm cache on prepost — compute nodes run HF_HUB_OFFLINE=1
+sbatch --partition=prepost --time=03:00:00 --job-name=warm --output=warm_%j.out \
+       --account=vsi@v100 --wrap \
+  "source \$WORK/InstantHMR/datasets_pipeline/jeanzay/jz_env.sh && \
+   python -u instanthmr_distill_train/train_distill_jz.py --warm-cache \
+          --backbone hgnetv2_b4 --data_root \$DATA_ROOT"
+
+# 2. add the flag to EXTRA_TRAIN_ARGS; everything else stays at gen-6
+EXTRA_TRAIN_ARGS="--preset v2 $COMMON6 --backbone hgnetv2_b4"
+```
+
+If the proxy refuses `cdn-lfs.hf.co`, the weights are 76 MB and already on the
+laptop — `rsync` `models--timm--hgnetv2_b4.ssld_stage2_ft_in1k` the same way
+`JEAN_ZAY.md` describes for RepViT.
+
+**Memory goes down, so the partition question does not reopen.** `hgnetv2_b4`
+peaks at 3498 MiB at batch 64 against `repvit_m2_3`'s 8549 (synthetic step, no
+MHR forward kinematics and no `--w-verts`), so `v100-16g` stays comfortable and
+CLAUDE.md's "re-add `--constraint=v100-32g` if a bigger backbone pushes past
+~12 GiB" does not trigger. `hgnetv2_b6` at 9444 MiB would need watching.
+
+**Plan.** Generation 6 finishes first — it is the `--w-verts` on/off comparison
+and that is the loss baseline; swapping the trunk underneath it would confound
+both questions. Then the backbone comparison runs as its own axis: **3 seeds per
+backbone** (`repvit_m2_3` and `hgnetv2_b4`) on the **full corpus including
+SA-1B**, everything else held at gen-6.
+
+Two things SA-1B changes, both already handled but both easy to get wrong:
+
+* **The mixture must be named explicitly.** `sqrt` hands SA-1B 0.692 of every
+  batch on the strength of 3.4 M crops. Extend `MIX6` rather than falling back
+  to a rule.
+* **`joints_2d_vis` is mandatory.** SA-1B stores unobserved 2D keypoints as
+  literal `(0, 0)`; only 8% of its hand keypoints are real. The mask is already
+  consumed by `loss_2d_native`, `loss_2d_simcc` and `loss_reproj` and defaults
+  to all-ones elsewhere, so nothing else changes — but a folder built without it
+  would drag every predicted hand keypoint to the top-left corner. See "The
+  SA-1B label trap" in `datasets_pipeline/README.md`.
+
+The reported number stays **J14 PA-MPJPE, adapter-applied, on the H36M GT**. The
+overfit test above measures fitting, not generalisation, and does not substitute
+for it.
 
 ### 13. PVE has no metric yet — only a loss
 
@@ -434,6 +575,58 @@ cost is gradient damping, `1 - tanh²`, and on the teacher distribution that is
    `demo.py` uses `1.05 x diag` for focal-aware graphs. If the real camera is
    far from that, depth is wrong — `--focal PX` overrides it.
 
+
+### 15. Host-RAM OOM from the pair index — fixed 2026-09-08
+
+Four generation-6 jobs (1857969/70/73/75, then 1884647/48/50) were OOM-killed
+between epochs 14 and 33, at 73.9-76.0 GiB per node against a `mem=160000M`
+cgroup. **Host RAM, not CUDA**: `State=OUT_OF_ME+`, `ExitCode 0:125`,
+`Detected N oom_kill events`, `tasks 0-3: Out Of Memory`. The only Python output
+was a dataloader worker dying of `ConnectionResetError` in
+`multiprocessing/resource_sharer.py` — the symptom of the killer, not a cause.
+
+**Cause.** A list of `(PosixPath, PosixPath)` pairs measures **694 bytes per
+pair**, so the 4,231,947-crop index is 2.94 GB per process.
+`build_jz_loaders` sets `persistent_workers=True` with `num_workers=9` per rank,
+so a node holds 4 parents + 36 workers = 40 processes. Fork shares those pages
+copy-on-write, but CPython writes a refcount into an object header to *read* it,
+so each worker converts the shared index into a private copy as it samples —
+gradually, which is why the kill lands hours in rather than at startup.
+
+**Fix.** `PairIndex` stores the index as three contiguous numpy byte arrays and
+rebuilds the two `Path`s on access (~2 us against a ~6 ms `__getitem__`):
+
+| | bytes/pair | 4.23 M crops |
+|---|---|---|
+| `list` of `Path` pairs | 694 | 2.94 GB/process |
+| `PairIndex` | **87** | **0.37 GB/process** |
+
+8.0x smaller, and numpy arrays carry no per-element refcounts so forks stay
+shared. Verified: 961,139 pairs compared, **0 mismatches**, iteration order
+identical, mixture table unchanged (45.0 / 22.5 / 25.0 / 7.5), slices stay
+compact. `SAM3DStudentDataset` copies only real lists, never a `PairIndex`.
+
+**Two things this cost a day to learn.**
+
+*The `--w-verts` arms died first and that was a red herring.* The surface term
+adds ~2 GiB per node (measured +0.108 GiB/rank at construction, +0.16 GiB steady
+state), so at 74 GiB it decided the *ordering* of four deaths, not whether they
+happened. A 400-step local test showed no leak at all: allocated 1.276 /
+reserved 4.250 / peak 4.123 GiB GPU and 2.67 GiB host, flat from step 50 to 400
+and matching the no-verts arm to three decimals. Correlation with a change is
+not causation by it when every arm shares the real cause.
+
+*`sacct` MaxRSS undersamples.* It reports ~74 GiB against a 156 GiB limit and
+the OOM-killer still fires, both because it samples at ~30 s and because RSS
+double-counts pages shared between a rank and its workers. Do not read "half the
+limit" as "safe".
+
+**Related, same session**: `--constraint=v100-32g` is now in
+`52_train_ddp.slurm` itself, not on the sbatch line — the self-chain resubmits
+with only `--job-name`, so a CLI constraint survives exactly one job. And the
+epoch log now reports peak GPU as the max over all ranks; the "9.3 GiB" figure
+that justified running unconstrained was rank 0's alone, while the ranks that
+OOM'd on 16 GB cards were at 14.99 GiB.
 
 ---
 
