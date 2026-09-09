@@ -637,28 +637,40 @@ flickering on video sequences. Post-processing filters (1-Euro / Kalman) smooth
 coordinates at the expense of phase delay (lag) and physical plausibility (foot
 skating). Making the decoder natively temporal resolves jitter without lag.
 
-**Architecture: N-frame FIFO past-pose buffer.**
-- The decoder accepts $N$ past-pose tokens (e.g., $N=5$ or $10$), each projected
-  from previous frames' `[mhr_params, cam_trans]` (207 floats) via a small
-  shared MLP into the transformer's `d_model`.
-- **Online streaming without lag.** At frame 0, the past buffer is empty and
-  filled with learned `[NO_PAST_POSE]` tokens. When frame 1 arrives, the buffer
-  holds 1 real past pose; it fills incrementally up to $N$ frames, then operates
-  as a standard FIFO sliding window. No future frames are needed, so online
-  inference has zero latency delay.
+**Architecture: Additive residual temporal tokens.**
+- **Base learned temporal queries.** The decoder carries $N$ learnable temporal
+  query tokens $\mathbf{q}_i^{\text{temporal}} \in \mathbb{R}^{d_{\text{model}}}$
+  (`nn.Parameter(1, N, d_model)`, e.g., $N=5$ or $10$). These tokens are
+  always present and encode the baseline canonical human prior and temporal
+  relative slot identity ($t-1, t-2, \dots, t-N$).
+- **Additive pose residual.** Each slot receives an additive modulation from the
+  past pose:
+  $$\text{Token}_i = \mathbf{q}_i^{\text{temporal}} + \Delta \mathbf{z}_i$$
+  where $\Delta \mathbf{z}_i = \text{MLP}(\text{mhr\_params}_{t-i}, \text{cam\_trans}_{t-i})$
+  when frame $t-i$ is available, and **$\Delta \mathbf{z}_i = \mathbf{0}$** when
+  absent. This mirrors the existing CLIFF conditioning (`queries + cond`).
+- **Zero-init stability.** Initializing the final linear layer of the projection
+  MLP to zero ensures $\Delta \mathbf{z}_i = \mathbf{0}$ at initialization,
+  allowing fine-tuning to start seamlessly from pretrained static weights
+  without disturbing existing trunk representations.
+- **Online streaming without lag.** At frame 0, $\Delta \mathbf{z}_{1\dots N} = \mathbf{0}$,
+  operating purely on the base learned tokens. As frames arrive, valid past poses
+  modulate slot $1$, then slot $2$, up to $N$ in an incremental FIFO buffer.
+  No future frames are needed, and tensor dimensions remain 100% static for ONNX
+  and mobile NPU deployment.
 
 **Training strategy & exposure bias prevention:**
 - **Static dataset compatibility.** For static splits (COCO, AIC, MPII, SA-1B),
-  the past buffer is masked or set to `[NO_PAST_POSE]`, preserving full
-  single-image pose estimation performance.
-- **Variable buffer warmup.** On video splits (Harmony4D, 3DPW), randomly sample
-  a buffer length $k \in [0, N]$ to mimic real startup conditions and partial
-  tracks.
+  $\Delta \mathbf{z}_i = \mathbf{0}$ across all slots. The model naturally learns
+  to predict solely from visual features when temporal deltas are zero.
+- **Variable buffer warmup.** On video splits (Harmony4D, 3DPW), randomly zero out
+  the last $N - k$ deltas ($k \in [0, N]$) to train the model to operate reliably
+  during startup or after tracking dropouts.
 - **Denoising training against exposure bias.** Corrupt past annotations during
   training with Gaussian jitter on joint angles ($\sigma \sim 0.05$ rad),
-  translation noise, and random token dropout (20-30%). This forces the
-  transformer to treat past tokens as a soft motion prior rather than an oracle,
-  preventing autoregressive compounding errors when a detection is noisy.
+  translation noise, and random slot zeroing (20-30%). This prevents the
+  transformer from over-relying on past tokens as exact ground truth, avoiding
+  autoregressive compounding errors during inference.
 
 **Evaluation & metrics:**
 - **3DPW test & Harmony4D test**: Both carry continuous video tracks.
