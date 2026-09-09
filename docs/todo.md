@@ -628,6 +628,46 @@ epoch log now reports peak GPU as the max over all ranks; the "9.3 GiB" figure
 that justified running unconstrained was rank 0's alone, while the ranks that
 OOM'd on 16 GB cards were at 14.99 GiB.
 
+
+### 16. Temporally promptable decoder (video stabilization via past-pose buffer)
+
+**Motivation.** Monocular frame-by-frame estimators (SAM-3D-Body, NLF, and
+InstantHMR baseline) exhibit high-frequency acceleration jitter and depth
+flickering on video sequences. Post-processing filters (1-Euro / Kalman) smooth
+coordinates at the expense of phase delay (lag) and physical plausibility (foot
+skating). Making the decoder natively temporal resolves jitter without lag.
+
+**Architecture: N-frame FIFO past-pose buffer.**
+- The decoder accepts $N$ past-pose tokens (e.g., $N=5$ or $10$), each projected
+  from previous frames' `[mhr_params, cam_trans]` (207 floats) via a small
+  shared MLP into the transformer's `d_model`.
+- **Online streaming without lag.** At frame 0, the past buffer is empty and
+  filled with learned `[NO_PAST_POSE]` tokens. When frame 1 arrives, the buffer
+  holds 1 real past pose; it fills incrementally up to $N$ frames, then operates
+  as a standard FIFO sliding window. No future frames are needed, so online
+  inference has zero latency delay.
+
+**Training strategy & exposure bias prevention:**
+- **Static dataset compatibility.** For static splits (COCO, AIC, MPII, SA-1B),
+  the past buffer is masked or set to `[NO_PAST_POSE]`, preserving full
+  single-image pose estimation performance.
+- **Variable buffer warmup.** On video splits (Harmony4D, 3DPW), randomly sample
+  a buffer length $k \in [0, N]$ to mimic real startup conditions and partial
+  tracks.
+- **Denoising training against exposure bias.** Corrupt past annotations during
+  training with Gaussian jitter on joint angles ($\sigma \sim 0.05$ rad),
+  translation noise, and random token dropout (20-30%). This forces the
+  transformer to treat past tokens as a soft motion prior rather than an oracle,
+  preventing autoregressive compounding errors when a detection is noisy.
+
+**Evaluation & metrics:**
+- **3DPW test & Harmony4D test**: Both carry continuous video tracks.
+- **Acceleration error ($E_{accel}$, $\text{m/s}^2$)**: Measures discrete second-order
+  joint acceleration differences against ground truth to quantify jitter.
+- **Rigid bone-length variance ($\sigma_{\text{bone}}$)**: Measures temporal scale
+  consistency along rigid kinematic segments (femur, tibia, humerus) across
+  tracks.
+
 ---
 
 ## Evaluation hygiene the audit raised

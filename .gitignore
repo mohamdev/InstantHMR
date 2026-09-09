@@ -50,3 +50,4 @@ runs/
 # Notebook checkpoints
 .ipynb_checkpoints/
 competitors/
+*.png
