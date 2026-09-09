@@ -98,7 +98,70 @@ the distance from the box centre to the actual body centre by 63.75 → 63.15 px
 i.e. nothing. **No second defect demonstrated; see item 11 for what is still
 open.**
 
-## Queue
+## Priority Queue: CVPR Research Roadmap
+
+Active core contributions for the paper, strictly prioritized:
+
+### 1. Kinematically-Factorized Decoder with Anatomical Routing
+
+**Motivation.** In the current architecture (`train_distill_mhr_only.py:924`), a single global token of dimension 512 is projected through `head_global = nn.Linear(512, 252)` to predict root translation/rotation, spine, extremities, bone scales, and identity blendshapes simultaneously. Compressing the entire articulated human tree into one flat vector forces the global token to be an undifferentiated average of the body. Furthermore, the 70 2D SimCC queries act only as an auxiliary output head, with no mechanism for their 2D localized image evidence to inform the 3D kinematic parameters.
+
+**Mechanism.**
+- **Factorized anatomical queries.** Replace the single global query with structured kinematic queries:
+  - `Q_root`: Camera translation, root orientation, global scale.
+  - `Q_torso`: Pelvis, spine joints, neck.
+  - `Q_larm` & `Q_rarm`: Shoulder, elbow, wrist joints.
+  - `Q_lleg` & `Q_rleg`: Hip, knee, ankle joints.
+- **Anatomical routing via sparse/masked cross-attention.** The 70 2D keypoint queries first locate joints across the backbone feature map. Then, each kinematic limb query performs directed cross-attention specifically over its corresponding 2D joint tokens (e.g., `Q_larm` attends to left shoulder/elbow/wrist tokens, `Q_lleg` to left hip/knee/ankle tokens).
+- **Efficiency.** Replacing 1 query with 6 queries adds $<0.1$ ms to decoder execution, preserving the 200 FPS edge speed while providing clear inductive bias and explainability.
+
+
+### 2. Resolving the 12-Dimensional Kinematic Null Space
+
+**Motivation.** `parameter_transform[:, :204]` has rank 192, not 204. Twelve orthogonal directions move the MHR parameters while leaving 3D joint positions *exactly* unchanged ($<0.0002$ mm) — pairing each `*_flexible` parameter against its `scale_*` partner (`scale_spine_length` vs `spine_length_flexible`, `scale_hip_width` vs `hip_width_flexible`, and spine rotations). Along these directions, geometric losses have zero gradient, but direct parameter losses (`loss_pose`, `loss_scale`) penalize the difference. The student is thus forced to waste model capacity and gradient budget memorizing arbitrary solver noise from the teacher/GT annotations that no image can determine.
+
+**Mechanism.**
+- **Null-space projection of parameter loss.** Compute the singular value decomposition (SVD) of the linear transform $T = U \Sigma V^T$. Project the parameter error $(\hat{\theta} - \theta^*)$ onto the 192-dimensional active row space $V_{\text{active}}$, setting loss to zero along the 12 null directions:
+  $$\mathcal{L}_{\text{pose\_proj}} = \| V_{\text{active}}^T (\hat{\theta} - \theta^*) \|_1$$
+- **Eliminating teacher noise.** The student is graded only on parameter variations that alter physical human geometry, completely removing gradient penalties on unobservable null-space drift.
+- **Zero runtime cost.** The projection matrix $V_{\text{active}} V_{\text{active}}^T$ is precomputed offline and applied only during training loss evaluation. Zero changes to ONNX inference or parameter count.
+
+
+### 3. Sensor-Agnostic In-the-Wild Field of View (FoV) Adaptation
+
+**Motivation.** Current inference assumes an uncalibrated default focal length $f = 1.05 \times \sqrt{H^2 + W^2}$ (`demo.py`, `instanthmr/inference.py`). In the wild (e.g. smartphone ultra-wide cameras at $0.6\times$ or telephoto lenses at $2\times$), this fixed assumption produces massive depth errors (1–3 meters) and severe scale distortion due to the perspective depth-scale ambiguity.
+
+**Mechanism.**
+- **FoV estimation query token.** Introduce a dedicated scalar FoV query token or integrate an angular field-of-view head predicting $2\omega_x = 2 \arctan(W / 2f)$.
+- **Decoupled scale & depth supervision.** Supervise predicted FoV on datasets with calibrated intrinsics (3DPW, Harmony4D, EgoExo4D) while training the pose decoder with self-consistent perspective reprojection.
+- **Plug-and-play inference.** In-the-wild deployment automatically infers the camera field of view alongside human pose, removing the need for manual `--focal` flags.
+
+
+### 4. Temporally Promptable Decoder (Temporal Smoothing)
+
+**Motivation.** Monocular frame-by-frame estimators (SAM-3D-Body, NLF, and InstantHMR baseline) exhibit high-frequency acceleration jitter and depth flickering on video sequences. Post-processing filters (1-Euro / Kalman) smooth coordinates at the expense of phase delay (lag) and physical plausibility (foot skating). Making the decoder natively temporal resolves jitter without lag.
+
+**Architecture: Additive residual temporal tokens.**
+- **Base learned temporal queries.** The decoder carries $N$ learnable temporal query tokens $\mathbf{q}_i^{\text{temporal}} \in \mathbb{R}^{d_{\text{model}}}$ (`nn.Parameter(1, N, d_model)`, e.g., $N=5$ or $10$). These tokens are always present and encode baseline canonical human priors and temporal relative slot identities ($t-1, t-2, \dots, t-N$).
+- **Additive pose residual.** Each slot receives an additive modulation from past poses:
+  $$\text{Token}_i = \mathbf{q}_i^{\text{temporal}} + \Delta \mathbf{z}_i$$
+  where $\Delta \mathbf{z}_i = \text{MLP}(\text{mhr\_params}_{t-i}, \text{cam\_trans}_{t-i})$ when frame $t-i$ is available, and **$\Delta \mathbf{z}_i = \mathbf{0}$** when absent.
+- **Zero-init stability.** Initializing the final linear layer of the projection MLP to zero ensures $\Delta \mathbf{z}_i = \mathbf{0}$ at initialization, allowing fine-tuning to start seamlessly from pretrained static weights without disturbing trunk representations.
+- **Online streaming without lag.** At frame 0, $\Delta \mathbf{z}_{1\dots N} = \mathbf{0}$, operating purely on the base learned tokens. As frames arrive, valid past poses modulate slot $1$, then slot $2$, up to $N$ in an incremental FIFO buffer. No future frames are needed, and tensor dimensions remain 100% static for ONNX and mobile NPU deployment.
+
+**Training strategy & exposure bias prevention:**
+- **Static dataset compatibility.** For static splits (COCO, AIC, MPII, SA-1B), $\Delta \mathbf{z}_i = \mathbf{0}$ across all slots. The model naturally learns to predict solely from visual features when temporal deltas are zero.
+- **Variable buffer warmup.** On video splits (Harmony4D, 3DPW), randomly zero out the last $N - k$ deltas ($k \in [0, N]$) to train the model to operate reliably during startup or after tracking dropouts.
+- **Denoising training against exposure bias.** Corrupt past annotations during training with Gaussian jitter on joint angles ($\sigma \sim 0.05$ rad), translation noise, and random slot zeroing (20-30%).
+
+**Evaluation & metrics:**
+- **3DPW test & Harmony4D test**: Both carry continuous video tracks.
+- **Acceleration error ($E_{accel}$, $\text{m/s}^2$)**: Measures discrete second-order joint acceleration differences against ground truth to quantify jitter.
+- **Rigid bone-length variance ($\sigma_{\text{bone}}$)**: Measures temporal scale consistency along rigid kinematic segments (femur, tibia, humerus) across tracks.
+
+---
+
+## Audit Backlog & Operational Queue
 
 Ordered by (cost of being wrong) x (cheapness of the fix). Items 3, 4 and 6 are
 defects; 5 and 7 onward are opportunities the audit raised that are not bugs.
@@ -272,12 +335,13 @@ the left/right parameter channels for flips, compose the roll into the root
 rotation. Needs the rig's mirror mapping **verified, not assumed**; MHR's Euler
 channels are not SMPL's permutation/sign convention.
 
-### 8. Twelve redundant target dimensions
+### 8. Twelve redundant target dimensions (Elevated to CVPR Priority 2)
 
 `parameter_transform[:, :204]` has rank 192. Moving 10 units along a null
 direction changes the skeleton by `< 0.0002 mm`, yet `loss_pose` / `loss_scale`
 still penalise the difference — 12 dimensions of solver-arbitrary teacher noise
-no image can determine.
+no image can determine. **See Priority 2 in the CVPR Roadmap above for the active
+null-space projection loss formulation.**
 
 **Measure before acting**: how much teacher variance actually lies along those
 directions, and how much trunk gradient they carry. The audit is explicit that
@@ -627,58 +691,6 @@ with only `--job-name`, so a CLI constraint survives exactly one job. And the
 epoch log now reports peak GPU as the max over all ranks; the "9.3 GiB" figure
 that justified running unconstrained was rank 0's alone, while the ranks that
 OOM'd on 16 GB cards were at 14.99 GiB.
-
-
-### 16. Temporally promptable decoder (video stabilization via past-pose buffer)
-
-**Motivation.** Monocular frame-by-frame estimators (SAM-3D-Body, NLF, and
-InstantHMR baseline) exhibit high-frequency acceleration jitter and depth
-flickering on video sequences. Post-processing filters (1-Euro / Kalman) smooth
-coordinates at the expense of phase delay (lag) and physical plausibility (foot
-skating). Making the decoder natively temporal resolves jitter without lag.
-
-**Architecture: Additive residual temporal tokens.**
-- **Base learned temporal queries.** The decoder carries $N$ learnable temporal
-  query tokens $\mathbf{q}_i^{\text{temporal}} \in \mathbb{R}^{d_{\text{model}}}$
-  (`nn.Parameter(1, N, d_model)`, e.g., $N=5$ or $10$). These tokens are
-  always present and encode the baseline canonical human prior and temporal
-  relative slot identity ($t-1, t-2, \dots, t-N$).
-- **Additive pose residual.** Each slot receives an additive modulation from the
-  past pose:
-  $$\text{Token}_i = \mathbf{q}_i^{\text{temporal}} + \Delta \mathbf{z}_i$$
-  where $\Delta \mathbf{z}_i = \text{MLP}(\text{mhr\_params}_{t-i}, \text{cam\_trans}_{t-i})$
-  when frame $t-i$ is available, and **$\Delta \mathbf{z}_i = \mathbf{0}$** when
-  absent. This mirrors the existing CLIFF conditioning (`queries + cond`).
-- **Zero-init stability.** Initializing the final linear layer of the projection
-  MLP to zero ensures $\Delta \mathbf{z}_i = \mathbf{0}$ at initialization,
-  allowing fine-tuning to start seamlessly from pretrained static weights
-  without disturbing existing trunk representations.
-- **Online streaming without lag.** At frame 0, $\Delta \mathbf{z}_{1\dots N} = \mathbf{0}$,
-  operating purely on the base learned tokens. As frames arrive, valid past poses
-  modulate slot $1$, then slot $2$, up to $N$ in an incremental FIFO buffer.
-  No future frames are needed, and tensor dimensions remain 100% static for ONNX
-  and mobile NPU deployment.
-
-**Training strategy & exposure bias prevention:**
-- **Static dataset compatibility.** For static splits (COCO, AIC, MPII, SA-1B),
-  $\Delta \mathbf{z}_i = \mathbf{0}$ across all slots. The model naturally learns
-  to predict solely from visual features when temporal deltas are zero.
-- **Variable buffer warmup.** On video splits (Harmony4D, 3DPW), randomly zero out
-  the last $N - k$ deltas ($k \in [0, N]$) to train the model to operate reliably
-  during startup or after tracking dropouts.
-- **Denoising training against exposure bias.** Corrupt past annotations during
-  training with Gaussian jitter on joint angles ($\sigma \sim 0.05$ rad),
-  translation noise, and random slot zeroing (20-30%). This prevents the
-  transformer from over-relying on past tokens as exact ground truth, avoiding
-  autoregressive compounding errors during inference.
-
-**Evaluation & metrics:**
-- **3DPW test & Harmony4D test**: Both carry continuous video tracks.
-- **Acceleration error ($E_{accel}$, $\text{m/s}^2$)**: Measures discrete second-order
-  joint acceleration differences against ground truth to quantify jitter.
-- **Rigid bone-length variance ($\sigma_{\text{bone}}$)**: Measures temporal scale
-  consistency along rigid kinematic segments (femur, tibia, humerus) across
-  tracks.
 
 ---
 
