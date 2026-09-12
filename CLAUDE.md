@@ -167,6 +167,26 @@ steps. Use `--anomaly-safe-fallback`, which steps on the non-FK terms instead
 divergence here by lowering the LR alone: `OneCycleLR(pct_start=0.1)` peaks at
 10% of the run, so a lower peak only moves *when* it dies.
 
+**A single-process smoke test cannot clear a training change for the cluster.**
+`52_train_ddp.slurm` wraps the student in `DistributedDataParallel` with the
+default `find_unused_parameters=False`, and that Reducer exists **nowhere** in a
+laptop run -- not in `train_distill_jz.py` on one GPU, not in `--self-test`, not
+in `--overfit-test`. A parameter that receives no gradient therefore passes
+every local check and then aborts the job on the SECOND optimiser step with
+`Expected to have finished reduction in the prior iteration ... Parameter
+indices which did not receive grad for rank N: <i>`, where `<i>` indexes
+`list(model.parameters())`. On 2026-09-11 that burned all eight queued
+generation-7 `hgnetv2_b4` links while the `repvit_m2_3` arms ran nine hours
+beside them: `forward_features()` stops before the timm classifier head, and
+`num_classes=0` empties that head for repvit but leaves hgnetv2_b4 a 2048x2048
+`last_conv` -- 4,194,304 orphaned parameters, index 241. `InstantHMRStudent`
+now replaces any head that still has parameters with `nn.Identity()` (a no-op
+for a parameterless one, so every existing state_dict is byte-identical --
+verified, 1542 keys, same sha256). **Run `python tools/ddp_smoke.py --backbone
+<name> --w-verts <w>` before submitting any architecture change.** It builds a
+real Reducer at world size 1 and takes under a minute; world 1 is enough,
+because the unused-parameter check is world-size independent.
+
 **The pair index is a host-RAM bomb, and it kills jobs with no traceback.**
 Four generation-6 jobs were OOM-killed at 74-76 GiB per node between epochs 14
 and 33 on 2026-09-08. Not CUDA -- `sacct` says `OUT_OF_ME+`, exit `0:125`,

@@ -890,6 +890,18 @@ class InstantHMRStudent(nn.Module):
 
         self.backbone = timm.create_model(cfg.backbone, pretrained=pretrained, num_classes=0)
         embed_dim = self.backbone.num_features
+        # forward_features() stops before the classifier head, so any parameter
+        # left in that head never receives a gradient and DDP (which runs with
+        # find_unused_parameters=False) aborts on the second step with
+        # "Expected to have finished reduction in the prior iteration".
+        # num_classes=0 empties the head for repvit_m2_3 but NOT for hgnetv2_b4,
+        # which keeps a 2048x2048 last_conv -- 4,194,304 parameters, DDP index
+        # 241. That killed all four generation-7 hgnet jobs at step 2.
+        # No-op for a head that is already parameterless, so the parameter list,
+        # its order and the state_dict of every existing run are untouched.
+        head = getattr(self.backbone, "head", None)
+        if head is not None and any(p.numel() for p in head.parameters()):
+            self.backbone.head = nn.Identity()
         self.feat_proj = nn.Linear(embed_dim, cfg.d_model)
 
         self.grid_size = cfg.image_size // 32
