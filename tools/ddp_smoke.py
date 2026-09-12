@@ -23,7 +23,9 @@ step 2.
 
 World size 1 is enough: the Reducer and its unused-parameter check are built and
 run identically at any world size, so this reproduces the cluster error exactly,
-on one GPU, in under a minute. It does NOT test NCCL, multi-node bring-up or
+on one GPU, in under a minute. The batch size is small for the same reason --
+see --batch_size; on a login node a large one is killed for memory, not for
+anything this is testing. It does NOT test NCCL, multi-node bring-up or
 gradient bucketing across ranks -- only that every parameter participates.
 
 Exit status is 0 when every parameter received a gradient, 1 otherwise, so it
@@ -50,12 +52,22 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backbone", default=None, help="timm name; default is the config's")
     p.add_argument("--data_root", default="data")
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=2,
+                   help="Small on purpose. Which parameters receive a gradient "
+                        "does not depend on the batch size, and a Jean Zay "
+                        "LOGIN node kills a process around 3-4 GB: measured peak "
+                        "RSS is 4.49 GB for repvit_m2_3 at batch 8 (killed) "
+                        "against 2.45 GB at batch 2. Raise it only if you are on "
+                        "a compute node.")
     p.add_argument("--losses", choices=("legacy", "rebalanced"), default="rebalanced")
     p.add_argument("--w-verts", dest="w_verts", type=float, default=0.0)
     p.add_argument("--bound-scales", dest="bound_scales", action="store_true", default=True)
     p.add_argument("--cliff-focal", dest="cliff_focal", action="store_true", default=True)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true", default=True)
+    p.add_argument("--cont-head", dest="cont_head", action="store_true",
+                   help="Build the teacher's continuous regression head instead "
+                        "of the linear 204-vector head. A changed head shape is "
+                        "exactly the class of change this exists to gate.")
     p.add_argument("--pretrained", action="store_true",
                    help="Load the timm weights too. Off by default: the head "
                         "geometry this checks does not depend on them.")
@@ -76,6 +88,9 @@ def main() -> int:
     cfg.cliff_focal = args.cliff_focal
     cfg.crop_centre_fix = args.crop_centre_fix
     cfg.w_verts = args.w_verts
+    if args.cont_head:
+        cfg.cont_head = True
+        cfg.root_rot_loss = True
     if args.backbone:
         cfg.backbone = args.backbone
 
@@ -94,6 +109,7 @@ def main() -> int:
     model = T.InstantHMRStudent(cfg, pretrained=args.pretrained).to(T.device)
     n = sum(q.numel() for q in model.parameters())
     print(f"{cfg.backbone}: {n/1e6:.2f} M parameters, "
+          f"head={'continuous' if cfg.cont_head else 'linear'}, "
           f"w_verts={cfg.w_verts}, batch {args.batch_size}")
 
     ddp = torch.nn.parallel.DistributedDataParallel(model)   # find_unused_parameters=False

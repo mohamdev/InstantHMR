@@ -134,6 +134,8 @@ def main() -> None:
           f"({prov.get('bound_scales', 'default')})")
     print(f"  cliff_focal  : {getattr(cfg, 'cliff_focal', False)} "
           f"({prov.get('cliff_focal', 'default')})")
+    print(f"  cont_head    : {getattr(cfg, 'cont_head', False)} "
+          f"({prov.get('cont_head', 'default')})")
 
     # SimCC head geometry lives in the checkpoint — mirror it so the graph and
     # the bin centres agree with what was actually trained.

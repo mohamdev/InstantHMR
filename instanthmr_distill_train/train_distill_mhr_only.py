@@ -65,6 +65,11 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 import torchvision.transforms as transforms
+
+try:
+    import mhr_cont as MC
+except ImportError:                      # imported as a package rather than a script
+    from instanthmr_distill_train import mhr_cont as MC
 import torchvision.transforms.functional as F_t
 from torchvision.transforms import InterpolationMode
 
@@ -298,6 +303,25 @@ class DistillConfig:
     bound_scales: bool = False
     scale_bound_margin: float = 0.5
     scale_bounds_path: str = str(PROJECT_ROOT / "assets/mhr_size_bounds.npz")
+
+    # --- the teacher's continuous regression pathway (--cont-head) ----------
+    # Off by default: with it off every tensor in this file is bit-identical to
+    # the previous commit, which generations 6 and 7 depend on as controls.
+    #
+    # On, the single `nn.Linear` that emits the rig-native 204-vector is
+    # replaced by the teacher's own space -- 6D root rotation, a 260-dim
+    # continuous body block, 28 bone-scale PCA coefficients and two 54-dim hand
+    # blocks -- converted to the 204-vector inside the model, so nothing
+    # downstream (losses, FK, export, deployment) sees a different contract.
+    # See instanthmr_distill_train/mhr_cont.py and docs/todo.md item 1.
+    cont_head: bool = False
+    cont_head_path: str = str(PROJECT_ROOT / "assets/mhr_cont_head.npz")
+    # Rotation-matrix loss on the root instead of SmoothL1 on its Euler triple.
+    # Set together with cont_head: a SmoothL1 in radians scores a prediction at
+    # -pi+eps against a target at pi-eps as a ~2pi error when it is a tiny
+    # rotation, and 13.59% of corpus root angles sit beyond 2.8 rad.
+    root_rot_loss: bool = False
+    w_root_rot: float = 1.0
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -422,6 +446,15 @@ def config_from_checkpoint(state, ckpt_path=None, **overrides):
 
     cfg.bound_scales = "scale_lo" in state
     prov["bound_scales"] = "checkpoint weights"
+
+    # --cont-head replaces head_global with a ContMHRHead, so the buffers it
+    # registers ARE the flag -- more reliable than run_config.json, which a
+    # hand-copied checkpoint may not have beside it. Rebuilding the default
+    # head for these weights would fail loudly on the missing keys rather than
+    # silently, but only because the shapes differ; do not rely on that.
+    cfg.cont_head = any(k.startswith("cont_head.") for k in state)
+    cfg.root_rot_loss = cfg.cont_head
+    prov["cont_head"] = "checkpoint weights"
 
     run_cfg = {}
     if ckpt_path is not None:
@@ -883,6 +916,148 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size):
     pos_embed = torch.cat([pe_y, pe_x], dim=1)  
     return pos_embed.unsqueeze(0)  
 
+class ContMHRHead(nn.Module):
+    """SAM 3D Body's continuous pose head, emitting the rig-native 204-vector.
+
+    447 numbers come out of a two-layer MLP and are converted here, so the rest
+    of the model, every loss, the ONNX graph and `instanthmr.inference` all keep
+    the contract they already have: 204 MHR parameters and 45 identity
+    coefficients. (The teacher emits 519; the extra 72 are a face block its own
+    `forward()` multiplies by zero.)
+
+        6    root rotation, 6D            -> 3 extrinsic-XYZ Euler angles
+        260  body pose, continuous        -> 130 angles
+        45   identity                     -> passed through
+        28   bone-scale PCA coefficients  -> 68 bone scales
+        108  two 54-dim hand blocks       -> overwrite the 54 finger channels
+
+    Three things are deliberate and each is measured in the file that owns it:
+
+    * **Root translation is emitted as exact zero**, not regressed. It is
+      `0.000e+00` in all 24,000 sampled annotations -- the person is placed by
+      `cam_trans` -- and the teacher's head does the same (`global_trans =
+      torch.zeros_like(...)`).
+
+    * **The bone-scale bound is on the 28 coefficients, not the 68 scales.**
+      Clamping after the PCA expansion is what `--bound-scales` does and it is
+      wrong here: an arbitrary point of the 68-dim box is generally not in the
+      24-dimensional column space `scale_comps` spans, so a coordinatewise tanh
+      silently leaves the subspace. The coefficient limits come from the corpus
+      (`tools/build_cont_head_assets.py`; GT projection residual 2.1e-08).
+
+    * **The six `*_length/_width_flexible` channels at `130:136` are bounded
+      separately.** The continuous body space carries them raw -- they are
+      joint TRANSLATION channels, not rotations -- so they are exactly as
+      unbounded here as they were before, and they reach 375 m on their own.
+
+    Assembly is one `index_select` over a fixed 136-long gather table rather
+    than three masked writes: `x[..., idx] = v` traces to a scatter, a gather
+    exports everywhere and is its own documentation.
+    """
+
+    def __init__(self, cfg, d_model: int):
+        super().__init__()
+        a = np.load(cfg.cont_head_path)
+        self.register_buffer("scale_mean", torch.from_numpy(a["scale_mean"]).float())
+        self.register_buffer("scale_comps", torch.from_numpy(a["scale_comps"]).float())
+        self.register_buffer("coeff_lo", torch.from_numpy(a["coeff_lo"]).float())
+        self.register_buffer("coeff_hi", torch.from_numpy(a["coeff_hi"]).float())
+        self.register_buffer("hand_mean", torch.from_numpy(a["hand_pose_mean"]).float())
+        self.register_buffer("hand_comps", torch.from_numpy(a["hand_pose_comps"]).float())
+
+        # One gather that builds the 136-vector [trans(3), root(3), body(130)]
+        # with the finger channels already replaced by the hand blocks. Source
+        # layout: [zeros(3), root_euler(3), body(130), left(27), right(27)].
+        g = torch.arange(136)
+        for j, t in enumerate(a["hand_joint_idxs_left"].tolist()):
+            g[t] = 136 + j
+        for j, t in enumerate(a["hand_joint_idxs_right"].tolist()):
+            g[t] = 163 + j
+        assert len(set(g.tolist())) == 136, "hand index sets overlap"
+        self.register_buffer("full_gather", g)
+
+        # Two-layer MLP at the student's own width, on normalised pose-token
+        # features: `nn.TransformerDecoder` is built here with norm_first=True
+        # layers and no final norm, so its output is unnormalised.
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, MC.N_HEAD_OUT))
+        # Learned initial estimate, added to the MLP output. Initialised to the
+        # neutral encoding: all-zeros is not a valid point of this space -- a
+        # zero 6D vector has no rotation and a zero (sin, cos) pair puts atan2
+        # at a 0/0 gradient.
+        self.init_estimate = nn.Parameter(MC.neutral_head_output())
+        nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        self.bound_scales = bool(getattr(cfg, "bound_scales", False))
+        if self.bound_scales:
+            b = np.load(cfg.scale_bounds_path)
+            # mhr_size_bounds.npz stores 0:3 then 130:204; take the six
+            # flexible channels, which are the first six of the second slice.
+            lo = torch.from_numpy(b["lo"]).float()
+            hi = torch.from_numpy(b["hi"]).float()
+            m = torch.clamp(0.25 * (hi - lo), min=float(cfg.scale_bound_margin))
+            lo, hi = lo - m, hi + m
+            starts = b["starts"].tolist()
+            off = 0
+            for st, sp in zip(starts, b["stops"].tolist()):
+                if st == 130:
+                    break
+                off += sp - st
+            self.register_buffer("flex_lo", lo[off:off + 6])
+            self.register_buffer("flex_hi", hi[off:off + 6])
+
+    @staticmethod
+    def _to_range(x, lo, hi):
+        return lo + (hi - lo) * 0.5 * (torch.tanh(x) + 1.0)
+
+    def forward(self, feat):
+        """(B, d_model) pose token -> (204) MHR params, (45) identity, (3,3) root R."""
+        return self.decode(self.mlp(self.norm(feat)) + self.init_estimate)
+
+    def decode(self, pred):
+        """(B, 447) continuous -> (204) MHR params, (45) identity, (3,3) root R.
+
+        Split out of `forward` so `tools/verify_cont_head.py` can drive the
+        conversion with hand-built vectors -- a second copy of this arithmetic
+        would be free to drift away from the one that trains.
+        """
+        B = pred.shape[0]
+
+        root_6d = pred[:, :6]
+        body_cont = pred[:, 6:6 + MC.N_BODY_CONT]
+        o = 6 + MC.N_BODY_CONT
+        shape = pred[:, o:o + MC.N_SHAPE]; o += MC.N_SHAPE
+        coeff = pred[:, o:o + MC.N_SCALE_COEFF]; o += MC.N_SCALE_COEFF
+        hand_l = pred[:, o:o + MC.N_HAND_CONT]
+        hand_r = pred[:, o + MC.N_HAND_CONT:o + 2 * MC.N_HAND_CONT]
+
+        R_root = MC.rot6d_to_rotmat(root_6d)
+        root_euler = MC.rotmat_to_euler_xyz(R_root)
+        body = MC.cont_to_body_params(body_cont)[:, :130]
+        if self.bound_scales:
+            # 130:136 are size, not pose, and the continuous space leaves them raw.
+            body = torch.cat(
+                [body[:, :130 - 6],
+                 self._to_range(body[:, 130 - 6:], self.flex_lo, self.flex_hi)], dim=1)
+        left = MC.cont_to_hand_params(self.hand_mean + hand_l @ self.hand_comps)
+        right = MC.cont_to_hand_params(self.hand_mean + hand_r @ self.hand_comps)
+
+        zeros3 = torch.zeros(B, 3, dtype=pred.dtype, device=pred.device)
+        src = torch.cat([zeros3, root_euler, body, left, right], dim=1)
+        full136 = src.index_select(1, self.full_gather)
+
+        if self.bound_scales:
+            coeff = self._to_range(coeff, self.coeff_lo, self.coeff_hi)
+        scales = self.scale_mean + coeff @ self.scale_comps
+        # R_root is returned so the root loss can be taken on the rotation the
+        # head actually built. Going back through the Euler triple would put
+        # atan2 in the gradient path, and 2.25% of corpus roots sit within
+        # 0.1 rad of the +-pi/2 gimbal singularity where that is unstable.
+        return torch.cat([full136, scales], dim=1), shape, R_root
+
+
 class InstantHMRStudent(nn.Module):
     def __init__(self, cfg, pretrained=True):
         super().__init__()
@@ -933,8 +1108,16 @@ class InstantHMRStudent(nn.Module):
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=cfg.n_decoder_layers)
 
-        self.global_out_dim = cfg.model_params_dim + cfg.shape_dim + cfg.cam_dim
-        self.head_global = nn.Linear(cfg.d_model, self.global_out_dim)
+        # The continuous pathway replaces head_global outright rather than
+        # leaving it unused: an orphaned parameter receives no gradient and
+        # aborts DDP on step 2 (see tools/ddp_smoke.py).
+        self.cont_head = ContMHRHead(cfg, cfg.d_model) \
+            if getattr(cfg, "cont_head", False) else None
+        if self.cont_head is not None:
+            self.head_cam = nn.Linear(cfg.d_model, cfg.cam_dim)
+        else:
+            self.global_out_dim = cfg.model_params_dim + cfg.shape_dim + cfg.cam_dim
+            self.head_global = nn.Linear(cfg.d_model, self.global_out_dim)
 
         self.kp2d_bins = getattr(cfg, 'kp2d_bins', 96)
         self.kp2d_range = getattr(cfg, 'kp2d_range', 1.5)
@@ -947,12 +1130,18 @@ class InstantHMRStudent(nn.Module):
             "kp2d_bin_centers",
             torch.linspace(-self.kp2d_range, self.kp2d_range, self.kp2d_bins))
 
-        nn.init.constant_(self.head_global.bias[-1], 2.0)
-        nn.init.constant_(self.head_global.bias[-2], 0.0)
-        nn.init.constant_(self.head_global.bias[-3], 0.0)
+        if self.cont_head is not None:
+            # Same camera start as head_global's: 2.0 on depth, 0 on x/y.
+            nn.init.normal_(self.head_cam.weight, mean=0.0, std=1e-4)
+            nn.init.zeros_(self.head_cam.bias)
+            nn.init.constant_(self.head_cam.bias[-1], 2.0)
+        else:
+            nn.init.constant_(self.head_global.bias[-1], 2.0)
+            nn.init.constant_(self.head_global.bias[-2], 0.0)
+            nn.init.constant_(self.head_global.bias[-3], 0.0)
 
-        nn.init.normal_(self.head_global.weight, mean=0.0, std=1e-4)
-        nn.init.constant_(self.head_global.bias[:-3], 0.0)
+            nn.init.normal_(self.head_global.weight, mean=0.0, std=1e-4)
+            nn.init.constant_(self.head_global.bias[:-3], 0.0)
         nn.init.normal_(self.head_2d_logits.weight, mean=0.0, std=1e-4)
         nn.init.constant_(self.head_2d_logits.bias, 0.0)
 
@@ -998,16 +1187,24 @@ class InstantHMRStudent(nn.Module):
         feat_global = shared_feats[:, 0, :]
         feat_2d     = shared_feats[:, 1 : 1 + self.num_2d, :]
 
-        global_preds = self.head_global(feat_global)
+        if self.cont_head is not None:
+            # Bounds live inside ContMHRHead: the bone scales are clamped as PCA
+            # coefficients so the expansion stays in the teacher's subspace, and
+            # root translation comes out as exact zero rather than regressed.
+            pred_mhr_params, pred_shape_params, pred_root_rotmat = \
+                self.cont_head(feat_global)
+            pred_cam_trans = self.head_cam(feat_global)
+        else:
+            global_preds = self.head_global(feat_global)
 
-        idx_mhr = self.cfg.model_params_dim
-        idx_shape = idx_mhr + self.cfg.shape_dim
+            idx_mhr = self.cfg.model_params_dim
+            idx_shape = idx_mhr + self.cfg.shape_dim
 
-        pred_mhr_params = global_preds[:, :idx_mhr]
-        pred_shape_params = global_preds[:, idx_mhr : idx_shape]
-        pred_cam_trans = global_preds[:, idx_shape :]
+            pred_mhr_params = global_preds[:, :idx_mhr]
+            pred_shape_params = global_preds[:, idx_mhr : idx_shape]
+            pred_cam_trans = global_preds[:, idx_shape :]
 
-        if self.bound_scales:
+        if self.bound_scales and self.cont_head is None:
             # tanh(0) = 0 maps a zero-init head to the middle of each interval,
             # which is ~0 because they are near-symmetric, so this does not move
             # the starting point of a fresh run.  Static python loop over two
@@ -1033,13 +1230,18 @@ class InstantHMRStudent(nn.Module):
         prob_2d = torch.softmax(logits_2d.float(), dim=-1)
         pred_joints_2d = (prob_2d * self.kp2d_bin_centers.float()).sum(dim=-1)
 
-        return {
+        out = {
             "mhr_params": pred_mhr_params,
             "shape_params": pred_shape_params,
             "cam_trans": pred_cam_trans,
             "joints_2d": pred_joints_2d,
             "joints_2d_logits": logits_2d,
         }
+        if self.cont_head is not None:
+            # Training-only. The deploy wrapper names its four outputs
+            # explicitly, so this never reaches the ONNX graph.
+            out["root_rotmat"] = pred_root_rotmat
+        return out
 
 # ============================================================
 # Cell 8 — The Distillation Loss Module (Foolproof Edition)
@@ -1199,6 +1401,34 @@ class DistillationLoss(nn.Module):
         e = F.smooth_l1_loss(pred, tgt, reduction='none', beta=beta).flatten(1).mean(1)
         return self._mmean(e, mask)
 
+    def root_chordal(self, preds, pred_pose, tgt_pose):
+        """Per-sample squared chordal distance between the two root rotations.
+
+        `||Rp - Rt||_F^2 / 4 == 1 - cos(theta)`, which is `theta^2 / 2` for
+        small errors -- the same curvature SmoothL1 at beta=1.0 has on one
+        angle, so swapping the metric does not silently rescale the term -- and
+        saturates at 2 instead of growing, so a half-turn cannot dominate a
+        batch. Chosen over an `acos` geodesic, whose derivative is unbounded at
+        theta = pi; this one is smooth everywhere (its gradient vanishes at pi,
+        a measure-zero stationary point every chordal rotation loss has).
+
+        Uses the rotation the head actually built when there is one. Rebuilding
+        it from the predicted Euler triple would put `atan2` in the backward
+        path, and the corpus sits near the +-pi/2 gimbal singularity often
+        enough (2.25% within 0.1 rad) for that to matter.
+        """
+        Rp = preds.get("root_rotmat")
+        if Rp is None:
+            Rp = MC.euler_xyz_to_rotmat(pred_pose[:, 3:6])
+        Rt = MC.euler_xyz_to_rotmat(tgt_pose[:, 3:6])
+        # Divided by the 6 root parameters the old term averaged over, so this
+        # swaps the METRIC without also rescaling the loss budget. Measured
+        # without it the chordal term is 6x larger at every angle (0.00015 vs
+        # 0.00003 at 1 deg, 1.99985 vs 0.43736 at 179 deg), which is exactly
+        # that dilution factor -- three of those six parameters are the root
+        # translation, which is identically zero. `w_root_rot` scales from here.
+        return (Rp - Rt.detach()).pow(2).flatten(1).sum(1) * (0.25 / POSE_ROOT_DIM)
+
     def m_mse(self, pred, tgt, mask):
         e = F.mse_loss(pred, tgt, reduction='none').flatten(1).mean(1)
         return self._mmean(e, mask)
@@ -1290,8 +1520,19 @@ class DistillationLoss(nn.Module):
             n = pred_pose.shape[1]
             # Proportional weights: the split changes the MASK, not the
             # root-vs-local balance a single mean over n parameters implied.
-            losses['loss_pose_root'] = self._m_beta(
-                pred_pose[:, :r], tgt_pose[:, :r], m_ident, 1.0) * self.cfg.w_pose * (r / n)
+            if getattr(self.cfg, "root_rot_loss", False):
+                # Rotation-matrix metric. A SmoothL1 in radians scores a
+                # prediction at -pi+eps against a target at pi-eps as a ~2pi
+                # error when the rotation between them is tiny, and 13.59% of
+                # corpus root angles lie beyond 2.8 rad.  Root translation
+                # (0:3) is excluded because it is exactly 0.000e+00 on both
+                # sides under --cont-head and contributes nothing.
+                losses['loss_pose_root'] = (
+                    self._mmean(self.root_chordal(preds, pred_pose, tgt_pose), m_ident)
+                    * self.cfg.w_pose * (r / n) * float(getattr(self.cfg, "w_root_rot", 1.0)))
+            else:
+                losses['loss_pose_root'] = self._m_beta(
+                    pred_pose[:, :r], tgt_pose[:, :r], m_ident, 1.0) * self.cfg.w_pose * (r / n)
             losses['loss_pose'] = self._m_beta(
                 pred_pose[:, r:], tgt_pose[:, r:], m_noflip, beta) * self.cfg.w_pose * ((n - r) / n)
         else:
@@ -2489,6 +2730,15 @@ def parse_args():
     p.add_argument("--no-export", dest="no_export", action="store_true",
                    help="Skip the ONNX export / quantization step after training.")
     p.add_argument("--gpu", type=int, default=None, help="GPU count (informational).")
+    p.add_argument("--cont-head", dest="cont_head", action="store_true",
+                   help="Regress the teacher's continuous space (6D root, 260-dim "
+                        "body, 28 scale PCA coefficients, 2x54 hand blocks; 447 "
+                        "numbers) and convert to the 204-vector inside the model, "
+                        "instead of emitting the 204-vector from one nn.Linear. "
+                        "Also switches the root's parameter loss to a rotation "
+                        "matrix metric, which is not separable from the change. "
+                        "Default off: with it off every tensor here is "
+                        "bit-identical to generation 7.")
     p.add_argument("--bound-scales", dest="bound_scales", action="store_true",
                    help="Squash the body-size parameters (root translation and "
                         "130:204) into the MHR rig's own parameter_limits. "
@@ -2556,6 +2806,9 @@ def main():
     if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
     if args.scale_bound_margin is not None: cfg.scale_bound_margin = args.scale_bound_margin
     if args.kp3d_warmup_steps is not None: cfg.kp3d_warmup_steps = args.kp3d_warmup_steps
+    if getattr(args, "cont_head", False):
+        cfg.cont_head = True
+        cfg.root_rot_loss = True
     if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)
     # An explicit --w_keypoints3d still wins over the preset.
     if args.w_keypoints3d is not None:   cfg.w_keypoints3d = args.w_keypoints3d

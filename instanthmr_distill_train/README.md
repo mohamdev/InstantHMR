@@ -1,4 +1,30 @@
-# InstantHMR Distillation — training scripts
+# InstantHMR — training scripts
+
+## What the labels are — read this first
+
+**Training is supervised by the released ground-truth annotations of
+[`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)**
+— the human MHR fits Meta used to build SAM 3D Body. They are **not** teacher
+inference. Every run in this repo's result tables, and the whole cluster corpus
+(`sam3d_gt_sa1b` / `_aic` / `_harmony4d` / `_coco` / `_mpii`), is of this kind.
+
+Distilling from the `facebook/sam-3d-body-dinov3` model is a supported
+**option**, not the default: `tools/annotate_dataset.py` runs it over your own
+images and is the only thing that writes `data/sam3d_distill_mix/`. Reach for it
+to label imagery the released dataset does not cover, and note the cost — a
+student trained on teacher output cannot exceed the teacher, while one trained on
+the ground truth can.
+
+Two naming traps that follow from the history:
+
+- **"distill" in a filename means nothing about the labels.**
+  `train_distill_mhr_only.py`, `train_distill_jz.py` and the
+  `data/sam3d_distill_mix/` directory keep the name from when distillation was
+  the only path. Only `annotate_dataset.py` produces teacher labels.
+- **"teacher" further down this file usually means "the training target".** Where
+  a number was measured against a label — parameter ranges, oracle ablations,
+  the `adapter_j14_h36m_teacher.npz` fit — the label is the dataset's ground
+  truth unless the text says `annotate_dataset.py` explicitly.
 
 ## Which script
 
@@ -401,6 +427,96 @@ Do not expect the benchmark to move; expect the conditioning to stop lying.
 
 The rotation half of the same correction is **not** settled: see `docs/todo.md`
 item 11.
+
+## `--cont-head` — the teacher's continuous regression space (added 2026-09-12)
+
+**What it changes.** Without it, the student emits the rig-native 204-vector
+straight out of one `nn.Linear`: raw Euler angles and 68 free bone scales.
+SAM 3D Body does not. Its head emits a *continuous* parameterisation and
+converts to the 204-vector inside the head, before MHR sees anything. This flag
+reproduces that pathway.
+
+| the head emits | dims | converted, inside the model, to |
+|---|---|---|
+| root rotation, 6D | 6 | 3 extrinsic-XYZ Euler angles |
+| body pose, continuous | 260 | 130 joint angles |
+| identity coefficients | 45 | passed through unchanged |
+| bone-scale PCA coefficients | 28 | 68 bone scales |
+| two hand blocks | 2 x 54 | the 54 finger channels, overwritten |
+
+447 numbers total — the teacher's 519 minus the 72-dim face block its own
+`forward()` multiplies by zero. They come from a two-layer MLP at the student's
+own 512 width on LayerNorm'd pose-token features (`nn.TransformerDecoder` is
+built here with `norm_first=True` layers and no final norm, so its output is
+unnormalised), plus a learned initial estimate. Camera translation moves to its
+own 3-dim head, unchanged in parameterisation.
+
+**Nothing downstream changes.** The model still returns 204 MHR parameters, 45
+identity coefficients, camera translation and 70 2D keypoints; every loss, the
+forward kinematics, `tools/pth_to_onnx.py` and `instanthmr.inference` see the
+contract they already saw. `config_from_checkpoint` reads the flag back out of
+the weights (the `cont_head.*` buffers ARE the flag), so an export needs no
+argument.
+
+**Why 260 for the body.** 23 three-DoF joints x 6D (138) + 58 one-DoF hinges x
+(sin, cos) (116) + 6 raw translation channels (6). Those last six are the
+`*_length/_width_flexible` parameters at `130:136` — body SIZE, not rotation —
+and **the continuous space does not bound them**, so they keep their own tanh
+against the rig limits exactly as under `--bound-scales`.
+
+**The root convention is the rig's, not the teacher's literal call.**
+`mhr_head.forward()` decodes the root with `roma.rotmat_to_euler("ZYX", R)`.
+Measured against `checkpoints/mhr_model.pt` (md5-identical to the teacher's own
+`assets/mhr_model.pt`): driving `model_params[3:6]` and rigid-fitting the 125
+joints it moves recovers **extrinsic XYZ** to 0.00000–0.014 deg, while roma's
+`"ZYX"` of the same triple is **36–92 deg away** — roma returns the triple
+Z-first, so it is the reverse of the rig's. Either convention round-trips and
+both would train; the rig's is used because only then is the intermediate
+rotation matrix the body's *actual* root rotation, which is what makes the
+accompanying chordal loss a physical angular error rather than a distance in a
+permuted space. All of this lives in `mhr_cont.py`, which is a transcription of
+the teacher's own functions verified at **0.000e+00**.
+
+**Bone scales are bounded as coefficients, and that ends the runaway.**
+`--bound-scales` clamps the 68 expanded scales coordinatewise, which is wrong
+for a PCA head: an arbitrary point of the 68-dim box is generally not in the
+24-dimensional column space `scale_comps` spans, so the clamp silently leaves
+the subspace. The bound moves onto the 28 coefficients, symmetric about zero so
+an untrained head sits exactly on `scale_mean`. Measured: feeding the head
+`N(0, 25)` — the regime that produced a 28,300 km skeleton and killed four runs
+at epochs 24–32 — now gives a **2.66 m** skeleton, scales still in-subspace to
+1.2e-07.
+
+**The root loss changes with it** (`root_rot_loss`, set by the same flag) from
+SmoothL1 on the Euler triple to the squared chordal distance
+`||Rp - Rt||_F^2 / 4`, on the rotation the head built rather than one rebuilt
+from the decoded Euler triple — `atan2` in the backward path is unstable, and
+2.25% of corpus roots sit within 0.1 rad of the ±pi/2 gimbal. Divided by the six
+root parameters the old term averaged over, so it is budget-neutral: 0.00003 vs
+0.00003 at 1 deg, 0.00063 vs 0.00063 at 5 deg, and 0.333 vs 0.437 at 179 deg —
+matched where it matters, saturating instead of growing.
+
+**Cost: none worth measuring.** +0.37 M parameters, and ONNX CPU single-thread
+batch 1 goes 102.03 -> 102.49 ms on `repvit_m2_3` and 64.55 -> 64.19 ms on
+`hgnetv2_b4`. The 980 extra graph nodes are all elementwise on 447 numbers.
+
+**Before using it:**
+
+```sh
+python tools/verify_cont_head.py --data_root data          # 24 gates, exits non-zero on any failure
+python tools/ddp_smoke.py --backbone <name> --w-verts 0.35 --cont-head --data_root data/sam3d_gt_mpii
+```
+
+`instanthmr_distill_train/assets/mhr_cont_head.npz` (30 KB) carries the
+teacher's scale and hand bases plus the measured coefficient bounds;
+`tools/build_cont_head_assets.py` rebuilds it from the teacher checkpoint and
+the corpus. **It is a new file and must be rsynced**, or the job dies at
+startup.
+
+Default off. With it off every tensor in the trainer is bit-identical to the
+previous commit — verified: 1544 state_dict keys, same sha256, forward and all
+12 loss terms 0.000e+00 apart on 48 real augmented samples, under both
+`--losses legacy` and `--losses rebalanced`.
 
 ## Tried and rejected: detaching the 2D head (2026-09-06 / 09-07)
 

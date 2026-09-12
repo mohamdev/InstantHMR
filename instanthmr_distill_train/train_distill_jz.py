@@ -693,6 +693,7 @@ def train(args, cfg, rank, local_rank, world):
             "lr": cfg.lr, "lr_arg": args.lr, "lr_scaling": args.lr_scaling,
             "mix": args.mix, "steps_per_epoch": steps_per_epoch,
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
+            "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
             "jpeg_p": cfg.jpeg_p, "cam_loss": cfg.cam_loss,
             "losses": args.losses, "w_shape": cfg.w_shape,
@@ -1147,6 +1148,14 @@ def parse_args():
                         "farthest-point subset of the rig's own 18,439-vertex "
                         "mesh (default 595, lod6's count). Costs 0.6 ms per "
                         "batch-64 step against 16.7 ms for the full mesh.")
+    p.add_argument("--cont-head", dest="cont_head", action="store_true",
+                   help="Reproduce the teacher's regression pathway: the head "
+                        "emits 447 numbers in its continuous space (6D root, "
+                        "260-dim body, 28 bone-scale PCA coefficients, two "
+                        "54-dim hand blocks) through a two-layer MLP with a "
+                        "learned neutral initial estimate, and converts to the "
+                        "204-vector inside the model. Implies the rotation-matrix "
+                        "root loss. Needs assets/mhr_cont_head.npz.")
     p.add_argument("--losses", choices=("legacy", "rebalanced"), default="legacy",
                    help="Orthogonal to --preset, which only controls the input "
                         "pipeline and the absolute-pose terms. 'rebalanced' applies "
@@ -1186,6 +1195,9 @@ def build_cfg(args):
     cfg.per_dataset_caps = {}            # replaced by the weighted sampler
     if args.backbone:               cfg.backbone = args.backbone
     if args.crop_centre_fix:        cfg.crop_centre_fix = True
+    if args.cont_head:
+        cfg.cont_head = True
+        cfg.root_rot_loss = True
     if args.w_verts is not None:    cfg.w_verts = args.w_verts
     if args.n_verts is not None:    cfg.n_verts = args.n_verts
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
@@ -1294,6 +1306,8 @@ def main():
            f"pose_beta={cfg.pose_beta} kp3d={cfg.kp3d_loss}@{cfg.w_keypoints3d} "
            f"finger_w={cfg.finger_weight}"
            if args.losses != "legacy" else ""))
+    log(f"head      {'continuous (teacher pathway, 447 dims)' if cfg.cont_head else 'linear 204-vector'}"
+        + (f" | root loss = rotation matrix" if cfg.root_rot_loss else ""))
     log(f"surface   w_verts={cfg.w_verts}"
         + (f" over {cfg.n_verts} mesh vertices" if cfg.w_verts > 0 else " (off)")
         + f" | crop_centre_fix={cfg.crop_centre_fix}")

@@ -96,6 +96,28 @@ or augmentation can be measured in under a minute. Do that.
 
 ---
 
+## What the training labels are
+
+**This is not a distillation setup.** Training is supervised by the released
+ground-truth annotations of `facebook/sam-3d-body-dataset` — the human MHR fits
+Meta used to build SAM 3D Body. The whole cluster corpus (`sam3d_gt_sa1b` /
+`_aic` / `_harmony4d` / `_coco` / `_mpii`) and every number in this repo's result
+tables are of that kind.
+
+Distilling from the `sam-3d-body-dinov3` model is an **option**:
+`tools/annotate_dataset.py` runs it over your own images and is the only thing
+that writes `data/sam3d_distill_mix/`. Use it for imagery the released dataset
+does not cover, and remember it caps the student at the teacher's accuracy.
+
+Two consequences for reading this file and the code:
+
+- **`train_distill_*.py` and `data/sam3d_distill_mix/` are historical names.**
+  They say nothing about which labels a run used.
+- **Where the docs say "teacher" they almost always mean "the training
+  target".** Parameter ranges, oracle ablations and
+  `adapter_j14_h36m_teacher.npz` were all measured against the *dataset's*
+  annotations, not against model inference.
+
 ## Where to read first
 
 Docs are the source of truth; the code is bigger than any context window.
@@ -108,7 +130,7 @@ Docs are the source of truth; the code is bigger than any context window.
 | 4 | `benchmark/README.md` | how published numbers are produced; the 3DPW GT (SMPL forward + H36M regressor), the MHR->J14 adapter, and why **J14+adapter** is the row to quote |
 | 5 | `datasets_pipeline/README.md` | how the corpus is built, including the SA-1B visibility mask |
 | 6 | `docs/architecture.md` | the student model |
-| 7 | `docs/todo.md` | open defects and opportunities from the 2026-09-06 audit, each with the measurement behind it |
+| 7 | `docs/todo.md` | open work: reproducing the teacher's regression pathway, the crop-resolution rebuild, model selection. Cleared and rewritten 2026-09-12 |
 
 `datasets_pipeline/jeanzay/` and `JEAN_ZAY.md` are in `.git/info/exclude` on
 purpose — they carry the login name, jump host and project code. Keep
@@ -142,6 +164,33 @@ session to re-derive: `6:136` is exactly invariant to the in-plane rotation
 augmentation, so it never needed the `m_ident` mask; and the 45 `shape_params`
 move the 127-joint skeleton by `0.00e+00 cm`, so they are mesh-only and every
 loss and metric in the trainer is blind to them.
+
+**The teacher's root Euler triple is REVERSED relative to the rig, and its own
+source hides it.** `sam_3d_body/models/heads/mhr_head.py` decodes the global
+rotation with `roma.rotmat_to_euler("ZYX", R)`. roma's *uppercase* letters mean
+extrinsic and it returns the triple in the order of the string, so `"ZYX"` hands
+back `(theta_z, theta_y, theta_x)` -- the reverse of the rig's extrinsic-XYZ
+`model_params[3:6]`. Feeding `(0.3, 0.5, 0.7)` through the teacher's own forward
+returns `(0.7, 0.5, 0.3)`. Measured against `checkpoints/mhr_model.pt` (md5
+8f21d804..., byte-identical to the teacher's `assets/mhr_model.pt`): drive
+`3:6`, rigid-fit the 125 joints it moves, and the recovered rotation matches
+`batch6DFromXYZ` to **0.00000-0.014 deg** while roma's `"ZYX"` of the same
+triple is **36-92 deg away**. Do the fit about the moving sub-skeleton, not the
+centroid and not joint 0 -- the root drives joint-parameter slots 10/11/12, so
+joints 0 and 1 do not move and a centroid Procrustes leaves an 11 mm residual
+that reads as a convention mismatch. Either convention round-trips if encode and
+decode agree, so a wrong choice trains fine and only shows up as a rotation loss
+measuring distance in a permuted space. `instanthmr_distill_train/mhr_cont.py`
+uses the rig's and says so; do not "fix" it to match the teacher's line.
+
+**`--cont-head` adds two files that must be rsynced.**
+`instanthmr_distill_train/mhr_cont.py` and
+`instanthmr_distill_train/assets/mhr_cont_head.npz` (30 KB, built by
+`tools/build_cont_head_assets.py` from the teacher checkpoint plus the corpus).
+Neither existed before 2026-09-12 and the job dies at startup without them.
+Gate any change to that head with `tools/verify_cont_head.py` (24 checks,
+including GT reachability to 0.0003 mm of forward kinematics) *and*
+`tools/ddp_smoke.py --cont-head`.
 
 **The student's MHR outputs are unbounded and 77 of them are body SIZE.** The
 head is a plain `nn.Linear`. `0:3` root translation (exactly `0.000e+00` in all
