@@ -159,6 +159,108 @@ Active core contributions for the paper, strictly prioritized:
 - **Acceleration error ($E_{accel}$, $\text{m/s}^2$)**: Measures discrete second-order joint acceleration differences against ground truth to quantify jitter.
 - **Rigid bone-length variance ($\sigma_{\text{bone}}$)**: Measures temporal scale consistency along rigid kinematic segments (femur, tibia, humerus) across tracks.
 
+### 5. Per-Topology Converter MLPs, Released as a Community Artifact
+
+**Decision (2026-09-09).** Ship one small feedforward converter per target
+topology — `mhr2smpl`, `mhr2soma` — as standalone weights the community can drop
+in front of any MHR-space estimator. The shared-latent / prompt-token version of
+this idea is *deferred*, not dropped; see the measurement below for what it would
+have to prove first.
+
+**Motivation.** Every SMPL number this repo publishes runs
+`benchmark/eval_smpl_fit.py`, which is 400 Adam iterations per frame. Measured on
+an RTX 4070 at batch 64: **0.17 ms/frame** for the mesh plus Meta's barycentric
+map, **42.24 ms/frame** for the fit, **42.4 ms total — 5x the entire 8.06 ms
+student**. Asking InstantHMR for SMPL output currently costs five model
+inferences and a GPU, which is the whole edge story undone at the last step.
+
+**What to build.** An MLP `(MHR 204 + shape 45) -> (theta 23x6D, beta 10)`, root
+taken from the pipeline's existing closed-form Procrustes. Two things matter:
+
+- **Train it with a geometric loss through the SMPL forward, not by regressing
+  the solver's parameters.** Measured on 20,000 pairs (16k train / 4k held out),
+  scored as vertex distance to the same barycentric target the solver optimises:
+
+  | converter | params | latency | held-out vertex error |
+  |---|---|---|---|
+  | regress solver params, linear | 37 k | 0.007 ms | 40.71 mm |
+  | regress solver params, MLP 2x512 | 467 k | 0.033 ms | 39.18 mm |
+  | regress solver params, MLP 3x2048 | 9,208 k | 0.046 ms | 40.10 mm |
+  | **geometric loss, linear** | 37 k | 0.007 ms | 27.00 mm |
+  | **geometric loss, MLP 2x512** | 467 k | 0.033 ms | **19.64 mm** |
+  | **geometric loss, MLP 3x1024** | 2,507 k | 0.051 ms | **19.19 mm** |
+  | the 400-iteration Adam solver | — | 42.4 ms | 20.77 mm |
+
+  Parameter regression plateaus near 40 mm at *every* capacity from 37 k to
+  9.2 M, because the solver trades theta against a 10-dimensional beta in a way
+  that is not a smooth function of the input. Supervise the surface and the same
+  network halves its error — and **beats** the solver, because 400 Adam steps
+  from a cold start get stuck where an amortised network does not.
+
+- **No images are involved.** Pairs come from MHR parameters through the rig, so
+  the whole training set is generated offline in ~15 minutes on one GPU. Nothing
+  to relabel, no cluster job, no way to contaminate a benchmark.
+
+**SOMA.** `python -m tools.mhr2soma --input <parquet-dir> --output-npz out.npz`
+consumes MHR parquet "including SAM 3D Body outputs" — the exact source this
+corpus was built from, and `tools/parquet_to_npz.py` copies `model_params`
+through unchanged, so our 204 numbers are byte-identical to what NVIDIA's
+converter expects. NVIDIA maintains the label generator and it runs in the
+direction we need. SOMA-X is Apache-2.0. Budget a day for the install: it pins
+nothing in its docs, wants NVIDIA Warp and a CUDA-matched torch wheel, and
+`pymomentum` already segfaults in `sam3d_video_312` — keep label generation in a
+separate environment.
+
+**Prior art — do not write the converter up as a contribution.** Fast SAM 3D
+Body's contribution 3 is "a learned feedforward MHR-to-SMPL projection module
+that replaces hundreds of iterative optimization steps, accelerating
+cross-topology mesh conversion by over 10,000x" (`competitors/fastsam3d.pdf`).
+Their f_omega is a 3-layer MLP 4500->512->256->76 over 1,500 barycentric-projected
+vertices, and their Eq. 5 is exactly the geometric-plus-parameter loss above.
+The release value here is a *set* of converters covering SOMA as well as SMPL,
+shipped as usable weights — packaging and coverage, not novelty.
+
+**Accuracy is not the reason to do it.** The documented mesh-conversion floor is
+11.44 mm MPJPE / 10.66 mm PA-MPJPE / 13.61 mm PVE, but floors add in quadrature:
+at EMDB-1's 52.00 mm a perfect native head gives sqrt(52.00^2 - 10.66^2) = 50.90,
+a **1.10 mm** gain (1.17 mm on 3DPW). Quote the speed-up, not the floor.
+
+**Why the shared-latent version is deferred.** Its architectural premise is that
+a head reading `z_body` beats a head reading the predicted MHR parameters. Tested
+directly — 8,000 crops across five splits, same target, same head capacity, same
+schedule, only the input differs:
+
+| what the SMPL head reads | dim | params | held-out vertex error |
+|---|---|---|---|
+| the student's predicted MHR params | 249 | 467 k | 62.90 mm |
+| the shared latent `z_body` | 512 | 601 k | 62.84 mm |
+| the *teacher's* MHR params (oracle) | 249 | 467 k | 31.84 mm |
+
+0.07 mm out of 62.9. On this trunk the MHR head is a sufficient statistic for the
+SMPL target — where the head attaches is worth 0.1%, while the quality of the MHR
+prediction is worth 49%. What this does **not** test is whether a trunk *trained*
+against several rigs learns a different `z`; that is the only version of the
+claim still standing, and it needs a real run.
+
+**If we come back to it, the condition to satisfy is about data, not
+architecture.** Derived labels make the multi-head objective a *reweighting* of
+supervision we already have — and the reviewer's ablation is `--w-verts 0.35`,
+which we already run. The heads carry new information only if the labels do, i.e.
+from datasets with native SMPL/SOMA ground truth and no MHR annotation. Locally
+that is 81,006 EMDB frames outside EMDB-1 and 22,405 3DPW-train crops; the real
+prize is BEDLAM / AGORA / RICH. The headline experiment then becomes *does adding
+native-SMPL datasets through `head_SMPL` improve the MHR benchmark?* Before
+spending a generation on it, run the cheap gate: a paired short fine-tune, one arm
+MHR-only, one arm MHR + a second topology head, measured on 3DPW. The trunk is
+already underfitting (~29 mm off a near-perfect teacher on its own training data,
+79% of trunk gradient serving non-benchmarked outputs), so negative transfer is
+the live risk.
+
+**Verification.** Re-run `benchmark/eval_smpl_fit.py` with the MLP substituted for
+the solver; the two reports must agree to well under a millimetre. Note that the
+measurement above used `SMPL_MALE` throughout while the real evaluator is
+gendered — handle that before release.
+
 ---
 
 ## Audit Backlog & Operational Queue
@@ -551,11 +653,15 @@ MHR forward kinematics and no `--w-verts`), so `v100-16g` stays comfortable and
 CLAUDE.md's "re-add `--constraint=v100-32g` if a bigger backbone pushes past
 ~12 GiB" does not trigger. `hgnetv2_b6` at 9444 MiB would need watching.
 
-**Plan.** Generation 6 finishes first — it is the `--w-verts` on/off comparison
-and that is the loss baseline; swapping the trunk underneath it would confound
-both questions. Then the backbone comparison runs as its own axis: **3 seeds per
-backbone** (`repvit_m2_3` and `hgnetv2_b4`) on the **full corpus including
-SA-1B**, everything else held at gen-6.
+**Plan — launched 2026-09-10 as generation 7.** Generation 6 answered the
+`--w-verts` question first (`g6bv_s`, baseline preset + surface term, 41.67 mm
+J14 PA), so the trunk is now the only axis moving: **2 seeds per backbone**
+(`repvit_m2_3` and `hgnetv2_b4`) on the **full corpus including SA-1B**,
+everything else held at gen-6's winning arm. Two seeds, not the three written
+here originally — the seed spread is wide enough that two will only resolve a
+gap of a few mm, so read a sub-2 mm result as "not separated". The launch block,
+the mixture and the local verification table are in
+`datasets_pipeline/jeanzay/STATUS.md`, "Generation 7".
 
 Two things SA-1B changes, both already handled but both easy to get wrong:
 
@@ -694,6 +800,59 @@ OOM'd on 16 GB cards were at 14.99 GiB.
 
 ---
 
+
+### 16. Depth reweighting — tested 2026-09-09, rejected
+
+**Do not re-try this.** The hypothesis was that the depth channel is where the
+remaining 3D error lives, so weighting it harder should help. It does not, and
+the mechanism check says why.
+
+The reasoning that motivated it: measured on 2,048 unaugmented crops, the 3D
+error decomposes into an in-plane part that *equals the model's own 2D-head
+error* — COCO 20.6 mm against 20.5, Harmony4D 32.7 against 31.0 — and a depth
+part (23.9 / 37.5 mm) with no comparable bound. In-plane is saturated at the
+precision of the SimCC branch, which is also why anatomical routing (item 1) has
+nothing to win. But "no bound found" is not "headroom exists", and that was the
+error.
+
+Two interventions, both gated so the default is bit-identical:
+
+* **`depthw`** — `loss_3d_native`'s unsquared Euclidean made anisotropic,
+  `sqrt(dx^2 + dy^2 + (lam*dz)^2)`, lam = 2.5.
+* **`fore`** — an explicit term on the out-of-plane extent `|dz|` of 8 rigid
+  limbs (femur, tibia, humerus, forearm, both sides) indexed via
+  `benchlib.joints.J14_FROM_MHR70`.
+
+Four tests, J14+adapter PA-MPJPE on 3DPW test, paired (same seed, same data
+order, only the loss differs):
+
+| regime | base | `depthw` | `fore` |
+|---|---|---|---|
+| 4,000-step fine-tune from `g6bv_s`, 2 seeds, stride 2 | 44.07 | 44.12 (+0.05) | 44.19 (+0.12) |
+| `hgnetv2_b4` from scratch, 18,000 steps, 2 seeds, stride 4 | 64.06 | 65.09 (+1.03) | 64.25 (+0.19) |
+
+Everything is inside noise (base seed spread 0.55 mm in the fine-tune, 1.32 mm
+from scratch), and every arm is on the wrong side of its control.
+
+**The diagnostic is the actual finding.** Weighting the depth residual 2.5x
+harder moved the measured depth error by **0.3% on one seed and 0.9% the wrong
+way on the other** (1,024 unaugmented COCO crops, in-plane/depth split per
+checkpoint). The loss did not do what it was built to do. That is what you expect
+if the model is already at the information limit of a single 224 crop: in-plane
+is capped by the 2D branch's precision, depth by monocular ambiguity. Both
+channels are saturated, for different reasons.
+
+**Corollary.** No loss and no architecture that re-routes *existing* image
+evidence can move depth. Only new information can — a second view, temporal
+context (item 4), or a known focal (item 3). That is a useful constraint on the
+roadmap, not just a dead end.
+
+*Incidental:* `hgnetv2_b4` from scratch runs at 0.062-0.068 s/it at batch 32 on
+an RTX 4070, 1.6x faster than `repvit_m2_3`'s 0.107, consistent with item 12.
+18,000 steps on the 92k local subset reaches ~64 mm, so this budget is a paired
+A/B instrument only — the absolute number means nothing.
+
+---
 ## Evaluation hygiene the audit raised
 
 Not code defects, but they gate a submission.
