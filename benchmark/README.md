@@ -2,6 +2,13 @@
 
 Evaluation harness for publishing numbers on `models/instanthmr_mhr_only_ckpt90.onnx`.
 
+> **A note on the word "teacher" below.** The models under test are trained on
+> the **released ground-truth annotations** of `facebook/sam-3d-body-dataset`,
+> not on teacher inference. Where this file says "teacher labels" or names a
+> file `adapter_*_teacher.npz`, it means *the dataset's own MHR annotations* —
+> the filenames are historical. Only `tools/annotate_dataset.py` produces
+> genuine teacher output, and it writes `data/sam3d_distill_mix/`.
+
 Three benchmarks are implemented — two 3D, one 2D:
 
 | Benchmark | What it measures | Data cost | Status |
@@ -404,7 +411,7 @@ which is the most recent one carrying every baseline:
 
 Read that with the 18.8 mm conversion floor in mind: those baselines all predict
 SMPL directly and pay no rig-conversion cost, and the floor already contains the
-teacher's own error. It is not separable from the model's error without perfect
+error in the dataset's own MHR fits. It is not separable from the model's error without perfect
 MHR ground truth, so the honest statement is "53.8 mm, of which up to 18.8 mm is
 the MHR→SMPL conversion", not a corrected number.
 

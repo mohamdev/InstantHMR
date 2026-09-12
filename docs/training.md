@@ -1,5 +1,14 @@
 # Training
 
+**Label source.** Training is supervised by the released ground-truth
+annotations of
+[`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)
+— the human MHR fits used to build SAM 3D Body — not by teacher inference.
+Distilling from `facebook/sam-3d-body-dinov3` with `tools/annotate_dataset.py`
+is an option for imagery the dataset does not cover; see
+[`docs/annotation.md`](annotation.md). The `train_distill_*.py` filenames are
+historical and say nothing about which labels you are using.
+
 The InstantHMR training notebook is
 [`notebooks/distill_transformer_decoder.ipynb`](../notebooks/distill_transformer_decoder.ipynb).
 It is the source of truth for the notebook workflow — this page is a tour, not a

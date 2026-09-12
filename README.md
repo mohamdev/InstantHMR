@@ -2,11 +2,17 @@
 
 ![InstantHMR demo](models/instanthmr.gif)
 
-A lightweight, ONNX-exportable distillation of
+A lightweight, ONNX-exportable MHR body regressor for **3D human pose estimation
+and mesh recovery**: a RepViT-M1.5 backbone + a 9-token cross-attention decoder +
+CLIFF camera conditioning.
+
+It is trained on the **released ground-truth annotations** of
+[`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)
+— the human MHR fits used to build SAM 3D Body — predicting per-person MHR
+parameters and 70 keypoints from a single 224×224 crop. Distilling from
 [`facebook/sam-3d-body-dinov3`](https://huggingface.co/facebook/sam-3d-body-dinov3)
-for **3D human pose estimation and mesh recovery**: a RepViT-M1.5 backbone + a 9-token
-cross-attention decoder + CLIFF camera conditioning. The model released by [`NaturalPad`](https://www.naturalpad.fr/) was trained to mimic the
-SAM3D teacher's per-person 70-keypoint outputs from a single 224×224 crop.
+by running the model over your own images is supported as an **option** (see
+[Training](#training)), but it is not how the shipped models were trained.
 
 InstantHMR ships as a single `.onnx` file. The demo pipeline pairs it with
 **RF-DETR** for person detection — both stages are timed independently so
@@ -315,13 +321,25 @@ exact same `images/*.png` + `annotations/*.npz` layout** that
 [`notebooks/distill_transformer_decoder.ipynb`](notebooks/distill_transformer_decoder.ipynb)
 consumes, so the training notebook is identical either way:
 
-1. **Distillation (default).** Run the SAM3D teacher over your own images with
+1. **Released ground-truth annotations — this is what every shipped model uses.**
+   Train directly on
+   [`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)
+   — the human MHR fits used to build SAM 3D Body — converted to the `.npz`
+   schema by [`tools/parquet_to_npz.py`](tools/parquet_to_npz.py) and laid out
+   by [`datasets_pipeline/build_split.py`](datasets_pipeline/build_split.py)
+   into `data/sam3d_gt_<dataset>/`. The cluster corpus is entirely of this kind
+   (sa1b / aic / harmony4d / coco / mpii).
+2. **Teacher distillation — an option, not the default.** Run
+   `facebook/sam-3d-body-dinov3` over your own images with
    [`tools/annotate_dataset.py`](tools/annotate_dataset.py) to generate
    per-person pseudo-labels — see [`docs/annotation.md`](docs/annotation.md).
-2. **Original ground-truth annotations.** Train directly on the released
-   [`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)
-   — the human MHR fits used to build SAM 3D Body — converted to the same
-   `.npz` schema by [`tools/parquet_to_npz.py`](tools/parquet_to_npz.py).
+   This is the only thing that writes `data/sam3d_distill_mix/`. Use it to label
+   imagery the released dataset does not cover; note that it caps the student at
+   the teacher's own accuracy, which training on the ground truth does not.
+
+The trainer entry points and the `data/sam3d_distill_mix` directory keep
+"distill" in their names for historical reasons. The name does **not** mean the
+labels are teacher inference — only `tools/annotate_dataset.py` produces those.
 
 ### Train on the original annotations (COCO example)
 
@@ -422,7 +440,7 @@ prefixed per dataset, so they never collide.
   (RepViT backbone, 9-query decoder, CLIFF condition).
 - **[`docs/annotation.md`](docs/annotation.md)** — training data generation
   with the SAM3D teacher.
-- **[`docs/training.md`](docs/training.md)** — distillation and ONNX export.
+- **[`docs/training.md`](docs/training.md)** — training and ONNX export.
 
 ## License
 
@@ -432,5 +450,5 @@ The code in this repository is released under the **Apache License 2.0**
 The model weights distributed at
 <https://huggingface.co/momolesang/InstantHMR> are released under the
 [SAM license](https://github.com/facebookresearch/sam-3d-body), since
-InstantHMR is a distillation of `facebook/sam-3d-body-dinov3`. Please
+InstantHMR is trained on `facebook/sam-3d-body-dataset` labels. Please
 review the SAM and RF-DETR licenses before downstream use.

@@ -78,16 +78,22 @@ Both `joints_3d` and `cam_trans` are in metres in the SAM3D camera frame:
   `[-1, 1]`; the demo's `instanthmr/inference.py` re-projects them to
   full-frame pixels using the bbox-derived crop transform.
 
-## Why distill?
+## Why a small model at all?
 
-The DINOv3-based teacher is excellent but heavy: its tokenizer + decoder runs
-at <20 FPS on a desktop GPU and doesn't fit comfortably on edge hardware.
-Distillation gives us InstantHMR — a model that:
+SAM 3D Body is excellent but heavy: its DINOv3 tokenizer + decoder runs at
+<20 FPS on a desktop GPU and doesn't fit comfortably on edge hardware. Training
+a compact student on the **same ground-truth MHR annotations Meta used to build
+it** (`facebook/sam-3d-body-dataset`) gives us InstantHMR — a model that:
 
 - runs at ~200 FPS on a single RTX 4070, 
 - exports to ONNX / TFLite / QNN, and
 - preserves the SAM3D 70-keypoint & MHR outputs, so any downstream code that
   consumed `pred_keypoints_3d` keeps working.
+
+Distilling from the `sam-3d-body-dinov3` model instead is an option
+(`tools/annotate_dataset.py`) and is useful for imagery the released dataset
+does not cover — but it caps the student at the teacher's accuracy, which
+training on the ground truth does not.
 
 ## Detection: RF-DETR
 

@@ -1,5 +1,12 @@
 Audit of the working tree on 6 September 2026
 
+> **Historical record — kept as written, not updated.** Read it as a snapshot of
+> 6 September 2026; several findings below were acted on or superseded later.
+> One terminology note: where this audit says "teacher" or "distillation" it
+> means the training *targets*, which are the released ground-truth annotations
+> of `facebook/sam-3d-body-dataset`, not inference from the
+> `sam-3d-body-dinov3` model. See `CLAUDE.md`, "What the training labels are".
+
 The best opportunity is to improve what the student learns from its supervision before increasing the backbone. There are also confirmed evaluation/export defects that must be fixed before measuring a new method. Three research directions below could support separate papers, but their accuracy gains and novelty remain experimental questions; none is a guaranteed CVPR contribution.
 
 Scope: inspected the current MHR-only trainer, DDP driver, augmentation and conversion code, evaluation, inference/export, available run configurations/results, and relevant primary research. Existing uncommitted changes were included in the audit and preserved. Numerical probes ran on CPU with the local TorchScript rig, local annotations, and the epoch-137 EMA checkpoint b3_s1. CUDA was unavailable to this process, so there was no new GPU timing, distributed reproduction, or training sweep. The small probes are diagnostics, not new benchmark results.

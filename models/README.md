@@ -9,7 +9,7 @@ tags:
   - human-mesh-recovery
   - 3d-pose-estimation
   - onnx
-  - distillation
+  - mhr
   - sam3d
   - repvit
   - cliff
@@ -20,12 +20,14 @@ base_model: facebook/sam-3d-body-dinov3
 
 ![InstantHMR demo](instanthmr.gif)
 
-A lightweight, ONNX-exportable distillation of
-[`facebook/sam-3d-body-dinov3`](https://huggingface.co/facebook/sam-3d-body-dinov3)
-for **3D human pose estimation and mesh recovery**: a RepViT-M1.5
-backbone + a 9-token cross-attention decoder + CLIFF camera conditioning.
-Trained to mimic the SAM3D teacher's per-person 70-keypoint outputs from
-a single 224×224 crop.
+A lightweight, ONNX-exportable MHR body regressor for **3D human pose
+estimation and mesh recovery**: a RepViT-M1.5 backbone + a 9-token
+cross-attention decoder + CLIFF camera conditioning.
+
+Trained on the released ground-truth annotations of
+[`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset)
+— the human MHR fits used to build SAM 3D Body — predicting per-person MHR
+parameters and 70 keypoints from a single 224×224 crop.
 
 Demo, training, and inference code live at the main InstantHMR
 repository: <https://github.com/mohamdev/InstantHMR>.
@@ -35,7 +37,7 @@ repository: <https://github.com/mohamdev/InstantHMR>.
 | File | Size | Purpose |
 |---|---|---|
 | `instanthmr.onnx` | ~77 MB | fp16 ONNX export — what the demo and `InstantHMR(...)` wrapper load. |
-| `instanthmr.pth`  | ~461 MB | PyTorch checkpoint for fine-tuning / further distillation. |
+| `instanthmr.pth`  | ~461 MB | PyTorch checkpoint for fine-tuning. |
 
 Most users only need `instanthmr.onnx`. The `.pth` is included for people
 who want to continue training, swap the head, or re-export with different
@@ -131,7 +133,7 @@ when you need vertices.
 ## License
 
 These weights are released under the **SAM license**, since InstantHMR
-is a distillation of `facebook/sam-3d-body-dinov3`. Refer to
+is trained on `facebook/sam-3d-body-dataset` labels. Refer to
 <https://github.com/facebookresearch/sam-3d-body> for the full license
 text and applicable use restrictions.
 

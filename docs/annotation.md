@@ -1,10 +1,21 @@
-# Building the training dataset
+# Building a training dataset by teacher annotation (optional path)
 
-InstantHMR is supervised entirely by the **SAM3D teacher**
+> **This page describes the OPTIONAL distillation path.** The default — and what
+> every shipped model and published number in this repo actually used — is the
+> released ground-truth annotations of
+> [`facebook/sam-3d-body-dataset`](https://huggingface.co/datasets/facebook/sam-3d-body-dataset),
+> laid out by `datasets_pipeline/build_split.py` into `data/sam3d_gt_<dataset>/`.
+> See `datasets_pipeline/README.md`.
+>
+> Use this page when you need labels for imagery the released dataset does not
+> cover. The cost is a ceiling: a model trained on teacher output cannot exceed
+> the teacher, while one trained on the ground truth can.
+
+On this path InstantHMR is supervised by the **SAM3D teacher**
 (`facebook/sam-3d-body-dinov3`): for every detector-found person we run
 the teacher and store its outputs alongside a tight 224×224 crop. The
-training loop in `notebooks/distill_transformer_decoder.ipynb` then learns
-to mimic those teacher outputs from the crop alone.
+training loop then learns to mimic those teacher outputs from the crop alone.
+This is the only thing that writes `data/sam3d_distill_mix/`.
 
 The bundled `tools/annotate_dataset.py` uses YOLO for the
 detector during annotation. That choice is independent of the runtime
