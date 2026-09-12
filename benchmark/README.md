@@ -435,9 +435,97 @@ Per-joint, the error is concentrated in the extremities the adapter has to
 extrapolate — `left/right_hand` at 97-98 mm and the wrists at 79-82 mm, against
 30-40 mm at the collars, neck, pelvis and hips.
 
+### `--fit-iters 400` is too low by ~4x — every number below it is inflated (2026-09-11)
+
+**The default was not converged**, and it is the reason this repo carried three
+mutually inconsistent conversions. On 3DPW test the fit leaves **16.13 mm** of
+surface residual at 400 iterations and **7.96 mm** at 4000; the metrics move
+with it, by far more than any model change on the roadmap:
+
+| fit-iters | residual | PVE | J14 PA | SMPL24 PA |
+|---|---|---|---|---|
+| 400 | 16.13 | 82.34 | 45.95 | 49.16 |
+| 1500 | 8.94 | 80.96 | 42.71 | 46.56 |
+| 4000 | 7.96 | 81.01 | 42.33 | 45.93 |
+
+Worse, **the sign is not predictable**: on EMDB, PVE gets *worse* as the fit
+converges (92.45 -> 93.84 -> 94.07) because at 400 iterations the fit is
+accidentally regularised toward the SMPL mean shape. A number you cannot
+defend without saying how long Adam ran is not a protocol. Use >= 1500, or
+skip the fit entirely (next section). The EMDB table two sections down was
+produced at 400 and is inflated.
+
+### The conversion, settled: one surface, one operator on both sides
+
+`barycentric_transfer` already returns the prediction **in SMPL topology**,
+vertex i <-> SMPL vertex i. So the SMPL parameter fit is not needed to reach
+either PVE or a regressed joint set — it exists only to recover the 24
+*kinematic* joints, which come off the kinematic chain. Measured on identical
+predictions, a converged fit converges *toward* the fit-free answer, so all it
+adds in those cases is a hyperparameter with a 3-4 mm blast radius.
+
+The protocol, in order of what the ground truth actually *is*:
+
+| metric | GT is | conversion |
+|---|---|---|
+| **PVE / PA-PVE** | vertices | none — compare directly |
+| **3DPW J14** | `J_regressor_h36m @ GT verts` | same regressor on **both** sides, so its bias cancels exactly |
+| **EMDB SMPL-24** | kinematic joints | a vertex regressor approximates these; costs ~1.1 mm (see below) |
+
+Nothing here is fitted by us: only the rig, Meta's published barycentric map,
+and the benchmark's own regressor. There is no optimiser and no free parameter,
+so the failure above cannot recur.
+
+**The one approximation, quantified.** EMDB's 24 kinematic joints are not a
+linear function of posed vertices. Regressing them from the surface carries, on
+EMDB GT bodies, **10.15 mm mid-hip / 7.02 mm Procrustes** of bias. Errors add in
+quadrature, so at a ~50 mm error level that costs **~1.1 mm** of PA-MPJPE:
+sqrt(50.73^2 + 7.02^2) = 51.2 against 51.82 measured. Quote it; do not
+reach for the fit to remove it unless you run >= 1500 iterations.
+
+**Conversion floor, measured on EMDB (2026-09-11).** `make_mhr_gt.py`'s cached
+MHR fit of EMDB's own GT, pushed through this exact forward path — the oracle
+row, the best any MHR-rigged model could score:
+
+| | MPJPE | PA-MPJPE | PVE |
+|---|---|---|---|
+| oracle (conversion floor) | 18.64 | **12.36** | 19.92 |
+
+The oracle's own surface fit leaves 9.40 mm, so this is an **upper bound** on
+conversion cost, not a tight estimate. At a 51.8 mm result, a 12.4 mm floor
+contributes ~1.5 mm in quadrature: **conversion is not what separates this
+model from SOTA.** Do not subtract it — errors do not add linearly.
+
+### The EMDB person-box convention: quote `--bbox annotated` for published tables
+
+Not because it scores better — it scores **8-12 mm worse**, and it changes the
+ranking. Measured over all 24,103 frames, PA-MPJPE penalty for switching from
+projected-GT-joint boxes to EMDB's own:
+
+| run | gt-joints | annotated | penalty |
+|---|---|---|---|
+| b3_s1 | 53.16 | 60.15 | +6.99 |
+| g6bv_s | 52.01 | 60.33 | +8.32 |
+| g6b_s | 54.78 | 63.30 | +8.52 |
+| g6v_s (v2) | 52.50 | 64.36 | **+11.86** |
+| g6vv_s (v2) | 51.81 | 63.81 | **+12.00** |
+
+Published "Oracle: annotated bounding boxes" rows use EMDB's own boxes, so that
+is the only row that may sit beside them. Picking the cheaper convention while
+comparing against papers that used theirs is the same error as picking a
+flattering joint conversion.
+
+**`--preset v2` is markedly more box-sensitive** (~12 mm against ~8.4 mm), which
+reverses the ranking: g6vv_s is best under projected boxes and *fourth* under
+EMDB's. v2 sets `cliff_follows_aug`, so the model leans harder on the CLIFF
+vector describing its crop; EMDB's boxes are 17.5 % larger and 5.7 % off-centre
+against the padded boxes it trained on. Truncation augmentation does not cover
+this mismatch. Check both conventions before claiming a v2 win.
+
 ### EMDB-1, SMPL space via mesh conversion (2026-09-08)
 
-All 17 sequences, all 24,103 frames, projected-GT-joint boxes, `--fit-iters 400`.
+All 17 sequences, all 24,103 frames, projected-GT-joint boxes, `--fit-iters 400`
+— **inflated, see the fit-iters section above; kept for provenance only.**
 Report in `benchmark/results/emdb1_smplfit_gt-joints.json`.
 
 | run | epoch | MPJPE | **PA-MPJPE** | PVE | PA-PVE | mean fit residual |
@@ -469,6 +557,54 @@ Note the headline gain is only ~1.8 mm even though the conversion floor drops
 linearly. Treating model and conversion error as independent, sqrt(50^2 +
 18.8^2) = 53.4 against sqrt(50^2 + 10.7^2) = 51.1, so ~2.3 mm predicted against
 1.8 mm observed. The real win is that **PVE exists at all**.
+
+### Generation 6 — the `preset x --w-verts` 2x2 (2026-09-11)
+
+Scored through the fit-free conversion above, all frames, `best_student_model_v3.pth`
+(selected on 3DPW validation). All four are seed 0, `--losses rebalanced
+--cliff-focal --bound-scales --anomaly-safe-fallback --crop-centre-fix`.
+
+**3DPW test** — 35,463 person-frames, J14/H36M, published-protocol GT:
+
+| run | preset | w_verts | ep | MPJPE | PA-MPJPE | PVE | PA-PVE | J14+adapter PA |
+|---|---|---|---|---|---|---|---|---|
+| g6vv_s | v2 | 0.35 | 239 | 67.71 | **42.69** | 81.01 | **57.68** | **41.77** |
+| g6v_s | v2 | 0 | 225 | **67.27** | 43.16 | **80.57** | 58.07 | 42.21 |
+| g6bv_s | baseline | 0.35 | 247 | 70.31 | 43.30 | 83.51 | 58.51 | 42.55 |
+| g6b_s | baseline | 0 | 102 | 73.98 | 45.27 | 87.92 | 61.07 | 44.44 |
+| b3_s1 (gen5) | baseline | 0 | 137 | 69.10 | 43.03 | 82.81 | 58.31 | 41.81 |
+| bno_s0 (gen5) | v2 | 0 | 85 | 69.84 | 44.80 | 83.39 | 60.04 | 43.78 |
+
+**EMDB-1** — 24,103 frames, SMPL-24 kinematic, projected-GT-joint boxes (for the
+`--bbox annotated` row that belongs beside published tables, see above):
+
+| run | preset | w_verts | ep | MPJPE | PA-MPJPE | PVE | PA-PVE |
+|---|---|---|---|---|---|---|---|
+| g6vv_s | v2 | 0.35 | 239 | **78.71** | **51.81** | **94.71** | **61.67** |
+| g6bv_s | baseline | 0.35 | 247 | 79.20 | 52.01 | 95.01 | 61.69 |
+| g6v_s | v2 | 0 | 225 | 79.44 | 52.50 | 95.29 | 62.68 |
+| g6b_s | baseline | 0 | 102 | 83.31 | 54.78 | 99.82 | 64.30 |
+| b3_s1 (gen5) | baseline | 0 | 137 | 78.01 | 53.16 | 94.17 | 63.66 |
+| bno_s0 (gen5) | v2 | 0 | 85 | 80.55 | 55.36 | 96.82 | 65.88 |
+
+**`--preset v2` is the win, and it lands where the mechanism says it should.**
+At nearly matched epochs (g6bv_s 247 vs g6vv_s 239), 3DPW MPJPE drops **2.60 mm**
+and PVE **2.50 mm** while PA-MPJPE moves only 0.61 mm. That is the signature of
+v2's absolute-pose supervision — `w_reproj` 0.01 -> 0.5 and the unsquared
+Euclidean `loss_cam` fix *where the body sits*, and Procrustes discards exactly
+that. Read it next to the box-sensitivity finding above before shipping it.
+
+**`--w-verts 0.35` does not deliver what it was added for.** At matched epochs it
+moves PVE by -0.58 mm on EMDB and **+0.44 mm on 3DPW** — the wrong sign, net
+~zero. PVE is the only metric that can see the 45 `shape_params`, so this was
+the row where the surface term should have shown up. It did not, at one seed.
+
+**g6b_s is not a fair member of the 2x2.** Its best checkpoint is epoch 102
+against the others' 225-247 and its run died at 171 of a 300-epoch
+`OneCycleLR`, so it never annealed. Its ~2 mm deficit is maturity.
+
+**One seed per arm.** Every gap above except the v2 MPJPE/PVE effect is under
+1 mm, well inside seed spread. Only the 2.5 mm v2 result is safe to act on.
 
 ### What these metrics cannot see
 
@@ -515,9 +651,11 @@ camera translation never enters the metric.
 `good_frames_mask` is set and the subject is at least 60 % inside the image.
 Metrics are over the 24 SMPL kinematic joints, aligned at the midpoint of the
 two hips (SMPL indices 1 and 2, not the `pelvis` joint), reached through the
-fixed MHR70 → SMPL-24 map fitted on 3DPW train teacher labels. PA-MPJPE is
-Procrustes with uniform scale. Person boxes: say which of the two conventions
-above you used. PVE is not reported — see the EMDB section for why.
+rig mesh and Meta's barycentric map, then a vertex regressor (see "The
+conversion, settled" — the ~1.1 mm kinematic approximation is quoted with the
+result). PA-MPJPE is Procrustes with uniform scale. PVE is vertex-to-vertex
+against the GT SMPL mesh, mid-hip aligned. Person boxes: say which of the two
+conventions you used, and use `--bbox annotated` for any published comparison.
 
 **COCO val2017.** Top-down with **ground-truth boxes**, one crop per annotated
 person with `num_keypoints ≥ 1` and `iscrowd = 0`. These AP numbers are *not*

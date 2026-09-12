@@ -1,0 +1,146 @@
+{
+  "instanthmr_distill_train/runs/g7r_s0/g7r_s0/best_student_model_v3.pth|h36m": {
+    "ckpt": "instanthmr_distill_train/runs/g7r_s0/g7r_s0/best_student_model_v3.pth",
+    "gt": "h36m",
+    "split": "validation",
+    "stride": 5,
+    "epoch": 169,
+    "source": "ema",
+    "n": 1993,
+    "n_dropped": 0,
+    "results": [
+      {
+        "joint_set": "J14",
+        "num_joints": 14,
+        "num_samples": 1993,
+        "MPJPE_mm": 103.90234720126412,
+        "PA_MPJPE_mm": 63.38082033985036,
+        "PCK3D_50mm": 0.44731560461615655,
+        "PCK3D_100mm": 0.8547415955845459,
+        "AUC_0_150mm": 0.581793188602505,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 56.85948093194728,
+          "right_knee": 48.547847304625115,
+          "right_hip": 93.48160213603958,
+          "left_hip": 79.84831634941624,
+          "left_knee": 42.368813230012584,
+          "left_ankle": 57.1097939616838,
+          "right_wrist": 74.59096379795069,
+          "right_elbow": 56.99275884049035,
+          "right_shoulder": 46.58418912944933,
+          "left_shoulder": 47.12430108487619,
+          "left_elbow": 62.35690634119856,
+          "left_wrist": 70.64812134640509,
+          "neck": 28.415358839382485,
+          "head": 122.40303146442776
+        }
+      },
+      {
+        "joint_set": "J12",
+        "num_joints": 12,
+        "num_samples": 1993,
+        "MPJPE_mm": 101.33608351059434,
+        "PA_MPJPE_mm": 58.47637562965319,
+        "PCK3D_50mm": 0.49790934938953,
+        "PCK3D_100mm": 0.9057534704800134,
+        "AUC_0_150mm": 0.6126064883004495,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 53.655452915405846,
+          "right_knee": 50.538598104998165,
+          "right_hip": 94.88849772018665,
+          "left_hip": 80.98289262973533,
+          "left_knee": 42.88079426469913,
+          "left_ankle": 54.47031725378426,
+          "right_wrist": 68.33861065226719,
+          "right_elbow": 49.76684152737039,
+          "right_shoulder": 44.36023974855144,
+          "left_shoulder": 42.89197693615923,
+          "left_elbow": 53.18353818410083,
+          "left_wrist": 65.75874761857979
+        }
+      },
+      {
+        "joint_set": "J14+adapter",
+        "num_joints": 14,
+        "num_samples": 1993,
+        "MPJPE_mm": 71.46007771292817,
+        "PA_MPJPE_mm": 39.93041587262252,
+        "PCK3D_50mm": 0.7482976130743316,
+        "PCK3D_100mm": 0.9567414522256469,
+        "AUC_0_150mm": 0.7317373479991028
+      }
+    ]
+  },
+  "instanthmr_distill_train/runs/g7h_s0/g7h_s0/best_student_model_v3.pth|h36m": {
+    "ckpt": "instanthmr_distill_train/runs/g7h_s0/g7h_s0/best_student_model_v3.pth",
+    "gt": "h36m",
+    "split": "validation",
+    "stride": 5,
+    "epoch": 107,
+    "source": "ema",
+    "n": 1993,
+    "n_dropped": 0,
+    "results": [
+      {
+        "joint_set": "J14",
+        "num_joints": 14,
+        "num_samples": 1993,
+        "MPJPE_mm": 104.55982490458405,
+        "PA_MPJPE_mm": 65.93545723714554,
+        "PCK3D_50mm": 0.42409146297756434,
+        "PCK3D_100mm": 0.8353164647695506,
+        "AUC_0_150mm": 0.568342886739533,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 64.19624479582436,
+          "right_knee": 50.74390423789055,
+          "right_hip": 95.92368380209209,
+          "left_hip": 81.13944986939818,
+          "left_knee": 45.85929759842022,
+          "left_ankle": 62.16279393248126,
+          "right_wrist": 80.60291493429548,
+          "right_elbow": 59.837420844358356,
+          "right_shoulder": 48.020763238307765,
+          "left_shoulder": 46.653383851617825,
+          "left_elbow": 62.65661110302429,
+          "left_wrist": 77.38705180161271,
+          "neck": 29.98179263390863,
+          "head": 117.93108867680598
+        }
+      },
+      {
+        "joint_set": "J12",
+        "num_joints": 12,
+        "num_samples": 1993,
+        "MPJPE_mm": 101.93417681696192,
+        "PA_MPJPE_mm": 61.96334827986432,
+        "PCK3D_50mm": 0.46483525673189496,
+        "PCK3D_100mm": 0.8771951831409934,
+        "AUC_0_150mm": 0.5936517057011368,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 60.675849979517814,
+          "right_knee": 52.61648682866706,
+          "right_hip": 96.62411961742293,
+          "left_hip": 82.1574260874414,
+          "left_knee": 46.535775669858026,
+          "left_ankle": 59.28138744913558,
+          "right_wrist": 74.83031419970418,
+          "right_elbow": 52.28211428433266,
+          "right_shoulder": 46.93795907879271,
+          "left_shoulder": 43.69254107647294,
+          "left_elbow": 54.286340260518216,
+          "left_wrist": 73.63986482650833
+        }
+      },
+      {
+        "joint_set": "J14+adapter",
+        "num_joints": 14,
+        "num_samples": 1993,
+        "MPJPE_mm": 71.92407096255458,
+        "PA_MPJPE_mm": 43.644587072587775,
+        "PCK3D_50mm": 0.705684180345495,
+        "PCK3D_100mm": 0.9385707117769335,
+        "AUC_0_150mm": 0.7105734124736115
+      }
+    ]
+  }
+}

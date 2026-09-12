@@ -92,7 +92,10 @@ def parse_args():
     p.add_argument("--bbox", default="gt-joints", choices=["gt-joints", "annotated"],
                    help="EMDB only; 3DPW always uses projected-GT-joint boxes")
     p.add_argument("--fit-iters", type=int, default=400,
-                   help="400 is within 0.3 mm of 550 on the round trip")
+                   help="USE >= 1500. 400 converges on the round trip but NOT "
+                        "on real predictions: 16.1 mm residual on 3DPW vs 8.0 "
+                        "at 4000, worth 3.6 mm of J14 PA-MPJPE, and the sign "
+                        "differs per dataset. See benchmark/README.md.")
     p.add_argument("--fit-batch", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=10)
