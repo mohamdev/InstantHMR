@@ -37,6 +37,10 @@ Usage
     # Video file
     python demo.py --video path/to/clip.mp4
 
+    # Video file, with the saved SAM 3D Body teacher overlaid for comparison
+    # (bare flag reads reference/<video stem>.npz)
+    python demo.py --video vid1.mp4 --mhr-model --show-reference
+
     # Live camera (index 0)
     python demo.py --camera 0
 """
@@ -54,6 +58,7 @@ import numpy as np
 
 from instanthmr import PosePipeline, onnx_output_names
 from instanthmr.mhr_renderer import DEFAULT_MHR_SCRIPT
+from instanthmr.reference import ReferenceTrack, resolve_reference
 from instanthmr.smoothing import TemporalSmoother
 from instanthmr.visualizer import RerunVisualizer
 
@@ -183,6 +188,18 @@ def parse_args() -> argparse.Namespace:
             "MHR level-of-detail for --mhr-assets (0=73 639 verts … 6=595 "
             "verts). Default: 3 (4 899 verts). The TorchScript rig has a fixed "
             "LOD (18 439 verts) and ignores this."
+        ),
+    )
+    p.add_argument(
+        "--show-reference", type=str, nargs="?", default=None, const="",
+        metavar="NPZ",
+        help=(
+            "Overlay a saved SAM 3D Body (teacher) prediction for this clip, "
+            "so you can compare it against the student in the same 3D scene. "
+            "Bare flag = reference/<video stem>.npz. The reference stores MHR "
+            "parameters and is decoded by the same rig as the student, so any "
+            "difference you see is the model, not the renderer. Build one with "
+            "tools/pack_reference.py — see instanthmr/reference.py."
         ),
     )
     p.add_argument(
@@ -324,8 +341,28 @@ def build_all(args: argparse.Namespace):
         save_path=args.save_rrd,
         mhr_renderer=mhr,
         mesh_alpha=args.mesh_alpha,
+        reference=build_reference(args),
     )
     return pipeline, viz, mhr
+
+
+def build_reference(args: argparse.Namespace):
+    """Load the saved teacher track for ``--show-reference``, or ``None``."""
+    path = resolve_reference(args.show_reference, getattr(args, "video", None))
+    if path is None:
+        return None
+    if not path.exists():
+        sys.exit(
+            f"[error] reference not found: {path}\n"
+            "        Build it by running the teacher once, then packing it:\n"
+            "          MOMENTUM_ENABLED=0 python main.py --video_path <clip> \\\n"
+            "              --output_path reference/<stem> --save_meshes\n"
+            "          python tools/pack_reference.py reference/<stem>/meshes "
+            "reference/<stem>.npz"
+        )
+    track = ReferenceTrack(path)
+    print(f"reference: {path} — {len(track)} frames, {track.num_persons} persons")
+    return track
 
 
 def _print_timings(

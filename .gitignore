@@ -51,3 +51,8 @@ runs/
 .ipynb_checkpoints/
 competitors/
 *.png
+
+# Saved teacher runs for `demo.py --show-reference` (renders + packed .npz).
+# Local and regenerable: tools/pack_reference.py rebuilds the .npz from a
+# video_to_pose_pipeline --save_meshes run. 247 MB here.
+reference/

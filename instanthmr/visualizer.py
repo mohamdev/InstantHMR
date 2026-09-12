@@ -42,6 +42,13 @@ MESH_COLOR = (200, 160, 130)
 #: body, high enough that the silhouette is still legible.
 MESH_ALPHA = 0.35
 
+#: Reference (teacher) overlay colours — a cool palette against the student's
+#: warm skin tone and green/yellow skeleton, so the two read apart at a glance
+#: even where the bodies overlap.
+REF_MESH_COLOR = (110, 170, 255)
+REF_JOINT_COLOR = (0, 200, 255)
+REF_SKELETON_COLOR = (255, 110, 255)
+
 
 class RerunVisualizer:
     """Rerun logger for the demo.
@@ -56,6 +63,11 @@ class RerunVisualizer:
         mesh_alpha: body-mesh opacity in ``[0, 1]``. Applied through Rerun's
             ``albedo_factor`` rather than per-vertex alpha, so one scalar
             controls the whole surface.
+        reference: optional :class:`instanthmr.reference.ReferenceTrack` whose
+            saved teacher prediction is logged alongside the student's under
+            ``world/reference/``, in the cool palette above. It is decoded by
+            the SAME ``mhr_renderer``, so a visible difference is the model and
+            not the renderer.
     """
 
     def __init__(
@@ -65,6 +77,7 @@ class RerunVisualizer:
         save_path: str | None = None,
         mhr_renderer: "MHRRenderer | None" = None,
         mesh_alpha: float = MESH_ALPHA,
+        reference=None,
     ):
         import rerun as rr
 
@@ -74,6 +87,12 @@ class RerunVisualizer:
             *MESH_COLOR,
             int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
         )
+        self._reference = reference
+        self._ref_albedo = (
+            *REF_MESH_COLOR,
+            int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
+        )
+        self._prev_num_ref = 0
         rr.init(application_id, spawn=spawn_viewer)
 
         # SAM3D / MHR convention: right-handed, Y-down camera frame.
@@ -137,6 +156,12 @@ class RerunVisualizer:
         self._prev_num_persons = n
 
         h, w = image_rgb.shape[:2]
+
+        # Before the no-detection early-out below: the reference is independent
+        # of whether the student found anybody, and seeing it alone on a frame
+        # the student missed is exactly the failure worth looking at.
+        if self._reference is not None:
+            self._log_reference(frame_idx)
 
         # Always log the image — even when no person was detected — so the
         # viewer keeps showing the camera feed and the timing HUD.
@@ -219,6 +244,51 @@ class RerunVisualizer:
                 f"{path}/skeleton",
                 rr.LineStrips3D(lines, colors=[255, 230, 0], radii=0.004),
             )
+
+    def _log_reference(self, frame_idx: int) -> None:
+        """Log the saved teacher prediction for this frame under ``world/reference``.
+
+        Kept in a sibling entity tree rather than mixed into
+        ``world/persons/`` so the viewer can toggle either side on its own.
+        """
+        rr = self._rr
+        persons = self._reference.persons_at(frame_idx)
+
+        for stale in range(len(persons), self._prev_num_ref):
+            rr.log(f"world/reference/person_{stale}", rr.Clear(recursive=True))
+        self._prev_num_ref = len(persons)
+
+        for idx, ref in enumerate(persons):
+            path = f"world/reference/person_{idx}"
+            joints = ref.joints_3d_cam
+            rr.log(
+                f"{path}/joints",
+                rr.Points3D(positions=joints, radii=0.012,
+                            colors=list(REF_JOINT_COLOR)),
+            )
+            edges = edges_for(joints.shape[0])
+            if edges:
+                rr.log(
+                    f"{path}/skeleton",
+                    rr.LineStrips3D(
+                        [[joints[i].tolist(), joints[j].tolist()] for i, j in edges],
+                        colors=list(REF_SKELETON_COLOR), radii=0.004,
+                    ),
+                )
+            # The teacher stored parameters, not vertices; decoding them with
+            # the student's own rig is what keeps the two meshes comparable.
+            if self._mhr_renderer is not None:
+                verts = self._mhr_renderer.forward(
+                    ref.mhr_params, ref.shape_params,
+                ) + ref.cam_trans
+                rr.log(
+                    f"{path}/mesh",
+                    rr.Mesh3D(
+                        vertex_positions=verts,
+                        triangle_indices=self._mhr_renderer.faces,
+                        albedo_factor=self._ref_albedo,
+                    ),
+                )
 
     def _log_person_mesh(self, idx: int, person: HMRPrediction) -> None:
         """Run MHR forward pass and log the resulting mesh vertices via Rerun."""
