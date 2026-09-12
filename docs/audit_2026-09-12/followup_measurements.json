@@ -1,0 +1,64 @@
+{
+  "geometry_samples": 256,
+  "dataset": "coco",
+  "seed": 20260912,
+  "scale_basis_rank_float32": 24,
+  "scale_basis_rank_float64": 25,
+  "scale_basis_pinv_rtol": 1e-05,
+  "stable_scale_projection_max_abs": 1.4955233162972092e-08,
+  "stable_scale_projection_max_abs_coeff": 3.551532238553479,
+  "stable_scale_projection_pve_mm": {
+    "mean": 1.431666341034088e-08,
+    "max": 0.00015275544137693942
+  },
+  "hand_zero_exact_nonfinger_keypoint_mm": {
+    "mean": 0.10175210982561111,
+    "max": 1.5162975788116455
+  },
+  "hand_zero_approx_nonfinger_keypoint_mm": {
+    "mean": 1.2984461784362793,
+    "max": 6.655439376831055
+  },
+  "shape_zero_exact_nonfinger_keypoint_mm": {
+    "mean": 1.049141526222229,
+    "max": 11.555269241333008
+  },
+  "shape_zero_pve_mm": 2.7963504791259766,
+  "coco_pose_limits": {
+    "n": 6000,
+    "indices": "6:130",
+    "tolerance": 1e-05,
+    "parameter_violation_fraction": 0.20225538313388824,
+    "sample_violation_fraction": 1.0,
+    "max_violation_rad": 0.8167469501495361,
+    "zero_width_limits": 24,
+    "total_local_rotation_limits": 124
+  },
+  "hgnetv2_b0": {
+    "backbone_parameters_without_head": 1850396,
+    "features_at_224": [
+      1,
+      1024,
+      7,
+      7
+    ]
+  },
+  "hgnetv2_b4": {
+    "backbone_parameters_without_head": 13553376,
+    "features_at_224": [
+      1,
+      2048,
+      7,
+      7
+    ]
+  },
+  "repvit_m2_3": {
+    "backbone_parameters_without_head": 22404232,
+    "features_at_224": [
+      1,
+      640,
+      7,
+      7
+    ]
+  }
+}
