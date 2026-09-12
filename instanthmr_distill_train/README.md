@@ -518,6 +518,73 @@ previous commit — verified: 1544 state_dict keys, same sha256, forward and all
 12 loss terms 0.000e+00 apart on 48 real augmented samples, under both
 `--losses legacy` and `--losses rebalanced`.
 
+## `--exact-landmarks` — the teacher's own 70-landmark readout (added 2026-09-13)
+
+**What it changes.** The student derives its 70 annotation keypoints from the
+127 skeleton joints alone, through a fitted `(70, 127)` matrix. SAM 3D Body does
+not — it reads them off the *skinned mesh* and the joints together, with a fixed
+matrix from its checkpoint:
+
+```
+teacher:  K = W_joint @ J  +  W_vertex @ V
+student:  K ≈ W_fitted @ J
+```
+
+**21 of the 70 landmarks have no joint contribution at all** — nose, elbows, toe
+tips, acromion and other surface points — so a skeleton-only matrix cannot
+represent them, and none of the 70 can move with body shape. Measured against
+the teacher's readout on identical GT geometry:
+
+| readout | all 70 | 30 non-finger | worst |
+|---|---|---|---|
+| fitted `(70, 127)` | 1.306 mm mean | **3.037 mm mean** | 18.05 mm |
+| exact subset readout | 0.000 mm | 0.000 mm | 0.000 mm |
+
+Those targets came out of the teacher's mapping, so this removes an operator
+mismatch between the prediction and its own label. It affects `loss_3d_native`
+and `loss_reproj` only.
+
+**Why it is affordable.** The first 70 mapping rows reference just **468
+distinct vertices**. `MHRForwardPass` already skins an arbitrary subset exactly
+(not approximately — it rewrites the rig's three flattened influence tables and
+leaves the op untouched), so this takes the **union** of those 468 with the
+`--w-verts` subset. Do not assume the 595 already contain the 468: measured,
+they overlap in **10**. Union is 1053 vertices, and the cost is unmeasurable —
+181.2 ms for 595 alone against 180.9 ms for the union, batch 64, forward+backward.
+The skinning is dominated by the forward-kinematics pass, not the vertex count.
+
+`loss_verts` keeps averaging over exactly its own 595 farthest-point samples
+with uniform weighting, via `verts_loss_pos`; averaging over the union instead
+would silently reweight the term and break comparability with generations 6-8.
+
+**It gives identity a second geometric gradient.** Resample `shape_params` and
+the exact landmarks move **0.821 mm mean**; the fitted ones move exactly
+**0.000 mm**. Before this, `--w-verts` was the only route by which the 45
+identity coefficients saw any geometry at all.
+
+**Verified** (`python tools/verify_exact_landmarks.py --data_root data`) against
+full 18,439-vertex skinning with the full `(70, 18566)` teacher mapping:
+**2.4e-04 mm** on real GT, on pose perturbed by N(0, 0.25) rad, and under
+resampled identity; gradients agree to 2e-07 relative in `model_params` and
+2e-09 absolute in `shape_params`. Every row of the mapping sums to exactly 1.0,
+so the readout is translation-equivariant and commutes with `to_vision` — which
+is why the mapping is applied after the unit/axis conversion.
+
+**Scoring is unchanged, on purpose.** `val3dpw.py` and
+`benchmark/eval_3dpw_ckpt.py` both go through `get_native_keypoints`, i.e. the
+fitted readout, and neither was touched. The flag changes what the model is
+trained to match, not what it is measured with, so the reported J14 PA-MPJPE
+stays comparable with earlier generations and keeps measuring the path that
+actually ships. **Deployment is unchanged**: the exported graph never emitted
+these 3D keypoints — the consumer derives them — so no operator is added to the
+phone runtime. Making the deployed readout exact is a separate decision with its
+own latency measurement.
+
+`instanthmr_distill_train/assets/mhr_landmarks70.npz` (167 KB) is **a new file
+and must be rsynced**, or the job dies at startup. Default off; with it off
+every loss term is bit-identical, verified across `legacy`, `rebalanced`,
+`w_verts` on/off and `cont_head` on/off.
+
 ## Tried and rejected: detaching the 2D head (2026-09-06 / 09-07)
 
 **Do not retry this without reading the failure mode.** The flag is gone from

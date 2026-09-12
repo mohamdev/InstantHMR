@@ -417,7 +417,39 @@ latency has been measured for this change.
 
 # 5. Exact 70-landmark readout using a small vertex subset
 
-**Status:** open, scoped to extending existing subset skinning. Preserve MHR's
+**Status: implemented 2026-09-13** behind `--exact-landmarks`, default off, as
+a training-loss change only. Asset built by `tools/build_landmark_assets.py`
+(the first 70 rows of `head_pose.keypoint_mapping`, vertex columns restricted to
+their 468-vertex support); `MHRForwardPass._build_vertex_subset` now takes the
+union of those 468 with the vertex-loss subset; `loss_3d_native` and
+`loss_reproj` read through `regress_keypoints_exact`. Gated by
+`tools/verify_exact_landmarks.py`. Measurements in
+`datasets_pipeline/jeanzay/STATUS.md`, "Generation 8b".
+
+Verified: **2.4e-04 mm** against full 18,439-vertex skinning with the full
+teacher mapping, on GT, on pose perturbed by N(0, 0.25) rad, and under resampled
+identity; gradients agree to 2e-07 relative in `model_params` and 2e-09 absolute
+in `shape_params`. The 468 and the 595 vertex-loss samples **overlap in only
+10**, confirming the warning below. Union skinning is 1053 vertices and costs
+nothing measurable (181.2 ms for 595 alone vs 180.9 ms for the union, batch 64,
+forward+backward). `loss_verts` still averages over exactly its own 595 with
+uniform weighting.
+
+The disagreement this removes, measured against the teacher's readout on
+identical GT geometry: the fitted `(70, 127)` matrix is **3.037 mm mean over the
+30 non-finger landmarks** (1.306 mm over all 70, 18.05 mm worst), in the
+2.93-3.75 mm band recorded below. The exact readout is 0.000 mm by construction.
+It also gives the 70 landmarks a gradient into `shape_params` -- they move
+0.821 mm mean when identity is resampled, against exactly 0.000 mm for the
+fitted matrix, which is blind to identity by construction.
+
+**Scoring is deliberately unchanged.** `val3dpw.py` and
+`benchmark/eval_3dpw_ckpt.py` both call `get_native_keypoints`, i.e. the fitted
+readout, and neither was touched. So the flag changes what the model is trained
+to match, not what it is measured with, and the reported J14 PA-MPJPE stays
+comparable with generations 6-8 and keeps measuring the deployed path.
+
+Original scoping, kept for context: preserve MHR's
 direct pose-parameter prediction and rig/mesh separation. First evaluate as a
 training-loss change; a deployed landmark-readout change is a separate decision
 subject to the smartphone speed constraint.

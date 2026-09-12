@@ -183,6 +183,23 @@ decode agree, so a wrong choice trains fine and only shows up as a rotation loss
 measuring distance in a permuted space. `instanthmr_distill_train/mhr_cont.py`
 uses the rig's and says so; do not "fix" it to match the teacher's line.
 
+**The vertex subset now has two independent consumers, and mixing them breaks
+a loss silently.** `--w-verts` skins 595 farthest-point samples; the teacher's
+exact 70-landmark mapping (`--exact-landmarks`) needs the 468 vertices its first
+70 rows reference. **Those two sets overlap in exactly 10 vertices** -- the 468
+are not a subset of the 595, and raising `n_verts` does not reach them, because
+farthest-point sampling optimises coverage, not landmark support. So
+`_build_vertex_subset` skins their UNION (1053) and keeps `verts_loss_pos` /
+`lm_vert_pos` to index the two consumers separately. If `loss_verts` ever
+averages over the union instead of `verts_loss_pos`, it silently changes value
+and stops being comparable with generations 6-8 -- no error, just a different
+number. The union is free (181.2 ms for 595 alone vs 180.9 ms for 1053 at batch
+64), because the cost is the forward-kinematics pass, not the vertex count.
+`instanthmr_distill_train/assets/mhr_landmarks70.npz` is a new file and must be
+rsynced. Scoring deliberately stays on the fitted readout: `val3dpw.py` and
+`benchmark/eval_3dpw_ckpt.py` both call `get_native_keypoints`, so the metric
+keeps measuring the deployed path and stays comparable across generations.
+
 **`--cont-head` adds two files that must be rsynced.**
 `instanthmr_distill_train/mhr_cont.py` and
 `instanthmr_distill_train/assets/mhr_cont_head.npz` (30 KB, built by

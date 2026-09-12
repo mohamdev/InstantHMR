@@ -535,8 +535,10 @@ def train(args, cfg, rank, local_rank, world):
         out_dir.mkdir(parents=True, exist_ok=True)
 
     W = np.load(cfg.kp_regressor_path)
-    mhr_module = T.MHRForwardPass(cfg.mhr_model_path, device, kp_regressor=W,
-                                  n_verts=cfg.n_verts if cfg.w_verts > 0 else 0)
+    mhr_module = T.MHRForwardPass(
+        cfg.mhr_model_path, device, kp_regressor=W,
+        n_verts=cfg.n_verts if cfg.w_verts > 0 else 0,
+        landmark_assets=cfg.landmark_assets_path if cfg.exact_landmarks else None)
     criterion = T.DistillationLoss(cfg, mhr_module)
 
     train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
@@ -694,6 +696,7 @@ def train(args, cfg, rank, local_rank, world):
             "mix": args.mix, "steps_per_epoch": steps_per_epoch,
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
+            "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
             "jpeg_p": cfg.jpeg_p, "cam_loss": cfg.cam_loss,
             "losses": args.losses, "w_shape": cfg.w_shape,
@@ -1148,6 +1151,12 @@ def parse_args():
                         "farthest-point subset of the rig's own 18,439-vertex "
                         "mesh (default 595, lod6's count). Costs 0.6 ms per "
                         "batch-64 step against 16.7 ms for the full mesh.")
+    p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
+                   help="Supervise the 70 keypoints with the teacher's exact "
+                        "mesh+joint mapping over the 468 vertices it references, "
+                        "instead of the fitted skeleton-only matrix. Changes "
+                        "loss_3d_native and loss_reproj; export is unchanged. "
+                        "Needs assets/mhr_landmarks70.npz.")
     p.add_argument("--cont-head", dest="cont_head", action="store_true",
                    help="Reproduce the teacher's regression pathway: the head "
                         "emits 447 numbers in its continuous space (6D root, "
@@ -1198,6 +1207,7 @@ def build_cfg(args):
     if args.cont_head:
         cfg.cont_head = True
         cfg.root_rot_loss = True
+    if args.exact_landmarks:        cfg.exact_landmarks = True
     if args.w_verts is not None:    cfg.w_verts = args.w_verts
     if args.n_verts is not None:    cfg.n_verts = args.n_verts
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
@@ -1308,6 +1318,7 @@ def main():
            if args.losses != "legacy" else ""))
     log(f"head      {'continuous (teacher pathway, 447 dims)' if cfg.cont_head else 'linear 204-vector'}"
         + (f" | root loss = rotation matrix" if cfg.root_rot_loss else ""))
+    log(f"landmarks {'teacher exact mapping (468 mesh vertices + 50 joints)' if cfg.exact_landmarks else 'fitted (70, 127) skeleton regressor'}")
     log(f"surface   w_verts={cfg.w_verts}"
         + (f" over {cfg.n_verts} mesh vertices" if cfg.w_verts > 0 else " (off)")
         + f" | crop_centre_fix={cfg.crop_centre_fix}")

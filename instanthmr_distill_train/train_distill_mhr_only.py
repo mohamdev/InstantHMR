@@ -322,6 +322,18 @@ class DistillConfig:
     # rotation, and 13.59% of corpus root angles sit beyond 2.8 rad.
     root_rot_loss: bool = False
     w_root_rot: float = 1.0
+
+    # --- the teacher's exact 70-landmark readout (--exact-landmarks) --------
+    # Off by default. On, loss_3d_native and loss_reproj read the 70 keypoints
+    # out of the skinned mesh with the teacher's own fixed mapping
+    # (K = Wj @ J + Wv @ V) instead of the fitted (70, 127) skeleton-only
+    # matrix. 21 of the 70 are pure mesh-surface points with no joint
+    # contribution at all, so the fitted matrix cannot represent them; measured
+    # 2.93-3.75 mm mean disagreement over the 30 non-finger landmarks on
+    # identical GT geometry. Training-only: the exported graph never emitted
+    # these keypoints, so deployment still uses the approximate readout.
+    exact_landmarks: bool = False
+    landmark_assets_path: str = str(PROJECT_ROOT / "assets/mhr_landmarks70.npz")
     use_amp: bool = True
     ema_decay: float = 0.9998       
     early_stop_patience: int = 150  
@@ -455,6 +467,12 @@ def config_from_checkpoint(state, ckpt_path=None, **overrides):
     cfg.cont_head = any(k.startswith("cont_head.") for k in state)
     cfg.root_rot_loss = cfg.cont_head
     prov["cont_head"] = "checkpoint weights"
+
+    # --exact-landmarks leaves NO trace in the weights: it changes which
+    # operator two training losses use, not the graph. So it can only come from
+    # run_config.json, and its absence there is indistinguishable from "off".
+    # That is acceptable because nothing downstream of a checkpoint depends on
+    # it -- export and inference use the fitted readout either way.
 
     run_cfg = {}
     if ckpt_path is not None:
@@ -1256,7 +1274,8 @@ class MHRForwardPass:
     per training step and makes the mesh LOD irrelevant to training cost.
     """
 
-    def __init__(self, mhr_path, device, kp_regressor=None, n_verts: int = 0):
+    def __init__(self, mhr_path, device, kp_regressor=None, n_verts: int = 0,
+                 landmark_assets: str | None = None):
         self.device = device
         self.mhr = torch.jit.load(mhr_path, map_location=device).eval()
         for p in self.mhr.parameters():
@@ -1266,12 +1285,32 @@ class MHRForwardPass:
             W = torch.as_tensor(kp_regressor, dtype=torch.float32, device=device)
             assert W.shape == (70, 127), f"expected a (70, 127) regressor, got {tuple(W.shape)}"
             self.kp_regressor = W
-        self.vert_idx = None
-        if n_verts:
-            self._build_vertex_subset(int(n_verts))
 
-    def _build_vertex_subset(self, n: int):
+        # The teacher's exact landmark readout, when asked for: K = Wj @ J + Wv @ V
+        # over the 468 mesh vertices its first 70 mapping rows actually touch.
+        self.lm_W_vert = self.lm_W_joint = None
+        lm_verts = None
+        if landmark_assets is not None:
+            a = np.load(landmark_assets)
+            lm_verts = torch.as_tensor(a["vert_idx"], dtype=torch.int64, device=device)
+            self.lm_W_vert = torch.as_tensor(a["W_vert"], dtype=torch.float32, device=device)
+            self.lm_W_joint = torch.as_tensor(a["W_joint"], dtype=torch.float32, device=device)
+
+        self.vert_idx = None
+        self.verts_loss_pos = None      # where the w_verts samples sit in the subset
+        self.lm_vert_pos = None         # where the landmark vertices sit, in W_vert order
+        if n_verts or lm_verts is not None:
+            self._build_vertex_subset(int(n_verts), lm_verts)
+
+    def _build_vertex_subset(self, n: int, extra: torch.Tensor | None = None):
         """A farthest-point subset of the rig mesh, plus a skinning op for it.
+
+        `extra` is an additional index set to include -- the 468 vertices the
+        teacher's landmark mapping references. The subset becomes the UNION, so
+        the two consumers are independent: `loss_verts` still averages over
+        exactly the `n` farthest-point samples it always did, with the same
+        uniform weighting, via `verts_loss_pos`. The 468 are not a subset of the
+        595 and a larger `n` does not contain them -- they have to be named.
 
         The rig's `linear_blend_skinning` asserts it is handed all 18,439
         vertices, so the subset is installed by rewriting its three flattened
@@ -1289,24 +1328,37 @@ class MHRForwardPass:
         # Farthest-point sampling in float64: the mesh spans ~180 cm and
         # neighbouring vertices are sub-millimetre apart, so float32 ties would
         # make the traversal order depend on accumulation noise.
-        P = rest.double()
-        idx = [0]
-        d = (P - P[0]).norm(dim=-1)
-        for _ in range(n - 1):
-            i = int(d.argmax())
-            idx.append(i)
-            d = torch.minimum(d, (P - P[i]).norm(dim=-1))
-        sub = torch.tensor(sorted(idx), device=self.device)
+        fps = None
+        if n:
+            P = rest.double()
+            idx = [0]
+            d = (P - P[0]).norm(dim=-1)
+            for _ in range(n - 1):
+                i = int(d.argmax())
+                idx.append(i)
+                d = torch.minimum(d, (P - P[i]).norm(dim=-1))
+            fps = torch.tensor(sorted(idx), device=self.device)
+
+        parts = [t for t in (fps, extra.to(self.device) if extra is not None else None)
+                 if t is not None]
+        assert parts, "_build_vertex_subset called with neither n_verts nor extra"
+        sub = torch.unique(torch.cat(parts))
+        n_sub = int(sub.numel())
+        # Positions, not vertex ids: both consumers index the skinned output.
+        # searchsorted is exact here because `sub` is sorted and contains both.
+        self.verts_loss_pos = torch.searchsorted(sub, fps) if fps is not None else None
+        self.lm_vert_pos = (torch.searchsorted(sub, extra.to(self.device))
+                            if extra is not None else None)
 
         lbs = copy.deepcopy(ct.linear_blend_skinning)
         vi = ct.linear_blend_skinning.vert_indices_flattened
         keep = torch.isin(vi, sub)
         remap = torch.full((int(vi.max()) + 1,), -1, dtype=torch.int64, device=self.device)
-        remap[sub] = torch.arange(n, device=self.device)
+        remap[sub] = torch.arange(n_sub, device=self.device)
         lbs.vert_indices_flattened = remap[vi[keep]]
         lbs.skin_indices_flattened = ct.linear_blend_skinning.skin_indices_flattened[keep]
         lbs.skin_weights_flattened = ct.linear_blend_skinning.skin_weights_flattened[keep]
-        lbs.num_vertices = n
+        lbs.num_vertices = n_sub
         self.vert_idx, self.vert_lbs = sub, lbs
 
     def get_joints(self, model_params, shape_params):
@@ -1347,6 +1399,27 @@ class MHRForwardPass:
         assert self.kp_regressor is not None, (
             "no keypoint regressor loaded — run --fit-regressor or pass kp_regressor_path")
         return torch.einsum('kj,bjc->bkc', self.kp_regressor, joints_vision)
+
+    def regress_keypoints_exact(self, joints_vision, verts_vision):
+        """The teacher's own landmark readout: `Wj @ J + Wv @ V`.
+
+        `joints_vision` is (B, 127, 3) and `verts_vision` the (B, n_sub, 3)
+        skinned subset, both already through `to_vision`. That is legitimate
+        rather than a shortcut: every row of the mapping sums to exactly 1.0, so
+        the readout is translation-equivariant, and `to_vision` is a diagonal
+        scale-and-flip, so the two commute. Verified against the full
+        (70, 18566) mapping in `tools/verify_exact_landmarks.py`.
+
+        21 of the 70 landmarks have NO joint contribution -- nose, elbows, toe
+        tips, acromion and other surface points -- which is why a fitted
+        skeleton-only matrix cannot reproduce them and why these carry a
+        gradient into `shape_params`, unlike `regress_keypoints`.
+        """
+        assert self.lm_W_vert is not None, (
+            "MHRForwardPass was built without landmark_assets")
+        v = verts_vision.index_select(1, self.lm_vert_pos)
+        return (torch.einsum('kj,bjc->bkc', self.lm_W_joint, joints_vision)
+                + torch.einsum('kv,bvc->bkc', self.lm_W_vert, v))
 
     def get_native_keypoints(self, model_params, shape_params):
         """(B, 70, 3) native keypoints in the annotation frame."""
@@ -1551,7 +1624,12 @@ class DistillationLoss(nn.Module):
             losses['loss_cam'] = self.mse(preds["cam_trans"], targets["cam_trans"]) * self.cfg.w_cam
 
         want_verts = float(getattr(self.cfg, "w_verts", 0.0)) > 0.0
-        if want_verts:
+        exact_lm = bool(getattr(self.cfg, "exact_landmarks", False))
+        # The prediction needs skinned vertices for either consumer. The TARGET
+        # needs them only for loss_verts: the landmark losses compare against
+        # the stored annotation, which the teacher already produced with this
+        # mapping, so --exact-landmarks adds no target-side cost at all.
+        if want_verts or exact_lm:
             pred_mhr_joints, pred_verts = self.mhr_module.get_joints_and_vertices(
                 preds["mhr_params"], preds["shape_params"])
         else:
@@ -1590,7 +1668,15 @@ class DistillationLoss(nn.Module):
             # logged value reads as mean PVE / 1000.  Masked to m_noflip for the
             # same reason loss_mhr_joints is: under a horizontal flip the target
             # PARAMETERS are not mirrored, only the 2D and 3D labels are.
-            e_verts = (pred_verts - tgt_verts.detach()).norm(dim=-1).mean(1) / 100.0
+            # Restricted to the farthest-point samples this term has always
+            # used. --exact-landmarks widens the skinned subset to the union
+            # with the mapping's 468 vertices; averaging over the union instead
+            # would silently reweight the term and break comparability with
+            # generations 6-8.
+            vp = self.mhr_module.verts_loss_pos
+            pv = pred_verts if vp is None else pred_verts.index_select(1, vp)
+            tv = tgt_verts if vp is None else tgt_verts.index_select(1, vp)
+            e_verts = (pv - tv.detach()).norm(dim=-1).mean(1) / 100.0
             losses['loss_verts'] = (self._mmean(e_verts, m_noflip)
                                     * self.cfg.w_verts * self.fk_scale)
 
@@ -1598,7 +1684,16 @@ class DistillationLoss(nn.Module):
         # 127 skeleton joints, so they are differentiable w.r.t. mhr_params and
         # carry no extra forward pass (pred_mhr_joints is already computed).
         pred_mhr_vision = self.mhr_module.to_vision(pred_mhr_joints)
-        pred_kp3d = self.mhr_module.regress_keypoints(pred_mhr_vision)
+        if exact_lm:
+            # The teacher's readout, off the skinned mesh, instead of the fitted
+            # skeleton-only matrix. Feeds loss_3d_native and loss_reproj below,
+            # which is the whole change: `tgt_3d` already came out of this same
+            # mapping, so this removes an operator mismatch between the
+            # prediction and its own target.
+            pred_kp3d = self.mhr_module.regress_keypoints_exact(
+                pred_mhr_vision, self.mhr_module.to_vision(pred_verts))
+        else:
+            pred_kp3d = self.mhr_module.regress_keypoints(pred_mhr_vision)
 
         pred_2d = preds["joints_2d"]
         tgt_2d = targets["joints_2d"]
@@ -2730,6 +2825,12 @@ def parse_args():
     p.add_argument("--no-export", dest="no_export", action="store_true",
                    help="Skip the ONNX export / quantization step after training.")
     p.add_argument("--gpu", type=int, default=None, help="GPU count (informational).")
+    p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
+                   help="Read the 70 keypoints out of the skinned mesh with the "
+                        "teacher's own fixed mapping, instead of the fitted "
+                        "(70, 127) skeleton-only matrix. Affects loss_3d_native "
+                        "and loss_reproj only; the exported graph is unchanged. "
+                        "Needs assets/mhr_landmarks70.npz.")
     p.add_argument("--cont-head", dest="cont_head", action="store_true",
                    help="Regress the teacher's continuous space (6D root, 260-dim "
                         "body, 28 scale PCA coefficients, 2x54 hand blocks; 447 "
@@ -2809,6 +2910,8 @@ def main():
     if getattr(args, "cont_head", False):
         cfg.cont_head = True
         cfg.root_rot_loss = True
+    if getattr(args, "exact_landmarks", False):
+        cfg.exact_landmarks = True
     if args.losses == "rebalanced":     apply_rebalanced_losses(cfg)
     # An explicit --w_keypoints3d still wins over the preset.
     if args.w_keypoints3d is not None:   cfg.w_keypoints3d = args.w_keypoints3d
@@ -2871,7 +2974,10 @@ def main():
                                    cfg.kp_regressor_path)
 
     train_loader, val_loader, full_dataset = build_dataloaders(cfg)
-    mhr_module = MHRForwardPass(cfg.mhr_model_path, device, kp_regressor=W)
+    mhr_module = MHRForwardPass(
+        cfg.mhr_model_path, device, kp_regressor=W,
+        n_verts=cfg.n_verts if cfg.w_verts > 0 else 0,
+        landmark_assets=cfg.landmark_assets_path if cfg.exact_landmarks else None)
 
     if args.self_test:
         run_self_tests()

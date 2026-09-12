@@ -64,6 +64,9 @@ def main() -> int:
     p.add_argument("--bound-scales", dest="bound_scales", action="store_true", default=True)
     p.add_argument("--cliff-focal", dest="cliff_focal", action="store_true", default=True)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true", default=True)
+    p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
+                   help="Use the teacher's exact landmark readout, which widens "
+                        "the skinned vertex subset.")
     p.add_argument("--cont-head", dest="cont_head", action="store_true",
                    help="Build the teacher's continuous regression head instead "
                         "of the linear 204-vector head. A changed head shape is "
@@ -91,6 +94,8 @@ def main() -> int:
     if args.cont_head:
         cfg.cont_head = True
         cfg.root_rot_loss = True
+    if args.exact_landmarks:
+        cfg.exact_landmarks = True
     if args.backbone:
         cfg.backbone = args.backbone
 
@@ -101,15 +106,17 @@ def main() -> int:
     batch = {k: (v.to(T.device) if torch.is_tensor(v) else v)
              for k, v in next(iter(loader)).items()}
 
-    mhr = T.MHRForwardPass(cfg.mhr_model_path, T.device,
-                           kp_regressor=np.load(cfg.kp_regressor_path),
-                           n_verts=cfg.n_verts if cfg.w_verts > 0 else 0)
+    mhr = T.MHRForwardPass(
+        cfg.mhr_model_path, T.device, kp_regressor=np.load(cfg.kp_regressor_path),
+        n_verts=cfg.n_verts if cfg.w_verts > 0 else 0,
+        landmark_assets=cfg.landmark_assets_path if cfg.exact_landmarks else None)
     T.mhr_module = mhr
 
     model = T.InstantHMRStudent(cfg, pretrained=args.pretrained).to(T.device)
     n = sum(q.numel() for q in model.parameters())
     print(f"{cfg.backbone}: {n/1e6:.2f} M parameters, "
           f"head={'continuous' if cfg.cont_head else 'linear'}, "
+          f"landmarks={'exact' if cfg.exact_landmarks else 'fitted'}, "
           f"w_verts={cfg.w_verts}, batch {args.batch_size}")
 
     ddp = torch.nn.parallel.DistributedDataParallel(model)   # find_unused_parameters=False
