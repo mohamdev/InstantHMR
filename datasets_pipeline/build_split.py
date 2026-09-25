@@ -34,6 +34,25 @@ it ignores today and that a hand branch will need:
     hand_crop_l/_r  (4,)    the square crop actually written (NaN if skipped)
     hand_valid_l/_r ()      bool: was a crop written
 
+`--context C` (default 1.2, i.e. today's crop) stores a CONTEXT CROP instead:
+the body crop covers C x the tight box, so the v3 preset can sample loose,
+off-centre framings from real scene rather than black margins. Two keys are
+added, and `bbox_square` keeps meaning the 1.2x square:
+
+    bbox_context    (4,)    the stored square, full-frame px (same int()
+                            rounding as bbox_square)
+    context_padded  ()      bool: that square leaves the frame, so part of the
+                            crop is black frame-edge padding
+
+A non-default --context requires an explicit --output-dir, and the builder
+refuses to add crops of one kind to a folder holding the other, so a context
+corpus can never silently mix with a standard one.
+
+Verified by `tools/verify_context_crops.py` on 200 AIC rows: default output
+byte-identical to HEAD; the 1.2x window cut back out of a 2.0x / 448 crop
+matches today's 224 crop at 42.2 dB mean (sigma-1 blur, padding masked) with
+a 0.09 px shift. At 2.0x, 195 of 200 AIC squares reach past the frame edge.
+
 Hand crops are stored UNFLIPPED. SAM3D trains a single right-hand model and
 mirrors the left at inference; flipping a loaded crop is a free numpy slice, so
 baking the mirror into disk would only remove a choice.
@@ -177,6 +196,13 @@ def parse_args() -> argparse.Namespace:
                    help="override the sam3d_gt_<dataset> destination")
 
     p.add_argument("--body-size", type=int, default=224)
+    p.add_argument("--context", type=float, default=1.2,
+                   help="side of the stored body crop as a multiple of the tight "
+                        "person box. 1.2 (default) is today's crop, byte for byte. "
+                        "Anything else writes a context crop and records its square "
+                        "as bbox_context (full-frame px) plus context_padded; "
+                        "bbox_square stays the 1.2x square, so the standard window "
+                        "can always be cut back out.")
     p.add_argument("--crop-format", choices=("png", "jpg"), default="png",
                    help="png keeps body_crops byte-identical to the existing "
                         "data/ tree; jpg is ~5x smaller and ~4x faster to decode")
@@ -224,6 +250,20 @@ def main() -> None:
     args = parse_args()
     ds = dataset_for_split(args.split)
     out_dir = args.output_dir or output_dir_for_split(args.split, args.data_root)
+
+    # A context build must never land in (or resume into) a folder of the
+    # other kind: the skip-existing logic below would silently yield a corpus
+    # of mixed 224 crops and context crops. Checked before anything is created.
+    if args.context != 1.2 and args.output_dir is None:
+        sys.exit(f"--context {args.context} needs an explicit --output-dir, so the "
+                 f"context crops never land in the standard {out_dir.name}")
+    first = next((out_dir / "annotations").glob("*.npz"), None)
+    if first is not None:
+        with np.load(first) as z:
+            was_context = "bbox_context" in z.files
+        if was_context != (args.context != 1.2):
+            sys.exit(f"{out_dir} already holds {'context' if was_context else 'standard'} "
+                     f"crops; refusing to add {'standard' if was_context else 'context'} ones")
 
     dirs = {k: out_dir / k for k in
             ("original_images", "annotations", "body_crops", "hands_crops")}
@@ -324,6 +364,13 @@ def main() -> None:
 
                 body_crop, sq_bbox = get_square_crop_padded(img_rgb, ann["bbox"],
                                                             expand=1.2)
+                if args.context != 1.2:
+                    body_crop, ctx_bbox = get_square_crop_padded(
+                        img_rgb, ann["bbox"], expand=args.context)
+                    ann["bbox_context"] = ctx_bbox
+                    ann["context_padded"] = np.array(
+                        bool(ctx_bbox[0] < 0 or ctx_bbox[1] < 0
+                             or ctx_bbox[2] > w or ctx_bbox[3] > h))
                 body_crop = cv2.resize(body_crop, (args.body_size, args.body_size),
                                        interpolation=cv2.INTER_LINEAR)
                 cv2.imwrite(str(dirs["body_crops"] / f"{name}.{ext}"),
