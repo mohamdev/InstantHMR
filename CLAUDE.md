@@ -196,9 +196,16 @@ and stops being comparable with generations 6-8 -- no error, just a different
 number. The union is free (181.2 ms for 595 alone vs 180.9 ms for 1053 at batch
 64), because the cost is the forward-kinematics pass, not the vertex count.
 `instanthmr_distill_train/assets/mhr_landmarks70.npz` is a new file and must be
-rsynced. Scoring deliberately stays on the fitted readout: `val3dpw.py` and
-`benchmark/eval_3dpw_ckpt.py` both call `get_native_keypoints`, so the metric
-keeps measuring the deployed path and stays comparable across generations.
+rsynced. Scoring stays on the fitted readout by default and is now a switch
+(`--landmarks exact` on `eval_3dpw_ckpt.py` / `eval_emdb_ckpt.py`,
+`--val-landmarks exact` on the trainer). Measured 2026-09-22 it is worth
+**0.13 mm** of 3DPW-test J14+adapter PA-MPJPE and 0.1 mm of EMDB-1 — and the
+same 0.13 mm on `g7h_s0`, which trained WITHOUT `--exact-landmarks`, so it is a
+property of the operator, not of the training flag. The mismatch it removes is
+real (both adapters are fitted from the annotation `joints_3d`, i.e. the exact
+readout), but it is an offset, not a re-ranking. `fitted` stays default so the
+metric keeps measuring the deployed path and every recorded row stays
+comparable; **never put fitted-scored and exact-scored rows in one table.**
 
 **`--cont-head` adds two files that must be rsynced.**
 `instanthmr_distill_train/mhr_cont.py` and
@@ -368,9 +375,12 @@ by 0.1 mm. Measure jitter directly (frame-to-frame acceleration on 3DPW's
 consecutive frames, and the variance of rigid bone lengths within a person
 track, which cannot change and so is pure noise).
 
-**Seed spread is wide.** Observed 70-keypoint PA-MPJPE varies 34–49 mm across
-seeds, which is larger than several of the changes on the roadmap. A single-run
-comparison proves nothing; use 2–3 seeds.
+**Seed spread is narrow at generation 8.** g8h_s0 vs g8h_s1 differ by 0.10 mm
+on 3DPW test J14 (41.76 / 41.86) and 0.24 mm on EMDB-1 (46.93 / 46.69,
+fit-free J14/H36M). The old "34–49 mm" warning was the 70-keypoint metric on
+early generations and no longer applies. A seed sweep buys ~0.2 mm, so it is
+not a way to gain accuracy; keep 2 seeds per arm only to tell a >0.5 mm change
+from noise.
 
 **You cannot reach Jean Zay.** No SSH, no Slurm. Print commands for the user and
 read the logs they paste back. Files reach the cluster by `rsync` of *specific
@@ -379,3 +389,19 @@ files* — never the whole tree, since some files are edited on both sides.
 **ONNX export constrains the model.** `torch.linalg.lstsq` and friends do not
 export; use explicit small-matrix algebra. Pin `onnxruntime-gpu==1.26.0` — 1.27+
 is CUDA 13 and silently falls back to CPU.
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local markdown files under `.scratch/<feature>/`, not GitHub Issues (the repo is public). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default roles, label string = role name (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` plus `docs/adr/` at the repo root, created lazily. See `docs/agents/domain.md`.
