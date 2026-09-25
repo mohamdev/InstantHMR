@@ -62,7 +62,7 @@ MM = 1000.0
 
 
 def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int,
-                focal: float | None = None):
+                focal: float | None = None, size: int = INPUT_SIZE):
     """Square 1.2x crop + ImageNet normalise + CLIFF conditioning.
 
     A transcription of ``instanthmr.inference.InstantHMR._preprocess``. It is
@@ -98,7 +98,7 @@ def _preprocess(image_rgb: np.ndarray, bbox: np.ndarray, h: int, w: int,
     if pl or pt or pr or pb:
         patch = cv2.copyMakeBorder(patch, pt, pb, pl, pr,
                                    cv2.BORDER_CONSTANT, value=(0, 0, 0))
-    crop = cv2.resize(patch, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    crop = cv2.resize(patch, (size, size), interpolation=cv2.INTER_LINEAR)
     crop = (crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
     return np.ascontiguousarray(crop.transpose(2, 0, 1)), cliff
 
@@ -115,13 +115,15 @@ class ThreeDPWValSet(Dataset):
     def __init__(self, sequence_dir: str, image_root: str,
                  split: str = "validation", stride: int = 5,
                  bbox_scale: float = 1.2, gt: str = "h36m",
-                 gt_dir: str | None = None, cliff_focal: bool = False):
+                 gt_dir: str | None = None, cliff_focal: bool = False,
+                 input_size: int = INPUT_SIZE):
         self.samples, self.gt = P.build_samples(
             sequence_dir, image_root, split=split,
             stride=stride, bbox_scale=bbox_scale, gt=gt, gt_dir=gt_dir)
         self.gt = np.asarray(self.gt, dtype=np.float32)
         self.gt_source = gt
         self.cliff_focal = cliff_focal
+        self.input_size = input_size
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -132,14 +134,15 @@ class ThreeDPWValSet(Dataset):
         if bgr is None:
             # A missing frame must not kill a 20-hour job; return a zero crop
             # and flag it so the metric can drop it.
-            return {"image": torch.zeros(3, INPUT_SIZE, INPUT_SIZE),
+            return {"image": torch.zeros(3, self.input_size, self.input_size),
                     "cliff_cond": torch.zeros(3),
                     "gt": torch.from_numpy(self.gt[i]),
                     "ok": torch.tensor(0.0)}
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         crop, cliff = _preprocess(rgb, s["bbox"], h, w,
-                                  s["focal"] if self.cliff_focal else None)
+                                  s["focal"] if self.cliff_focal else None,
+                                  size=self.input_size)
         return {"image": torch.from_numpy(crop),
                 "cliff_cond": torch.from_numpy(cliff),
                 "gt": torch.from_numpy(self.gt[i]),
@@ -148,12 +151,20 @@ class ThreeDPWValSet(Dataset):
 
 @torch.no_grad()
 def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
-             gt: str = "h36m", adapter: np.ndarray | None = None) -> dict:
+             gt: str = "h36m", adapter: np.ndarray | None = None,
+             exact_landmarks: bool = False) -> dict:
     """J14 PA-MPJPE and MPJPE in mm, adapter-applied — the paper number.
 
-    Predictions come from ``mhr_params`` through the same FK + (70, 127)
-    regressor the training loss uses, so this measures exactly the geometry the
-    model is being trained to produce.
+    Predictions come from ``mhr_params`` through FK and the fitted (70, 127)
+    regressor, which is the readout the exported graph's consumer uses.
+
+    ``exact_landmarks=True`` uses the teacher's mesh+joint mapping instead —
+    the readout ``--exact-landmarks`` trains against and the one the adapter
+    was fitted from. Measured on 3DPW test stride 5 it is worth 0.13 mm of
+    J14+adapter PA-MPJPE, the same amount on a run trained WITHOUT
+    ``--exact-landmarks``, so it is a property of the operator and not of the
+    training flag. Off by default: flipping it shifts every recorded number by
+    that much and stops the metric describing the deployed path.
     """
     model.eval()
     preds, gts = [], []
@@ -166,7 +177,8 @@ def evaluate(model, loader, mhr_module, device, use_amp: bool = True,
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             out = model(img, cc)
         kp = mhr_module.get_native_keypoints(out["mhr_params"].float(),
-                                             out["shape_params"].float())
+                                             out["shape_params"].float(),
+                                             exact=exact_landmarks)
         # Drop non-finite predictions BEFORE they reach the metric. The forward
         # runs under fp16 autocast, so an early-training head output above
         # 65504 is already inf by the time .float() sees it, and the MHR forward

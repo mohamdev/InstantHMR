@@ -65,11 +65,12 @@ def group_by_conditioning(ckpts: list[str]) -> list[list[str]]:
     import torch
     sys.path.insert(0, str(ROOT / "instanthmr_distill_train"))
     import train_distill_mhr_only as T
-    groups: dict[bool, list[str]] = {}
+    groups: dict[tuple[bool, int], list[str]] = {}
     for c in ckpts:
         st = torch.load(c, map_location="cpu", weights_only=False)
         cfg, _ = T.config_from_checkpoint(st.get("model_state_dict", st), c)
-        groups.setdefault(bool(cfg.cliff_focal), []).append(c)
+        # the input size too: the harnesses build one crop set per invocation
+        groups.setdefault((bool(cfg.cliff_focal), int(cfg.image_size)), []).append(c)
         del st
     return list(groups.values())
 

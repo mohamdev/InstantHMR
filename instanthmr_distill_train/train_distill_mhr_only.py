@@ -434,7 +434,9 @@ def apply_rebalanced_losses(cfg) -> None:
 def config_from_checkpoint(state, ckpt_path=None, **overrides):
     """Rebuild the DistillConfig a checkpoint was actually trained with.
 
-    Two sources, because the checkpoint dict carries neither.
+    Two sources, because the checkpoint dict carries neither. (``image_size``
+    sits in both: the positional-embedding grid in the weights and the value
+    in run_config.json, which must agree.)
 
     * The ARCHITECTURE flags are readable from the weights. ``--bound-scales``
       registers ``scale_lo`` / ``scale_hi`` buffers, so their presence in the
@@ -483,6 +485,22 @@ def config_from_checkpoint(state, ckpt_path=None, **overrides):
         if k in run_cfg:
             setattr(cfg, k, run_cfg[k])
             prov[k] = "run_config.json"
+
+    # The input size IS in the weights: the decoder's positional embedding is a
+    # saved buffer with one row per 32-px patch, so its grid fixes the size up
+    # to the stride. run_config.json carries the exact value; a contradiction
+    # between the two means the wrong run_config.json sits beside the weights.
+    if "mem_pos_embed" in state:
+        grid = math.isqrt(state["mem_pos_embed"].shape[1])
+        cfg.image_size = grid * 32
+        prov["image_size"] = "checkpoint weights"
+        if "image_size" in run_cfg and int(run_cfg["image_size"]) != grid * 32:
+            raise ValueError(
+                f"run_config.json says image_size={run_cfg['image_size']} but "
+                f"the weights have a {grid}x{grid} patch grid ({grid * 32} px)")
+    elif "image_size" in run_cfg:
+        cfg.image_size = int(run_cfg["image_size"])
+        prov["image_size"] = "run_config.json"
 
     for k, v in overrides.items():
         if v is not None:
@@ -866,7 +884,8 @@ def build_dataloaders(cfg):
                 crop_centre_fix=cfg.crop_centre_fix,
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
-                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
+                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
+                image_size=cfg.image_size)
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,
@@ -1421,10 +1440,21 @@ class MHRForwardPass:
         return (torch.einsum('kj,bjc->bkc', self.lm_W_joint, joints_vision)
                 + torch.einsum('kv,bvc->bkc', self.lm_W_vert, v))
 
-    def get_native_keypoints(self, model_params, shape_params):
-        """(B, 70, 3) native keypoints in the annotation frame."""
-        j = self.get_joints(model_params, shape_params)[..., :3]
-        return self.regress_keypoints(self.to_vision(j))
+    def get_native_keypoints(self, model_params, shape_params, exact: bool = False):
+        """(B, 70, 3) native keypoints in the annotation frame.
+
+        `exact=True` switches from the fitted (70, 127) skeleton matrix to the
+        teacher's own `Wj @ J + Wv @ V` readout -- the operator the stored
+        annotations came out of, and therefore the one the MHR70 -> J14 / SMPL24
+        adapters were fitted against. It needs a module built with
+        `landmark_assets=`. Default off: the fitted readout is what the exported
+        graph's consumer uses, so it is what the published metric measures.
+        """
+        if not exact:
+            j = self.get_joints(model_params, shape_params)[..., :3]
+            return self.regress_keypoints(self.to_vision(j))
+        j, v = self.get_joints_and_vertices(model_params, shape_params)
+        return self.regress_keypoints_exact(self.to_vision(j), self.to_vision(v))
 
 class DistillationLoss(nn.Module):
     def __init__(self, cfg, mhr_module):
@@ -2477,7 +2507,7 @@ def _mock_preds_from(batch):
 def run_self_tests():
     print("--- Architecture Output Shapes ---")
     test_model = InstantHMRStudent(cfg, pretrained=False)
-    out = test_model(torch.randn(2, 3, 224, 224), torch.randn(2, 3))
+    out = test_model(torch.randn(2, 3, cfg.image_size, cfg.image_size), torch.randn(2, 3))
     for k, v in out.items():
         print(f"  {k}: {tuple(v.shape)}")
     n_par = sum(p.numel() for p in test_model.parameters())
@@ -2496,7 +2526,8 @@ def run_self_tests():
 
     print("\n--- Perfect Student (identity batch) ---")
     clean_ds = SAM3DStudentDataset(cfg.data_root, augment=False,
-                                   max_images=256, per_dataset_caps=cfg.per_dataset_caps)
+                                   max_images=256, per_dataset_caps=cfg.per_dataset_caps,
+                                   image_size=cfg.image_size)
     clean_loader = DataLoader(clean_ds, batch_size=32, shuffle=False, num_workers=0)
     cb = {k: v.to(device) for k, v in next(iter(clean_loader)).items()}
     l_clean = criterion(_mock_preds_from(cb), cb)
@@ -2514,7 +2545,8 @@ def run_self_tests():
                                  max_images=256, per_dataset_caps=cfg.per_dataset_caps,
                                  geom_p=1.0, geom_rot_deg=cfg.geom_rot_deg,
                                  geom_scale_range=cfg.geom_scale_range,
-                                 geom_trans=cfg.geom_trans, geom_flip_p=0.0)
+                                 geom_trans=cfg.geom_trans, geom_flip_p=0.0,
+                                 image_size=cfg.image_size)
     aug_loader = DataLoader(aug_ds, batch_size=32, shuffle=False, num_workers=0)
     ab = {k: v.to(device) for k, v in next(iter(aug_loader)).items()}
 
@@ -2549,7 +2581,8 @@ def run_self_tests():
     flip_ds = SAM3DStudentDataset(cfg.data_root, augment=True,
                                   max_images=256, per_dataset_caps=cfg.per_dataset_caps,
                                   geom_p=1.0, geom_rot_deg=0.0, geom_scale_range=0.0,
-                                  geom_trans=0.0, geom_flip_p=1.0)
+                                  geom_trans=0.0, geom_flip_p=1.0,
+                                  image_size=cfg.image_size)
     flip_loader = DataLoader(flip_ds, batch_size=32, shuffle=False, num_workers=0)
     fb = {k: v.to(device) for k, v in next(iter(flip_loader)).items()}
     with torch.no_grad():
@@ -2581,7 +2614,8 @@ def run_self_tests():
                                 max_images=256, per_dataset_caps=cfg.per_dataset_caps,
                                 geom_p=1.0, geom_rot_deg=0.0,
                                 geom_scale_range=cfg.geom_scale_range,
-                                geom_trans=cfg.geom_trans, geom_flip_p=0.0)
+                                geom_trans=cfg.geom_trans, geom_flip_p=0.0,
+                                image_size=cfg.image_size)
     st_loader = DataLoader(st_ds, batch_size=32, shuffle=False, num_workers=0)
     sb = {k: v.to(device) for k, v in next(iter(st_loader)).items()}
     l_aug = criterion(_mock_preds_from(sb), sb)
@@ -2632,7 +2666,8 @@ def run_overfit_test(steps=3000, subset=8, lr=5e-4):
         max_images=subset,
         per_dataset_caps=cfg.per_dataset_caps,
         geom_p=0.0,         # STRICTLY DISABLE SPATIAL AUGS
-        geom_flip_p=0.0     # STRICTLY DISABLE FLIPS
+        geom_flip_p=0.0,    # STRICTLY DISABLE FLIPS
+        image_size=cfg.image_size
     )
     overfit_loader = DataLoader(overfit_dataset, batch_size=subset, shuffle=False, num_workers=0)
     batch = next(iter(overfit_loader))

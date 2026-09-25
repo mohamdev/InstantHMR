@@ -570,20 +570,68 @@ resampled identity; gradients agree to 2e-07 relative in `model_params` and
 so the readout is translation-equivariant and commutes with `to_vision` — which
 is why the mapping is applied after the unit/axis conversion.
 
-**Scoring is unchanged, on purpose.** `val3dpw.py` and
-`benchmark/eval_3dpw_ckpt.py` both go through `get_native_keypoints`, i.e. the
-fitted readout, and neither was touched. The flag changes what the model is
-trained to match, not what it is measured with, so the reported J14 PA-MPJPE
-stays comparable with earlier generations and keeps measuring the path that
-actually ships. **Deployment is unchanged**: the exported graph never emitted
-these 3D keypoints — the consumer derives them — so no operator is added to the
-phone runtime. Making the deployed readout exact is a separate decision with its
-own latency measurement.
+**Scoring stays on the fitted readout by default, and it is now a switch.**
+`val3dpw.evaluate(..., exact_landmarks=)`, `--val-landmarks {fitted,exact}` on
+the trainer, and `--landmarks {fitted,exact}` on `benchmark/eval_3dpw_ckpt.py`
+and `benchmark/eval_emdb_ckpt.py` all default to `fitted`, which reproduces
+every recorded number to the decimal.
+
+Measured 2026-09-22, 3DPW test stride 1, J14+adapter PA-MPJPE:
+
+| run | trained with `--exact-landmarks` | fitted | exact |
+|---|---|---|---|
+| g8h_s0 | yes | 40.80 | **40.66** |
+| g8h_s1 | yes | 40.89 | **40.77** |
+| g8r_s0 | yes | 41.27 | **41.13** |
+| g7h_s0 | **no** | 42.90 | **42.77** |
+
+0.13 mm, the same on the run that never saw the flag — the switch is a property
+of the operator, not of the training. EMDB-1 SMPL24+adapter moves 0.09-0.11 mm
+the same way. It is an offset, not a re-ranking, and it is far inside the
+34-49 mm seed spread.
+
+What it removes is nonetheless a genuine mismatch: the MHR70 -> J14 and
+MHR70 -> SMPL24 adapters are fitted by `benchmark/fit_adapter_mhr.py` from the
+stored annotation `joints_3d`, which is the teacher's exact mesh+joint readout,
+so `fitted` hands the adapter keypoints from a different operator than the one
+it was fitted on. The GT side needs nothing: 3DPW's H36M joints and EMDB's SMPL
+joints are SMPL-derived and independent of any MHR readout.
+
+`fitted` remains the default because it is what the exported graph's consumer
+computes, so the published number keeps describing the path that ships, and
+because flipping it would shift every recorded row by 0.13 mm. **Deployment is
+unchanged**: the exported graph never emitted these 3D keypoints — the consumer
+derives them — so no operator is added to the phone runtime. Making the deployed
+readout exact is a separate decision with its own latency measurement.
 
 `instanthmr_distill_train/assets/mhr_landmarks70.npz` (167 KB) is **a new file
 and must be rsynced**, or the job dies at startup. Default off; with it off
 every loss term is bit-identical, verified across `legacy`, `rebalanced`,
 `w_verts` on/off and `cont_head` on/off.
+
+## `--image-size` — the network input side (added 2026-09-25)
+
+Default 224, i.e. unchanged. Must be a multiple of 32, because the decoder's
+positional grid is `image_size // 32` (7x7 at 224, 9x9 at 288). One setting
+drives every place that builds the input: the training dataset, `val3dpw`
+(and so the 3DPW / EMDB / SMPL-fit harnesses), `tools/pth_to_onnx.py` and
+`instanthmr.inference`.
+
+**It is recoverable from the weights.** `mem_pos_embed` is a saved buffer with
+one row per patch, so `config_from_checkpoint` reads the grid off it; the exact
+value comes from `run_config.json`, and a `run_config.json` that contradicts
+the weights raises instead of silently resizing. The export stamps
+`image_size` into the ONNX metadata, and `instanthmr.inference` reads it back
+(falling back to the graph's static input shape, then 224). The harnesses
+refuse to score checkpoints of different sizes in one invocation, like
+`--cliff-focal`.
+
+On today's 224 corpus a larger size only upsamples the stored crop; the real
+test of resolution needs the context-crop corpus (`build_split.py --context`).
+
+Verified by `tools/verify_input_size.py`: baseline and v2 samples bit-identical
+at 224; a 288 checkpoint round-trips through the config, the export metadata,
+the inference package and both harnesses.
 
 ## Tried and rejected: detaching the 2D head (2026-09-06 / 09-07)
 

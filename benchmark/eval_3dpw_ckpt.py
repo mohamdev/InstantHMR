@@ -54,6 +54,16 @@ def parse_args():
     p.add_argument("--fit-adapter", default=None,
                    help="fit that regressor on THIS split and write it here "
                         "(run on train, never on test)")
+    p.add_argument("--landmarks", default="fitted", choices=["fitted", "exact"],
+                   help="how the 70 MHR keypoints are read off the prediction. "
+                        "fitted (default): the (70, 127) skeleton matrix, which "
+                        "is what the exported graph's consumer uses and what "
+                        "every recorded number in benchmark/results was scored "
+                        "with. exact: the teacher's mesh+joint mapping, the "
+                        "operator the stored annotations -- and so the adapter "
+                        "-- came out of. Worth 0.13 mm of J14+adapter PA-MPJPE "
+                        "on 3DPW test, with or without --exact-landmarks "
+                        "training.")
     p.add_argument("--backbone", default=None,
                    help="override the backbone; normally read from the "
                         "run_config.json beside the checkpoint")
@@ -71,7 +81,8 @@ def parse_args():
 
 
 @torch.no_grad()
-def predict(model, loader, mhr_module, device, use_amp: bool = True):
+def predict(model, loader, mhr_module, device, use_amp: bool = True,
+            exact_landmarks: bool = False):
     """(N, 70, 3) predicted keypoints in mm, plus the indices they came from.
 
     The indices let the same forward pass be scored against more than one GT
@@ -86,7 +97,8 @@ def predict(model, loader, mhr_module, device, use_amp: bool = True):
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             out = model(img, cc)
         kp = mhr_module.get_native_keypoints(out["mhr_params"].float(),
-                                             out["shape_params"].float())
+                                             out["shape_params"].float(),
+                                             exact=exact_landmarks)
         # Same guard as val3dpw.evaluate: a non-finite prediction makes the
         # Procrustes SVD raise rather than return a large error.
         finite = torch.isfinite(kp).flatten(1).all(dim=1).cpu()
@@ -129,10 +141,21 @@ def main():
             "conditioning is built once for all of them.\n"
             "Evaluate the two groups in separate invocations.")
     cliff_focal = focals.pop()
+    sizes = {c.image_size for c in cfgs.values()}
+    if len(sizes) > 1:
+        raise SystemExit(
+            f"the checkpoints disagree on the input size ({sorted(sizes)}), and the "
+            "crops are built once for all of them.\n"
+            "Evaluate the groups in separate invocations.")
+    input_size = sizes.pop()
 
     cfg = next(iter(cfgs.values()))
-    mhr = T.MHRForwardPass(cfg.mhr_model_path, device,
-                           kp_regressor=np.load(cfg.kp_regressor_path))
+    exact_lm = args.landmarks == "exact"
+    mhr = T.MHRForwardPass(
+        cfg.mhr_model_path, device, kp_regressor=np.load(cfg.kp_regressor_path),
+        landmark_assets=cfg.landmark_assets_path if exact_lm else None)
+    print(f"[readout] 70 keypoints via the "
+          f"{'teacher exact mesh+joint mapping' if exact_lm else 'fitted (70, 127) skeleton matrix'}")
     W_adapt = W_adapt_gt = None
     if args.adapter:
         ad = np.load(args.adapter)
@@ -145,7 +168,8 @@ def main():
         ds = val3dpw.ThreeDPWValSet(args.sequence_dir, args.image_root,
                                     split=args.split, stride=args.stride,
                                     gt=gt, gt_dir=args.gt_dir,
-                                    cliff_focal=cliff_focal)
+                                    cliff_focal=cliff_focal,
+                                    input_size=input_size)
         sets[gt] = ds
         print(f"[3DPW] {args.split} / GT={gt}: {len(ds):,} person-frames "
               f"(stride {args.stride}), CLIFF conditioning "
@@ -169,7 +193,8 @@ def main():
         # Strict: an unexpected key means the config restored above is wrong
         # and the model being scored is not the model that was trained.
         model.load_state_dict(ck["model_state_dict"])
-        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp)
+        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
+                                       exact_landmarks=exact_lm)
         del model
         torch.cuda.empty_cache()
 
@@ -183,6 +208,7 @@ def main():
             report[f"{ck_path}|{gt}"] = dict(
                 ckpt=ck_path, gt=gt, split=args.split, stride=args.stride,
                 epoch=ck.get("epoch"), source=ck.get("source"),
+                landmarks=args.landmarks,
                 n=int(pred.shape[0]), n_dropped=n_dropped,
                 results=list(rows.values()))
 

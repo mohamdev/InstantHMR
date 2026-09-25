@@ -7,7 +7,8 @@ It reuses the exact model architecture and deploy wrapper from the training
 script that produced the checkpoint, plus the FP32 export recipe from notebook
 Cell 15, so the graph I/O matches ``instanthmr/inference.py``:
 
-    inputs : image (N, 3, 224, 224), cliff_cond (N, 3)
+    inputs : image (N, 3, S, S), cliff_cond (N, 3); S = the checkpoint's input
+             size (224 unless trained with --image-size), stamped as image_size
     outputs: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
 
 Architecture selection
@@ -35,7 +36,7 @@ Usage
 
     # or point at a specific checkpoint / output
     python ./tools/pth_to_onnx.py \
-        --ckpt   ./instanthmr_distill_train/runs/g7h_s0/g7h_s0/best_student_model_v3.pth \
+        --ckpt   ./instanthmr_distill_train/runs/g8h_s1/g8h_s1/best_student_model_v3.pth \
         --output ./models/instanthmr.onnx
 """
 import argparse
@@ -208,12 +209,14 @@ def main() -> None:
         m = onnx.load(str(args.output))
         for k, v in (("cliff_focal", str(bool(getattr(cfg, "cliff_focal", False))).lower()),
                      ("bound_scales", str(bool(getattr(cfg, "bound_scales", False))).lower()),
-                     ("arch", arch)):
+                     ("arch", arch),
+                     ("image_size", str(int(cfg.image_size)))):
             e = m.metadata_props.add()
             e.key, e.value = k, v
         onnx.save(m, str(args.output))
         print(f"  metadata: cliff_focal={getattr(cfg, 'cliff_focal', False)} "
-              f"bound_scales={getattr(cfg, 'bound_scales', False)} arch={arch}")
+              f"bound_scales={getattr(cfg, 'bound_scales', False)} arch={arch} "
+              f"image_size={cfg.image_size}")
     except Exception as e:  # noqa: BLE001
         print(f"  [warning] could not stamp ONNX metadata: {e}")
 

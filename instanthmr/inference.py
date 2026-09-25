@@ -1,6 +1,7 @@
 """ONNX inference for InstantHMR.
 
-InstantHMR takes a 224x224 person crop and a 3-vector CLIFF condition
+InstantHMR takes a square person crop (224 px unless the ONNX metadata
+says otherwise) and a 3-vector CLIFF condition
 (bbox center / scale in full-frame coords) and returns mhr_params, shape,
 camera translation, and 70 joints in 2D (crop space) and 3D (camera coords,
 rig-local, metres, Y-down).
@@ -200,6 +201,11 @@ class InstantHMR:
         # Passing `focal=` alone still implies the angular form, which is how
         # this argument behaved before `cliff_focal` existed.
         meta = self.session.get_modelmeta().custom_metadata_map or {}
+        # The crop side the graph was trained at: stamped by tools/pth_to_onnx.py,
+        # else the graph's static input height, else the historical 224.
+        dim = self.session.get_inputs()[0].shape[2]
+        self.input_size = int(meta.get("image_size")
+                              or (dim if isinstance(dim, int) else INPUT_SIZE))
         if cliff_focal is None:
             cliff_focal = (str(meta.get("cliff_focal", "")).lower() == "true"
                            or focal is not None)
@@ -281,7 +287,7 @@ class InstantHMR:
         outs = self.session.run(
             None,
             {
-                self._in_image: crop[np.newaxis],         # (1, 3, 224, 224)
+                self._in_image: crop[np.newaxis],         # (1, 3, S, S), S = self.input_size
                 self._in_cliff: cliff_cond[np.newaxis],   # (1, 3)
             },
         )
@@ -296,8 +302,8 @@ class InstantHMR:
             joints_3d_local = self._joints_3d(mhr_params, shape_params)
 
         # Re-project the 2D head from normalised crop space → full-frame pixels.
-        crop_px = (joints_2d_norm + 1.0) * 0.5 * INPUT_SIZE
-        scale = sq_size / INPUT_SIZE
+        crop_px = (joints_2d_norm + 1.0) * 0.5 * self.input_size
+        scale = sq_size / self.input_size
         joints_2d = np.stack(
             [crop_px[:, 0] * scale + sq_x1, crop_px[:, 1] * scale + sq_y1],
             axis=-1,
@@ -356,7 +362,7 @@ class InstantHMR:
         batch = max(padded_to or n, n)  # always >= n; zero-pad the rest
 
         # Use zeros so padded slots produce deterministic (discarded) outputs.
-        crops = np.zeros((batch, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
+        crops = np.zeros((batch, 3, self.input_size, self.input_size), dtype=np.float32)
         cliffs = np.zeros((batch, 3), dtype=np.float32)
         sq_meta = []  # per-person (sq_x1, sq_y1, sq_size, bbox)
         for i, det in enumerate(detections):
@@ -394,8 +400,8 @@ class InstantHMR:
             joints_3d_local = joints_3d_local_b[i]
             cam_trans = cam_trans_b[i]
 
-            crop_px = (joints_2d_norm + 1.0) * 0.5 * INPUT_SIZE
-            scale = sq_size / INPUT_SIZE
+            crop_px = (joints_2d_norm + 1.0) * 0.5 * self.input_size
+            scale = sq_size / self.input_size
             joints_2d = np.stack(
                 [crop_px[:, 0] * scale + sq_x1, crop_px[:, 1] * scale + sq_y1],
                 axis=-1,
@@ -425,7 +431,7 @@ class InstantHMR:
         upfront so no mid-demo stall occurs when persons first appear.
         """
         dummy_image = np.zeros(
-            (max_batch_size, 3, INPUT_SIZE, INPUT_SIZE), dtype=np.float32
+            (max_batch_size, 3, self.input_size, self.input_size), dtype=np.float32
         )
         dummy_cliff = np.zeros((max_batch_size, 3), dtype=np.float32)
         # Large batch first — allocates the most memory; batch=1 reuses the plan.
@@ -500,10 +506,10 @@ class InstantHMR:
                 cv2.BORDER_CONSTANT, value=(0, 0, 0),
             )
 
-        crop_224 = cv2.resize(patch, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
-        crop = crop_224.astype(np.float32) / 255.0
+        crop_sq = cv2.resize(patch, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        crop = crop_sq.astype(np.float32) / 255.0
         crop = (crop - IMAGENET_MEAN) / IMAGENET_STD
-        crop = np.transpose(crop, (2, 0, 1)).astype(np.float32)  # (3, 224, 224)
+        crop = np.transpose(crop, (2, 0, 1)).astype(np.float32)  # (3, S, S)
 
         return crop, float(sq_x1), float(sq_y1), float(sq_size), cliff_cond
 

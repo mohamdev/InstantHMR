@@ -3,6 +3,7 @@
 
     python tools/ddp_smoke.py --backbone hgnetv2_b4 --w-verts 0.35
     python tools/ddp_smoke.py --backbone repvit_m2_3        # the control
+    python tools/ddp_smoke.py --image-size 288               # a non-224 input
 
 WHY THIS EXISTS. A plain single-process smoke run -- `train_distill_jz.py` on a
 laptop, `--self-test`, `--overfit-test` -- builds no DDP Reducer at all, so it
@@ -51,6 +52,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backbone", default=None, help="timm name; default is the config's")
+    p.add_argument("--image-size", dest="image_size", type=int, default=None,
+                   help="network input side; the positional grid and every crop follow it")
     p.add_argument("--data_root", default="data")
     p.add_argument("--batch_size", type=int, default=2,
                    help="Small on purpose. Which parameters receive a gradient "
@@ -98,10 +101,15 @@ def main() -> int:
         cfg.exact_landmarks = True
     if args.backbone:
         cfg.backbone = args.backbone
+    if args.image_size is not None:
+        if args.image_size % 32:
+            raise SystemExit(f"--image-size {args.image_size} is not a multiple of 32")
+        cfg.image_size = args.image_size
 
     ds = T.SAM3DStudentDataset(cfg.data_root, augment=True, max_images=args.batch_size,
                                per_dataset_caps={}, cliff_focal=cfg.cliff_focal,
-                               crop_centre_fix=cfg.crop_centre_fix)
+                               crop_centre_fix=cfg.crop_centre_fix,
+                               image_size=cfg.image_size)
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     batch = {k: (v.to(T.device) if torch.is_tensor(v) else v)
              for k, v in next(iter(loader)).items()}

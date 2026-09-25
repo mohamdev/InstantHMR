@@ -68,6 +68,10 @@ def parse_args():
     p.add_argument("--gt-dir", default=None)
     p.add_argument("--adapter", default="benchmark/results/adapter_smpl24_teacher.npz",
                    help="npz with the MHR70 -> SMPL24 regressor")
+    p.add_argument("--landmarks", default="fitted", choices=["fitted", "exact"],
+                   help="how the 70 MHR keypoints are read off the prediction; "
+                        "see eval_3dpw_ckpt.py. fitted is the deployed readout "
+                        "and what every recorded number was scored with.")
     p.add_argument("--backbone", default=None)
     p.add_argument("--cliff-focal", dest="cliff_focal", action="store_true",
                    default=None)
@@ -89,12 +93,13 @@ class EMDBValSet(torch.utils.data.Dataset):
     """
 
     def __init__(self, emdb_root, stride=1, bbox="gt-joints", bbox_scale=1.2,
-                 gt_dir=None, cliff_focal=False):
+                 gt_dir=None, cliff_focal=False, input_size=val3dpw.INPUT_SIZE):
         self.samples, gt = D.build_samples(
             emdb_root, stride=stride, bbox=bbox, bbox_scale=bbox_scale,
             gt_dir=gt_dir)
         self.gt = np.asarray(gt, dtype=np.float32)
         self.cliff_focal = cliff_focal
+        self.input_size = input_size
 
     def __len__(self):
         return len(self.samples)
@@ -103,12 +108,13 @@ class EMDBValSet(torch.utils.data.Dataset):
         s = self.samples[i]
         bgr = cv2.imread(s["image_path"], cv2.IMREAD_COLOR)
         if bgr is None:
-            return {"image": torch.zeros(3, val3dpw.INPUT_SIZE, val3dpw.INPUT_SIZE),
+            return {"image": torch.zeros(3, self.input_size, self.input_size),
                     "cliff_cond": torch.zeros(3), "ok": torch.tensor(0.0)}
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         crop, cliff = val3dpw._preprocess(
-            rgb, s["bbox"], h, w, s["focal"] if self.cliff_focal else None)
+            rgb, s["bbox"], h, w, s["focal"] if self.cliff_focal else None,
+            size=self.input_size)
         return {"image": torch.from_numpy(crop),
                 "cliff_cond": torch.from_numpy(cliff),
                 "ok": torch.tensor(1.0)}
@@ -168,10 +174,21 @@ def main():
             "conditioning is built once for all of them.\n"
             "Evaluate the two groups in separate invocations.")
     cliff_focal = focals.pop()
+    sizes = {c.image_size for c in cfgs.values()}
+    if len(sizes) > 1:
+        raise SystemExit(
+            f"the checkpoints disagree on the input size ({sorted(sizes)}), and the "
+            "crops are built once for all of them.\n"
+            "Evaluate the groups in separate invocations.")
+    input_size = sizes.pop()
 
     cfg = next(iter(cfgs.values()))
-    mhr = T.MHRForwardPass(cfg.mhr_model_path, device,
-                           kp_regressor=np.load(cfg.kp_regressor_path))
+    exact_lm = args.landmarks == "exact"
+    mhr = T.MHRForwardPass(
+        cfg.mhr_model_path, device, kp_regressor=np.load(cfg.kp_regressor_path),
+        landmark_assets=cfg.landmark_assets_path if exact_lm else None)
+    print(f"[readout] 70 keypoints via the "
+          f"{'teacher exact mesh+joint mapping' if exact_lm else 'fitted (70, 127) skeleton matrix'}")
     ad = np.load(args.adapter)
     if str(ad["gt"]) != "smpl24":
         raise SystemExit(f"{args.adapter} targets '{ad['gt']}', not smpl24; "
@@ -180,7 +197,7 @@ def main():
 
     ds = EMDBValSet(args.emdb_root, stride=args.stride, bbox=args.bbox,
                     bbox_scale=args.bbox_scale, gt_dir=args.gt_dir,
-                    cliff_focal=cliff_focal)
+                    cliff_focal=cliff_focal, input_size=input_size)
     seqs = sorted({s["sequence"] for s in ds.samples})
     print(f"[EMDB1] {len(ds):,} frames across {len(seqs)} sequences "
           f"(stride {args.stride}, boxes: {args.bbox}), CLIFF conditioning "
@@ -199,7 +216,8 @@ def main():
         model = T.InstantHMRStudent(cfgs[ck_path], pretrained=False).to(device)
         ck = torch.load(ck_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model_state_dict"])
-        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp)
+        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
+                                       exact_landmarks=exact_lm)
         del model
         torch.cuda.empty_cache()
 
@@ -219,7 +237,7 @@ def main():
 
         report[ck_path] = dict(
             ckpt=ck_path, dataset="EMDB1", split="emdb1", stride=args.stride,
-            bbox=args.bbox, adapter=str(args.adapter),
+            bbox=args.bbox, adapter=str(args.adapter), landmarks=args.landmarks,
             epoch=ck.get("epoch"), source=ck.get("source"),
             n=int(pred.shape[0]), n_dropped=n_dropped,
             num_sequences=len(seqs), results=rows,

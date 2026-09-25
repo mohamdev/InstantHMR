@@ -389,7 +389,8 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 crop_centre_fix=cfg.crop_centre_fix,
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
-                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality)
+                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
+                image_size=cfg.image_size)
 
     # Rank 0 builds the index (or reads the cache) while the others wait, then
     # everyone loads the same cache. Building on all ranks at once would put
@@ -538,7 +539,9 @@ def train(args, cfg, rank, local_rank, world):
     mhr_module = T.MHRForwardPass(
         cfg.mhr_model_path, device, kp_regressor=W,
         n_verts=cfg.n_verts if cfg.w_verts > 0 else 0,
-        landmark_assets=cfg.landmark_assets_path if cfg.exact_landmarks else None)
+        landmark_assets=(cfg.landmark_assets_path
+                         if cfg.exact_landmarks or args.val_landmarks == "exact"
+                         else None))
     criterion = T.DistillationLoss(cfg, mhr_module)
 
     train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
@@ -563,7 +566,8 @@ def train(args, cfg, rank, local_rank, world):
                 f"-> J14 numbers match benchmark/eval_3dpw_ckpt.py")
         dpw = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
                              split=args.val_3dpw_split, stride=args.val_3dpw_stride,
-                             gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal)
+                             gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal,
+                             input_size=cfg.image_size)
         # Stride-shard across ranks; the metric is all-reduced afterwards.
         dpw_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(dpw, list(range(rank, len(dpw), world))),
@@ -571,7 +575,8 @@ def train(args, cfg, rank, local_rank, world):
             num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
         log(f"3DPW {args.val_3dpw_split}: {len(dpw):,} person-frames "
             f"(stride {args.val_3dpw_stride}, GT {args.val_3dpw_gt}) "
-            f"-> selection metric is J14 PA-MPJPE (adapter-applied)")
+            f"-> selection metric is J14 PA-MPJPE (adapter-applied, "
+            f"{args.val_landmarks} 70-keypoint readout)")
 
         # Optional read-only monitor on the split the paper reports. Selection
         # NEVER touches it: picking the best of ~100 epochs on the test split
@@ -581,7 +586,8 @@ def train(args, cfg, rank, local_rank, world):
         if args.val_3dpw_test:
             dpw_t = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
                                    split="test", stride=args.val_3dpw_test_stride,
-                                   gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal)
+                                   gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal,
+                                   input_size=cfg.image_size)
             dpw_test_loader = torch.utils.data.DataLoader(
                 torch.utils.data.Subset(dpw_t, list(range(rank, len(dpw_t), world))),
                 batch_size=cfg.batch_size, shuffle=False, drop_last=False,
@@ -695,6 +701,7 @@ def train(args, cfg, rank, local_rank, world):
             "lr": cfg.lr, "lr_arg": args.lr, "lr_scaling": args.lr_scaling,
             "mix": args.mix, "steps_per_epoch": steps_per_epoch,
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
+            "image_size": cfg.image_size,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
@@ -704,6 +711,7 @@ def train(args, cfg, rank, local_rank, world):
             "pose_split": cfg.pose_split, "pose_beta": cfg.pose_beta,
             "finger_weight": cfg.finger_weight,
             "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
+            "val_landmarks": args.val_landmarks if args.val_3dpw else None,
             "cliff_focal": cfg.cliff_focal,
             "w_verts": cfg.w_verts, "n_verts": cfg.n_verts,
             "crop_centre_fix": cfg.crop_centre_fix,
@@ -884,20 +892,22 @@ def train(args, cfg, rank, local_rank, world):
         dpw_raw = dpw_em = dpw_test_raw = dpw_test_em = None
         if dpw_loader is not None:
             import val3dpw
+            exact_lm = args.val_landmarks == "exact"
             dpw_raw = all_reduce_mean(
                 val3dpw.evaluate(ddp_model, dpw_loader, mhr_module, device,
                                  cfg.use_amp, gt=args.val_3dpw_gt,
-                                 adapter=dpw_adapter),
+                                 adapter=dpw_adapter, exact_landmarks=exact_lm),
                 device)
             dpw_em = all_reduce_mean(
                 val3dpw.evaluate(ema, dpw_loader, mhr_module, device,
                                  cfg.use_amp, gt=args.val_3dpw_gt,
-                                 adapter=dpw_adapter),
+                                 adapter=dpw_adapter, exact_landmarks=exact_lm),
                 device)
             if dpw_test_loader is not None:
                 dpw_test_raw = all_reduce_mean(val3dpw.evaluate(
                     ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp,
-                    gt=args.val_3dpw_gt, adapter=dpw_adapter), device)
+                    gt=args.val_3dpw_gt, adapter=dpw_adapter,
+                    exact_landmarks=exact_lm), device)
                 dpw_test_em = all_reduce_mean(val3dpw.evaluate(
                     ema, dpw_test_loader, mhr_module, device, cfg.use_amp,
                     gt=args.val_3dpw_gt, adapter=dpw_adapter), device)
@@ -1103,6 +1113,19 @@ def parse_args():
                         "benchmark/make_3dpw_gt.py). jointpositions is the raw "
                         "pickle field the runs before this flag selected on — "
                         "several mm apart, so a resumed run must keep its own.")
+    p.add_argument("--val-landmarks", dest="val_landmarks", default="fitted",
+                   choices=("fitted", "exact"),
+                   help="Which readout the 3DPW selection metric scores. "
+                        "fitted (default) is the (70, 127) skeleton matrix the "
+                        "exported graph's consumer uses, and what every "
+                        "recorded run was selected on. exact is the teacher's "
+                        "mesh+joint mapping -- what --exact-landmarks trains "
+                        "against, and the operator the adapter was fitted "
+                        "from. Measured 0.13 mm of J14+adapter PA-MPJPE on "
+                        "3DPW test and 0.05 mm on validation, with or without "
+                        "--exact-landmarks training, so it does not move "
+                        "selection; it is an offset, and mixing the two in one "
+                        "table is what to avoid.")
     p.add_argument("--mix", default="sqrt",
                    help="Dataset mixture: sqrt | uniform | equal | "
                         "'sa1b=0.4,aic=0.35,coco=0.15,mpii=0.1'.")
@@ -1113,6 +1136,11 @@ def parse_args():
     p.add_argument("--w_simcc", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--backbone", default=None)
+    p.add_argument("--image-size", dest="image_size", type=int, default=None,
+                   help="Network input side in px (default 224). A multiple of "
+                        "32: the decoder's positional grid is image_size // 32. "
+                        "Recorded in run_config.json and read back by "
+                        "config_from_checkpoint, the harnesses and the export.")
     p.add_argument("--ema-decay", type=float, default=None)
 
     p.add_argument("--sync-bn", action="store_true")
@@ -1151,6 +1179,15 @@ def parse_args():
                         "farthest-point subset of the rig's own 18,439-vertex "
                         "mesh (default 595, lod6's count). Costs 0.6 ms per "
                         "batch-64 step against 16.7 ms for the full mesh.")
+    p.add_argument("--early-stop-patience", dest="early_stop_patience", type=int, default=None,
+                   help="Stop after this many epochs with no improvement in the "
+                        "selection metric (config default 150). The counter is "
+                        "carried in the checkpoint, so it accumulates across "
+                        "chained links. Raise it to disable: with OneCycleLR, "
+                        "which anneals to ~0 only in the last 10%% of the planned "
+                        "epochs, a plateau at high LR can expire the patience "
+                        "just before the refinement phase that would have ended "
+                        "it -- g8r_s0 stopped at 243 of 300 that way.")
     p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
                    help="Supervise the 70 keypoints with the teacher's exact "
                         "mesh+joint mapping over the 468 vertices it references, "
@@ -1208,11 +1245,17 @@ def build_cfg(args):
         cfg.cont_head = True
         cfg.root_rot_loss = True
     if args.exact_landmarks:        cfg.exact_landmarks = True
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience = args.early_stop_patience
     if args.w_verts is not None:    cfg.w_verts = args.w_verts
     if args.n_verts is not None:    cfg.n_verts = args.n_verts
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
+    if args.image_size is not None:
+        if args.image_size % 32:
+            raise SystemExit(f"--image-size {args.image_size} is not a multiple of 32")
+        cfg.image_size = args.image_size
 
     if args.preset == "v2":
         apply_v2_preset(cfg)

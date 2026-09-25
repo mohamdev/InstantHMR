@@ -92,10 +92,17 @@ def parse_args():
     p.add_argument("--bbox", default="gt-joints", choices=["gt-joints", "annotated"],
                    help="EMDB only; 3DPW always uses projected-GT-joint boxes")
     p.add_argument("--fit-iters", type=int, default=400,
-                   help="USE >= 1500. 400 converges on the round trip but NOT "
-                        "on real predictions: 16.1 mm residual on 3DPW vs 8.0 "
-                        "at 4000, worth 3.6 mm of J14 PA-MPJPE, and the sign "
-                        "differs per dataset. See benchmark/README.md.")
+                   help="0 skips the SMPL parameter fit entirely and reports "
+                        "the fit-free rows only (PVE, PA-PVE, J14/H36M) -- the "
+                        "settled protocol, no optimiser and no free parameter, "
+                        "and the only way to reach PVE without a "
+                        "hyperparameter that has a 3-4 mm blast radius. "
+                        "Otherwise USE >= 1500: 400 converges on the round trip "
+                        "but NOT on real predictions -- 16.1 mm residual on "
+                        "3DPW vs 8.0 at 4000, worth 3.6 mm of J14 PA-MPJPE, "
+                        "and the sign differs per dataset. The fit buys the 24 "
+                        "SMPL KINEMATIC joints and nothing else. See "
+                        "benchmark/README.md.")
     p.add_argument("--fit-batch", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=10)
@@ -241,12 +248,14 @@ def threedpw_gt_smpl(sequence_dir, split, samples, smpl_dir, device):
 class ThreeDPWSet(torch.utils.data.Dataset):
     """3DPW crops, built by the same ``val3dpw._preprocess`` EMDB uses."""
 
-    def __init__(self, sequence_dir, image_root, split, stride, cliff_focal):
+    def __init__(self, sequence_dir, image_root, split, stride, cliff_focal,
+                 input_size=val3dpw.INPUT_SIZE):
         from benchlib import threedpw as P3
         self.samples, _ = P3.build_samples(
             sequence_dir, image_root, split=split, stride=stride,
             gt="jointpositions")
         self.cliff_focal = cliff_focal
+        self.input_size = input_size
 
     def __len__(self):
         return len(self.samples)
@@ -255,12 +264,13 @@ class ThreeDPWSet(torch.utils.data.Dataset):
         s = self.samples[i]
         bgr = cv2.imread(s["image_path"], cv2.IMREAD_COLOR)
         if bgr is None:
-            return {"image": torch.zeros(3, val3dpw.INPUT_SIZE, val3dpw.INPUT_SIZE),
+            return {"image": torch.zeros(3, self.input_size, self.input_size),
                     "cliff_cond": torch.zeros(3), "ok": torch.tensor(0.0)}
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         crop, cliff = val3dpw._preprocess(
-            rgb, s["bbox"], h, w, s["focal"] if self.cliff_focal else None)
+            rgb, s["bbox"], h, w, s["focal"] if self.cliff_focal else None,
+            size=self.input_size)
         return {"image": torch.from_numpy(crop),
                 "cliff_cond": torch.from_numpy(cliff),
                 "ok": torch.tensor(1.0)}
@@ -281,10 +291,10 @@ def main():
 
         if args.dataset == "emdb":
             ds = EMDBValSet(args.emdb_root, stride=args.stride, bbox=args.bbox,
-                            cliff_focal=cfg.cliff_focal)
+                            cliff_focal=cfg.cliff_focal, input_size=cfg.image_size)
         else:
             ds = ThreeDPWSet(args.sequence_dir, args.image_root, args.split,
-                             args.stride, cfg.cliff_focal)
+                             args.stride, cfg.cliff_focal, cfg.image_size)
         loader = torch.utils.data.DataLoader(
             ds, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers, pin_memory=True)
@@ -306,11 +316,25 @@ def main():
             Jgt, Vgt, genders = threedpw_gt_smpl(args.sequence_dir, args.split,
                                                  kept, args.smpl_dir, device)
 
-        # Fit per gender group, so one SMPL model serves each batch.
+        # `barycentric_transfer` already returns the prediction in SMPL
+        # topology, vertex i <-> SMPL vertex i, so this surface IS the answer
+        # for every vertex-space metric. Keeping it costs one more (N, 6890, 3)
+        # and removes the optimiser from PVE entirely.
+        Vd = torch.zeros_like(Vgt)
+        fitting = args.fit_iters > 0
+        # Fit per gender group, so one SMPL model serves each batch. The fit
+        # exists only to recover the 24 SMPL KINEMATIC joints, which come off
+        # the chain and not off the surface.
         Jp = torch.zeros_like(Jgt)
-        Vp = torch.zeros_like(Vgt)
+        # 2.9 GB at 35,463 frames, so it is allocated only when a fit fills it.
+        Vp = torch.zeros_like(Vgt) if args.fit_iters > 0 else None
         resid = torch.zeros(len(kept))
-        for g in ("male", "female"):
+        if not fitting:
+            for k in range(0, len(kept), args.fit_batch):
+                sel = np.arange(k, min(k + args.fit_batch, len(kept)))
+                verts = rig.vertices(mp[sel].to(device), sh[sel].to(device))
+                Vd[sel] = barycentric_transfer(verts, rig.faces, tri, bary).cpu()
+        for g in ("male", "female") if fitting else ():
             gi = np.array([i for i, x in enumerate(genders) if x == g])
             if not len(gi):
                 continue
@@ -319,6 +343,7 @@ def main():
                 sel = gi[k:k + args.fit_batch]
                 verts = rig.vertices(mp[sel].to(device), sh[sel].to(device))
                 tgt = barycentric_transfer(verts, rig.faces, tri, bary)
+                Vd[sel] = tgt.cpu()
                 th, be, tr, r = fit_smpl_to_targets(sm, tgt, iters=args.fit_iters)
                 v, j = sm.forward(th, be, tr)
                 Jp[sel] = j.cpu()
@@ -344,30 +369,55 @@ def main():
         sel = J.J14_FROM_H36M17
         CH = 256
         pve_sum = pve_n = pa_pve_sum = 0.0
-        hp_parts, hg_parts = [], []
-        for i in range(0, Vp.shape[0], CH):
-            a = Vp[i:i + CH].numpy() * MM
+        pve_d_sum = pa_pve_d_sum = 0.0
+        hp_parts, hg_parts, hpd_parts = [], [], []
+        for i in range(0, Vd.shape[0], CH):
             b = Vgt[i:i + CH].numpy() * MM
-            n = a.shape[0]
-            e = M.mpjpe(a, b, root=(rp[i:i + n], rg[i:i + n]))
-            pve_sum += float(e.sum()); pve_n += e.size
-            pa_pve_sum += float(M.pa_mpjpe(a, b).sum())
-            hp_parts.append(np.einsum("jv,nvc->njc", Jreg, a)[:, sel])
-            hg_parts.append(np.einsum("jv,nvc->njc", Jreg, b)[:, sel])
-        h_p = np.concatenate(hp_parts)                             # already mm
+            n = b.shape[0]
+            # Fit-free: the prediction's own surface against the GT surface,
+            # rooted at the H36M pelvis regressed from EACH side by the same
+            # operator, so the regressor's bias cancels instead of being
+            # compared against a kinematic joint it does not equal.
+            a_d = Vd[i:i + CH].numpy() * MM
+            h_pd = np.einsum("jv,nvc->njc", Jreg, a_d)[:, sel]
+            h_gd = np.einsum("jv,nvc->njc", Jreg, b)[:, sel]
+            pve_d_sum += float(M.mpjpe(a_d, b,
+                                       root=(J.pelvis(h_pd), J.pelvis(h_gd))).sum())
+            pa_pve_d_sum += float(M.pa_mpjpe(a_d, b).sum())
+            pve_n += a_d.shape[0] * a_d.shape[1]
+            hpd_parts.append(h_pd)
+            hg_parts.append(h_gd)
+            if fitting:
+                a = Vp[i:i + CH].numpy() * MM
+                pve_sum += float(M.mpjpe(a, b, root=(rp[i:i + n], rg[i:i + n])).sum())
+                pa_pve_sum += float(M.pa_mpjpe(a, b).sum())
+                hp_parts.append(np.einsum("jv,nvc->njc", Jreg, a)[:, sel])
+        h_pd = np.concatenate(hpd_parts)                           # already mm
         h_g = np.concatenate(hg_parts)
-        del hp_parts, hg_parts
-        hp_r, hg_r = J.pelvis(h_p), J.pelvis(h_g)
+        h_p = np.concatenate(hp_parts) if fitting else None
+        del hp_parts, hg_parts, hpd_parts
+        hpd_r, hg_r = J.pelvis(h_pd), J.pelvis(h_g)
+        hp_r = J.pelvis(h_p) if fitting else None
 
         res = dict(
             ckpt=ck_path, dataset=tag, bbox=args.bbox, stride=args.stride,
             n=int(len(kept)), fit_iters=args.fit_iters,
             epoch=st.get("epoch"), source=st.get("source"),
-            fit_residual_mm=float(resid.mean() * MM),
-            MPJPE_mm=float(M.mpjpe(jp, jg, root=(rp, rg)).mean()),
-            PA_MPJPE_mm=float(M.pa_mpjpe(jp, jg).mean()),
-            PVE_mm=pve_sum / pve_n,
-            PA_PVE_mm=pa_pve_sum / pve_n,
+            fit_residual_mm=float(resid.mean() * MM) if fitting else None,
+            # The fit-free rows: the prediction's own surface, in SMPL
+            # topology, against the benchmark's own GT surface. No optimiser,
+            # no free parameter, so these are the PVE numbers to quote. The
+            # *_mm keys below keep their old meaning -- the FITTED mesh -- so
+            # rows recorded before 2026-09-22 stay comparable.
+            PVE_direct_mm=pve_d_sum / pve_n,
+            PA_PVE_direct_mm=pa_pve_d_sum / pve_n,
+            J14_h36m_direct_MPJPE_mm=float(
+                M.mpjpe(h_pd, h_g, root=(hpd_r, hg_r)).mean()),
+            J14_h36m_direct_PA_MPJPE_mm=float(M.pa_mpjpe(h_pd, h_g).mean()),
+            MPJPE_mm=float(M.mpjpe(jp, jg, root=(rp, rg)).mean()) if fitting else None,
+            PA_MPJPE_mm=float(M.pa_mpjpe(jp, jg).mean()) if fitting else None,
+            PVE_mm=pve_sum / pve_n if fitting else None,
+            PA_PVE_mm=pa_pve_sum / pve_n if fitting else None,
             # The published 3DPW protocol is 14 joints in the H36M convention,
             # reached here THROUGH the mesh conversion: MHR mesh -> barycentric
             # map -> fitted SMPL -> J_regressor_h36m, against the same
@@ -380,21 +430,29 @@ def main():
             # space. Both are legitimate, and note that J_regressor_h36m is
             # itself a fitted linear map (SMPL vertices -> H36M joints) -- SMPL-
             # native methods use it for exactly the same reason we need ours.
-            J14_h36m_viamesh_MPJPE_mm=float(M.mpjpe(h_p, h_g, root=(hp_r, hg_r)).mean()),
-            J14_h36m_viamesh_PA_MPJPE_mm=float(M.pa_mpjpe(h_p, h_g).mean()),
+            J14_h36m_viamesh_MPJPE_mm=float(
+                M.mpjpe(h_p, h_g, root=(hp_r, hg_r)).mean()) if fitting else None,
+            J14_h36m_viamesh_PA_MPJPE_mm=float(
+                M.pa_mpjpe(h_p, h_g).mean()) if fitting else None,
         )
 
-        e = M.pa_mpjpe(jp, jg).mean(1)
+        e = (M.pa_mpjpe(jp, jg) if fitting else M.pa_mpjpe(h_pd, h_g)).mean(1)
         res["per_sequence_PA_MPJPE_mm"] = {
             n: float(e[[i for i, s in enumerate(kept) if s["sequence"] == n]].mean())
             for n in sorted({s["sequence"] for s in kept})}
         report[ck_path] = res
-        print(f"\n  {Path(ck_path).parts[-3]:<10s} SMPL24: MPJPE {res['MPJPE_mm']:6.2f}  "
-              f"PA {res['PA_MPJPE_mm']:6.2f}  PVE {res['PVE_mm']:6.2f}  "
-              f"PA-PVE {res['PA_PVE_mm']:6.2f}  | J14/H36M via mesh: MPJPE "
-              f"{res['J14_h36m_viamesh_MPJPE_mm']:6.2f}  "
-              f"PA {res['J14_h36m_viamesh_PA_MPJPE_mm']:6.2f}"
-              f"   (fit residual {res['fit_residual_mm']:.2f} mm)\n", flush=True)
+        print(f"\n  {Path(ck_path).parts[-3]:<10s} fit-free: PVE "
+              f"{res['PVE_direct_mm']:6.2f}  PA-PVE {res['PA_PVE_direct_mm']:6.2f}"
+              f"  | J14/H36M: MPJPE {res['J14_h36m_direct_MPJPE_mm']:6.2f}  "
+              f"PA {res['J14_h36m_direct_PA_MPJPE_mm']:6.2f}", flush=True)
+        if fitting:
+            print(f"  {Path(ck_path).parts[-3]:<10s} fitted:   SMPL24 MPJPE "
+                  f"{res['MPJPE_mm']:6.2f}  PA {res['PA_MPJPE_mm']:6.2f}  PVE "
+                  f"{res['PVE_mm']:6.2f}  PA-PVE {res['PA_PVE_mm']:6.2f}  | "
+                  f"J14/H36M via mesh: MPJPE {res['J14_h36m_viamesh_MPJPE_mm']:6.2f}"
+                  f"  PA {res['J14_h36m_viamesh_PA_MPJPE_mm']:6.2f}"
+                  f"   (fit residual {res['fit_residual_mm']:.2f} mm)", flush=True)
+        print(flush=True)
         # Written after every checkpoint, not at the end: a full sweep is ~20
         # minutes per checkpoint and losing all of it to a crash in the last
         # one has already happened once.
