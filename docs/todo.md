@@ -443,11 +443,29 @@ It also gives the 70 landmarks a gradient into `shape_params` -- they move
 0.821 mm mean when identity is resampled, against exactly 0.000 mm for the
 fitted matrix, which is blind to identity by construction.
 
-**Scoring is deliberately unchanged.** `val3dpw.py` and
-`benchmark/eval_3dpw_ckpt.py` both call `get_native_keypoints`, i.e. the fitted
-readout, and neither was touched. So the flag changes what the model is trained
-to match, not what it is measured with, and the reported J14 PA-MPJPE stays
-comparable with generations 6-8 and keeps measuring the deployed path.
+**Scoring stays on the fitted readout by default, and 2026-09-22 measured what
+that costs.** `val3dpw.py`, `benchmark/eval_3dpw_ckpt.py` and
+`benchmark/eval_emdb_ckpt.py` all take a `landmarks` / `--landmarks` switch now;
+`fitted` is the default everywhere and reproduces every recorded number to the
+decimal. The switch is worth **0.13 mm** of 3DPW-test J14+adapter PA-MPJPE
+(g8h_s0 40.80 -> 40.66, g8h_s1 40.89 -> 40.77, g8r_s0 41.27 -> 41.13, stride 1)
+and 0.09-0.11 mm of EMDB-1 SMPL24+adapter PA-MPJPE, and it is worth the same
+0.13 mm on g7h_s0, which was trained WITHOUT `--exact-landmarks` (42.90 ->
+42.77). So it is a property of the operator, not of the training flag, and it is
+an offset rather than a re-ranking: every checkpoint moves the same way by the
+same amount, far inside the 34-49 mm seed spread.
+
+The mismatch it removes is real, though: the adapters
+(`adapter_j14_h36m_teacher.npz`, `adapter_smpl24_teacher.npz`) are fitted from
+the stored annotation `joints_3d`, which came out of the teacher's exact mapping
+-- so `fitted` feeds an adapter one operator's keypoints when it was fitted on
+another's. Nothing on the GT side needs changing: 3DPW's H36M joints and EMDB's
+SMPL joints are SMPL-derived and know nothing about the MHR readout.
+
+`fitted` stays the default for two reasons: it is what the exported graph's
+consumer computes, so the published number keeps describing the deployed path;
+and flipping it would shift every recorded row by 0.13 mm, which is exactly the
+kind of quiet offset that makes two generations uncomparable in one table.
 
 Original scoping, kept for context: preserve MHR's
 direct pose-parameter prediction and rig/mesh separation. First evaluate as a

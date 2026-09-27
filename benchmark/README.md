@@ -483,6 +483,22 @@ Nothing here is fitted by us: only the rig, Meta's published barycentric map,
 and the benchmark's own regressor. There is no optimiser and no free parameter,
 so the failure above cannot recur.
 
+**Implemented 2026-09-22 as `--fit-iters 0`.** It reports `PVE_direct_mm`,
+`PA_PVE_direct_mm` and `J14_h36m_direct_{MPJPE,PA_MPJPE}_mm`, rooted at the
+H36M pelvis regressed from each surface by the same operator. The old `PVE_mm`,
+`PA_PVE_mm`, `MPJPE_mm`, `PA_MPJPE_mm` and `J14_h36m_viamesh_*` keys keep their
+old meaning — the *fitted* mesh, and `null` when no fit ran — so every row
+recorded before that date stays comparable. The fit-free rows are computed on
+every run, fitted or not, and are identical either way; on g8h_s0 / EMDB-1
+stride 10 they came out the same to the decimal under `--fit-iters 0` and
+`--fit-iters 1500`, which is the check that the two paths share one surface.
+
+What the fit costs, same checkpoint and frames: PVE 86.29 fit-free against
+89.29 at 1500 iterations (9.30 mm residual), and J14/H36M PA-MPJPE 46.70
+against 45.66. The fit still buys the 24 SMPL **kinematic** joints, which the
+surface cannot give, so `--fit-iters >= 1500` remains the only route to the
+EMDB SMPL-24 row.
+
 **The one approximation, quantified.** EMDB's 24 kinematic joints are not a
 linear function of posed vertices. Regressing them from the surface carries, on
 EMDB GT bodies, **10.15 mm mid-hip / 7.02 mm Procrustes** of bias. Errors add in
