@@ -170,6 +170,14 @@ class DistillConfig:
     log_dir: str = str(PROJECT_ROOT / "runs/distill_mhr_only")  
 
     image_size: int = 224
+    # --preset v3: sample each crop from a context crop (build_split.py
+    # --context) over a wide range of framings. The box multiple is drawn
+    # log-uniformly in [v3_box_min, v3_box_max] x the tight box (1.2 = today's
+    # crop), the centre shifted by up to +/- v3_shift of the window side.
+    context_crops: bool = False
+    v3_box_min: float = 0.6
+    v3_box_max: float = 2.0
+    v3_shift: float = 0.15
     max_images: int | None = None   
     per_dataset_caps: dict = field(default_factory=lambda: {"sam3d_gt_harmony4d": 300_000})
     val_split: float = 0.1
@@ -556,6 +564,43 @@ class RandomPixelate:
             img = F_t.resize(img, [orig_h, orig_w], interpolation=InterpolationMode.NEAREST)
         return img
 
+def _apply_label_geometry(M_total, aug_flip, angle, joints_2d, joints_2d_vis,
+                          joints_3d, cam_trans, cx, cy, orig_w, orig_h, W, H):
+    """Move every label with an augmentation: joints_2d through M_total (crop
+    px -> augmented px), the left/right swap for a flip, the in-plane rotation
+    of joints_3d / cam_trans, and the CLIFF box centre with both. Shared by the
+    standard and the v3 path so the two can never disagree."""
+    px = (joints_2d[:, 0] + 1.0) * 0.5 * W
+    py = (joints_2d[:, 1] + 1.0) * 0.5 * H
+    px2 = M_total[0, 0] * px + M_total[0, 1] * py + M_total[0, 2]
+    py2 = M_total[1, 0] * px + M_total[1, 1] * py + M_total[1, 2]
+    joints_2d[:, 0] = (px2 / (0.5 * W) - 1.0).astype(np.float32)
+    joints_2d[:, 1] = (py2 / (0.5 * H) - 1.0).astype(np.float32)
+
+    if aug_flip > 0.5:
+        joints_3d[:, 0] = -joints_3d[:, 0]
+        joints_3d = joints_3d[FLIP_PERM]
+        # joints_2d was already mirrored geometrically by M_total, but a
+        # mirrored image LOOKS like the opposite-handed person, so the
+        # left/right labels must be swapped too - exactly as for joints_3d.
+        # Without this the 2D head gets contradictory left/right supervision
+        # and collapses symmetric joints toward the body midline.
+        joints_2d = joints_2d[FLIP_PERM]
+        joints_2d_vis = joints_2d_vis[FLIP_PERM]
+        cam_trans[0] = -cam_trans[0]
+        cx = orig_w - cx
+    rad = math.radians(angle)
+    cos_t, sin_t = math.cos(rad), math.sin(rad)
+    R_v = np.array([[cos_t, sin_t], [-sin_t, cos_t]], dtype=np.float32)
+    joints_3d[:, :2] = joints_3d[:, :2] @ R_v.T
+    cam_trans[:2] = R_v @ cam_trans[:2]
+
+    dxy = np.array([cx - orig_w / 2.0, cy - orig_h / 2.0], dtype=np.float64)
+    dxy = R_v.astype(np.float64) @ dxy
+    cx, cy = orig_w / 2.0 + dxy[0], orig_h / 2.0 + dxy[1]
+    return joints_2d, joints_2d_vis, joints_3d, cam_trans, cx, cy, cos_t, sin_t
+
+
 class SAM3DStudentDataset(Dataset):
     def __init__(self, data_root: str,
                  image_size: int = 224, max_images: int | None = None,
@@ -569,9 +614,13 @@ class SAM3DStudentDataset(Dataset):
                  crop_centre_fix: bool = False,
                  cliff_focal: bool = False,
                  occl_p: float = 0.2, occl_scale: tuple = (0.02, 0.15),
-                 jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90)):
+                 jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90),
+                 context_crops: bool = False, v3_box_min: float = 0.6,
+                 v3_box_max: float = 2.0, v3_shift: float = 0.15):
         super().__init__()
         self.image_size = image_size
+        self.context_crops = context_crops
+        self.v3_box_min, self.v3_box_max, self.v3_shift = v3_box_min, v3_box_max, v3_shift
         self.data_root = Path(data_root)
         self.augment = augment
         self.geom_p = geom_p
@@ -623,6 +672,7 @@ class SAM3DStudentDataset(Dataset):
             self.pairs = list(pairs) if isinstance(pairs, (list, tuple)) else pairs
             print(f"  Prebuilt index: {len(self.pairs)} (image, npz) pairs "
                   f"(augment={augment}).")
+            self._check_context_split()
             return
 
         self.pairs = []
@@ -666,6 +716,32 @@ class SAM3DStudentDataset(Dataset):
 
         print(f"  Found {len(dataset_dirs)} sub-folder(s) under {self.data_root}; "
               f"{len(self.pairs)} valid (image, npz) pairs (augment={augment}).")
+        self._check_context_split()
+
+    def _check_context_split(self):
+        """v3 samples from context crops. A standard 224 split would still
+        'work' -- with the 1.2x crop read as if it were the context, i.e. every
+        box silently 1.67x too large -- so refuse it up front."""
+        if not self.context_crops or len(self.pairs) == 0:
+            return
+        # One probe per sub-folder, so a --data_root mixing context and
+        # standard splits fails here and not hours in, inside a worker.
+        firsts = getattr(self.pairs, "first_per_subfolder", None)
+        if firsts is not None:
+            probes = firsts()
+        else:
+            seen = {}
+            for k, (_, npz) in enumerate(self.pairs):
+                seen.setdefault(Path(npz).parent, k)
+            probes = list(seen.values())
+        for k in probes:
+            npz = Path(self.pairs[k][1])
+            with np.load(npz) as z:
+                if "bbox_context" not in z.files:
+                    raise ValueError(
+                        f"{npz.parent.parent.name}: {npz.name} has no bbox_context. "
+                        f"--preset v3 needs a context-crop split, built with "
+                        f"build_split.py --context 2.0 --body-size 448 --output-dir ...")
 
     @staticmethod
     def _find_dataset_dirs(root: Path):
@@ -681,6 +757,88 @@ class SAM3DStudentDataset(Dataset):
                 if ann.is_dir() and img.is_dir():
                     dirs.append((ann, img))
         return dirs
+
+    def _context_window(self, img_pil, ann, W, H, b_size, cx, cy):
+        """v3: cut the network input out of a context crop in ONE resampling.
+
+        The window is drawn in full-frame px: side = m x the tight box, m
+        log-uniform in [v3_box_min, v3_box_max]; centre = box centre + a shift of
+        up to +/- v3_shift x side; plus v2's flip and rotation. It is clamped so
+        the ROTATED window stays inside the stored context square, shrinking
+        the side first if it cannot fit -- so no synthetic black margin ever
+        appears, only the real frame edge the builder padded.
+
+        The window is expressed as an ordinary aug_M relative to the standard
+        1.2x crop (bbox_square at W px), so labels, the reprojection loss and
+        everything downstream are unchanged. The image is warped from the
+        context crop with aug_M composed with the context -> standard-crop map.
+        Un-augmented samples use the identity window, i.e. today's crop.
+
+        Returns (image, M_total, aug_active, flip, angle, window centre (frame
+        px, before flip/rotation), window side / 1.2 in frame px).
+        """
+        sq = ann["bbox_square"].astype(np.float64)
+        ctx = ann["bbox_context"].astype(np.float64)
+        kx, ky = W / max(sq[2] - sq[0], 1.0), H / max(sq[3] - sq[1], 1.0)
+        M_total = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+        aug_active, aug_flip, angle, centre, bpx = 0.0, 0.0, 0.0, None, None
+
+        if self.augment and random.random() < self.geom_p:
+            aug_active = 1.0
+            aug_flip = 1.0 if random.random() < self.geom_flip_p else 0.0
+            angle = random.uniform(-self.geom_rot_deg, self.geom_rot_deg)
+            m = math.exp(random.uniform(math.log(self.v3_box_min), math.log(self.v3_box_max)))
+            side = m * b_size
+            wx = cx + random.uniform(-self.v3_shift, self.v3_shift) * side
+            wy = cy + random.uniform(-self.v3_shift, self.v3_shift) * side
+            # Keep the rotated window inside the stored square -- but only on
+            # sides where that square ends INSIDE the photo. Where it already
+            # runs past the photo's edge, anything further out is outside the
+            # photo too, so the black it reads IS the real frame edge (what a
+            # deployment crop shows when its box leaves the frame); clamping
+            # there would only thin out the loose, off-centre framings v3 is for.
+            rad = math.radians(angle)
+            reach = abs(math.cos(rad)) + abs(math.sin(rad))   # rotated square's extent / side
+            oh, ow = (float(v) for v in ann["orig_shape"][:2])
+            lo_x = ctx[0] if ctx[0] >= 0 else -math.inf
+            hi_x = ctx[2] if ctx[2] <= ow else math.inf
+            lo_y = ctx[1] if ctx[1] >= 0 else -math.inf
+            hi_y = ctx[3] if ctx[3] <= oh else math.inf
+            side = min(side, min(hi_x - lo_x, hi_y - lo_y) / reach)
+            e = side * reach / 2.0
+            wx = min(max(wx, lo_x + e), hi_x - e)
+            wy = min(max(wy, lo_y + e), hi_y - e)
+            centre, bpx = (wx, wy), side / 1.2
+
+            # standard-crop px: flip, then zoom and rotate about the window
+            # centre and move it to the output centre -- v2's M_total form. The
+            # zoom is per axis: bbox_square's int() edges can make it 198x200
+            # px, and only per-axis zoom keeps the window SQUARE in the frame,
+            # which the clamp above and the 3D label rotation both assume.
+            c = np.array([(wx - sq[0]) * kx, (wy - sq[1]) * ky])
+            M_flip = (np.array([[-1.0, 0.0, float(W)], [0.0, 1.0, 0.0]]) if aug_flip
+                      else np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+            fc = M_flip[:, :2] @ c + M_flip[:, 2]
+            rot = cv2.getRotationMatrix2D((0.0, 0.0), angle, 1.0)[:, :2]
+            lin = rot @ np.diag([(sq[2] - sq[0]) / side, (sq[3] - sq[1]) / side])
+            M_rst = np.hstack([lin, (np.array([W / 2.0, H / 2.0]) - lin @ fc)[:, None]])
+            A2, t2 = M_rst[:, :2], M_rst[:, 2]
+            A1, t1 = M_flip[:, :2], M_flip[:, 2]
+            M_total = np.hstack([A2 @ A1, (A2 @ t1 + t2)[:, None]])
+
+        # context-crop pixel index -> standard-crop pixel index (pixel centres,
+        # as cv2.resize maps them on both sides; verified against today's crops
+        # in tools/verify_context_crops.py)
+        ctx_np = np.asarray(img_pil)
+        sc_y, sc_x = ctx_np.shape[:2]
+        ax, ay = (ctx[2] - ctx[0]) / sc_x, (ctx[3] - ctx[1]) / sc_y
+        C = np.array([[ax * kx, 0.0, (0.5 * ax + ctx[0] - sq[0]) * kx - 0.5],
+                      [0.0, ay * ky, (0.5 * ay + ctx[1] - sq[1]) * ky - 0.5]])
+        A, t = M_total[:, :2], M_total[:, 2]
+        M_img = np.hstack([A @ C[:, :2], (A @ C[:, 2] + t)[:, None]])
+        img_np = cv2.warpAffine(ctx_np, M_img, (W, H), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        return Image.fromarray(img_np), M_total, aug_active, aug_flip, angle, centre, bpx
 
     def __len__(self):
         return len(self.pairs)
@@ -732,7 +890,21 @@ class SAM3DStudentDataset(Dataset):
         aug_flip, cos_t, sin_t = 0.0, 1.0, 0.0
         M_total = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
         aug_active = 0.0
-        if self.augment and random.random() < self.geom_p:
+        if self.context_crops:
+            (img_pil, M_total, aug_active, aug_flip, angle,
+             v3_centre, v3_bpx) = self._context_window(img_pil, ann, W, H, b_size, cx, cy)
+            if aug_active:
+                # CLIFF describes the window actually cut: its centre, and the
+                # tight box that would give it at the standard 1.2x expansion.
+                # Both are exact (no crop-space approximation), then flipped and
+                # rotated with the labels below.
+                cx, cy = v3_centre
+                b_scale = v3_bpx / max(orig_w, orig_h)
+                (joints_2d, joints_2d_vis, joints_3d, cam_trans, cx, cy,
+                 cos_t, sin_t) = _apply_label_geometry(
+                    M_total, aug_flip, angle, joints_2d, joints_2d_vis, joints_3d,
+                    cam_trans, cx, cy, orig_w, orig_h, W, H)
+        elif self.augment and random.random() < self.geom_p:
             aug_active = 1.0
             img_np = np.asarray(img_pil.resize((W, H)))
 
@@ -767,34 +939,10 @@ class SAM3DStudentDataset(Dataset):
                                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
             img_pil = Image.fromarray(img_np)
 
-            px = (joints_2d[:, 0] + 1.0) * 0.5 * W
-            py = (joints_2d[:, 1] + 1.0) * 0.5 * H
-            px2 = M_total[0, 0] * px + M_total[0, 1] * py + M_total[0, 2]
-            py2 = M_total[1, 0] * px + M_total[1, 1] * py + M_total[1, 2]
-            joints_2d[:, 0] = (px2 / (0.5 * W) - 1.0).astype(np.float32)
-            joints_2d[:, 1] = (py2 / (0.5 * H) - 1.0).astype(np.float32)
-
-            if aug_flip > 0.5:
-                joints_3d[:, 0] = -joints_3d[:, 0]
-                joints_3d = joints_3d[FLIP_PERM]
-                # joints_2d was already mirrored geometrically by M_total, but a
-                # mirrored image LOOKS like the opposite-handed person, so the
-                # left/right labels must be swapped too - exactly as for joints_3d.
-                # Without this the 2D head gets contradictory left/right supervision
-                # and collapses symmetric joints toward the body midline.
-                joints_2d = joints_2d[FLIP_PERM]
-                joints_2d_vis = joints_2d_vis[FLIP_PERM]
-                cam_trans[0] = -cam_trans[0]
-                cx = orig_w - cx                  
-            rad = math.radians(angle)
-            cos_t, sin_t = math.cos(rad), math.sin(rad)
-            R_v = np.array([[cos_t, sin_t], [-sin_t, cos_t]], dtype=np.float32)
-            joints_3d[:, :2] = joints_3d[:, :2] @ R_v.T
-            cam_trans[:2] = R_v @ cam_trans[:2]
-            
-            dxy = np.array([cx - orig_w / 2.0, cy - orig_h / 2.0], dtype=np.float64)
-            dxy = R_v.astype(np.float64) @ dxy
-            cx, cy = orig_w / 2.0 + dxy[0], orig_h / 2.0 + dxy[1]
+            (joints_2d, joints_2d_vis, joints_3d, cam_trans, cx, cy,
+             cos_t, sin_t) = _apply_label_geometry(
+                M_total, aug_flip, angle, joints_2d, joints_2d_vis, joints_3d,
+                cam_trans, cx, cy, orig_w, orig_h, W, H)
 
             # CLIFF conditioning describes the box this crop came from. The flip
             # and rotation above already move it; dx/dy/scale did not, which was
@@ -885,7 +1033,9 @@ def build_dataloaders(cfg):
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
-                image_size=cfg.image_size)
+                image_size=cfg.image_size,
+                context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
+                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift)
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,

@@ -1,0 +1,218 @@
+[
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S22 5G",
+  "job": "jg9zoorwp",
+  "ms": 3.7,
+  "peak_mb": 150.2,
+  "layers": {
+   "NPU": 827
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S23",
+  "job": "jp1noo98g",
+  "ms": 2.05,
+  "peak_mb": 90.1,
+  "layers": {
+   "NPU": 827
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S24",
+  "job": "jgdd66krg",
+  "ms": 1.31,
+  "peak_mb": 169.7,
+  "layers": {
+   "NPU": 827
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S25",
+  "job": "j57eoomvp",
+  "ms": 1.0,
+  "peak_mb": 167.3,
+  "layers": {
+   "NPU": 827
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy S23",
+  "job": "jp4yee78p",
+  "ms": 29.25,
+  "peak_mb": 139.7,
+  "layers": {
+   "CPU": 722
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A73 5G",
+  "job": "jpxl00q3p",
+  "ms": 38.2,
+  "peak_mb": 125.0,
+  "layers": {
+   "CPU": 722
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A53 5G",
+  "job": "j5m0997dg",
+  "ms": 93.51,
+  "peak_mb": 125.8,
+  "layers": {
+   "CPU": 722
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A14 5G",
+  "job": "jgnz114kg",
+  "ms": 78.97,
+  "peak_mb": 182.6,
+  "layers": {
+   "CPU": 722
+  }
+ },
+ {
+  "model": "random_b0_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Google Pixel 8",
+  "job": "jprlxxr0p",
+  "ms": 32.06,
+  "peak_mb": 142.9,
+  "layers": {
+   "CPU": 722
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S22 5G",
+  "job": "jp2roo1rg",
+  "ms": 5.5,
+  "peak_mb": 174.3,
+  "layers": {
+   "NPU": 890
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S23",
+  "job": "jpyo88l85",
+  "ms": 3.27,
+  "peak_mb": 159.2,
+  "layers": {
+   "NPU": 890
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S24",
+  "job": "jp0moow9g",
+  "ms": 2.31,
+  "peak_mb": 232.4,
+  "layers": {
+   "NPU": 890
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "npu",
+  "device": "Samsung Galaxy S25",
+  "job": "jp8ejjnkp",
+  "ms": 1.88,
+  "peak_mb": 141.0,
+  "layers": {
+   "NPU": 890
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy S23",
+  "job": "jgk2661wg",
+  "ms": 93.32,
+  "peak_mb": 173.5,
+  "layers": {
+   "CPU": 762
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A73 5G",
+  "job": "j5ql44nnp",
+  "ms": 119.02,
+  "peak_mb": 160.3,
+  "layers": {
+   "CPU": 762
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A53 5G",
+  "job": "jglywwdj5",
+  "ms": 288.74,
+  "peak_mb": 146.3,
+  "layers": {
+   "CPU": 762
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Samsung Galaxy A14 5G",
+  "job": "j568oox6g",
+  "ms": 294.21,
+  "peak_mb": 147.4,
+  "layers": {
+   "CPU": 762
+  }
+ },
+ {
+  "model": "random_b4_288",
+  "image_size": 288,
+  "unit": "cpu",
+  "device": "Google Pixel 8",
+  "job": "jp3zood35",
+  "ms": 115.04,
+  "peak_mb": 198.5,
+  "layers": {
+   "CPU": 762
+  }
+ }
+]

@@ -52,6 +52,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backbone", default=None, help="timm name; default is the config's")
+    p.add_argument("--context-crops", dest="context_crops", action="store_true",
+                   help="--preset v3's dataset; --data_root must be a context-crop "
+                        "split (build_split.py --context 2.0 --body-size 448)")
     p.add_argument("--image-size", dest="image_size", type=int, default=None,
                    help="network input side; the positional grid and every crop follow it")
     p.add_argument("--data_root", default="data")
@@ -109,7 +112,8 @@ def main() -> int:
     ds = T.SAM3DStudentDataset(cfg.data_root, augment=True, max_images=args.batch_size,
                                per_dataset_caps={}, cliff_focal=cfg.cliff_focal,
                                crop_centre_fix=cfg.crop_centre_fix,
-                               image_size=cfg.image_size)
+                               image_size=cfg.image_size,
+                               context_crops=args.context_crops)
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     batch = {k: (v.to(T.device) if torch.is_tensor(v) else v)
              for k, v in next(iter(loader)).items()}

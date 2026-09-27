@@ -609,6 +609,44 @@ and must be rsynced**, or the job dies at startup. Default off; with it off
 every loss term is bit-identical, verified across `legacy`, `rebalanced`,
 `w_verts` on/off and `cont_head` on/off.
 
+## `--preset v3` — framing robustness from context crops (added 2026-09-25)
+
+v2, plus: every crop is cut from a **context crop** (`build_split.py --context
+2.0 --body-size 448`, its own `--data_root`) through a window drawn in frame
+pixels -- side log-uniform in 0.6-2.0x the tight box (1.2 = today's crop, 0.6 =
+v2's deepest truncation), centre shifted up to +/-15% of the side, v2's
+rotation and flip. It is one resampling step from the stored 448 px crop, so
+zoom-in no longer upsamples a 224 crop. 20% of samples (`geom_p` 0.8, as v2)
+keep the identity window, i.e. today's crop, which also keeps root-rotation
+supervision on the un-augmented subset. Validation uses the identity window.
+
+**Why.** g8h loses 12-15 mm on EMDB under EMDB's own boxes, and 16 mm once our
+own boxes are enlarged to 1.6x -- the loosest framing a 1.2x-cropped corpus can
+show, and then only with black margins. v2 cannot help: it only zooms in.
+
+**The window is an ordinary `aug_M`** relative to `bbox_square`, so labels, the
+reprojection loss and the model are untouched; the CLIFF vector is computed
+from the exact window (centre, side / 1.2) and then flipped and rotated with
+the labels. `apply_v3_preset` forces `cliff_focal`.
+
+**The clamp.** The rotated window is kept inside the stored square only on
+sides where that square ends inside the photo. Where it already runs past the
+photo's edge, further out is outside the photo too, so the black read there is
+the real frame edge -- what a deployment crop shows when its box leaves the
+frame. Clamping every side instead thinned windows looser than 1.6x from 18.5%
+to 10.5% and centred them; this rule keeps 17.0%, with their shift intact.
+
+**Expect black.** In AIC / COCO the person usually nearly fills the photo: 95%
+of 2.0x squares run past the frame, and windows looser than 1.5x are on average
+38% black (frame edge). That is representative of deployment, but it caps how
+much loose-and-real-scene framing this corpus can teach.
+
+Verified by `tools/verify_v3_preset.py` on real AIC rows built both ways:
+baseline / v2 bit-identical; identity window = today's labels and CLIFF
+exactly; reprojection chain vs labels 2e-4 px; CLIFF vs the recovered window
+0.000 px; no read past an inside-photo stored edge; standard or mixed roots
+refused (also through `PairIndex`).
+
 ## `--image-size` — the network input side (added 2026-09-25)
 
 Default 224, i.e. unchanged. Must be a multiple of 32, because the decoder's

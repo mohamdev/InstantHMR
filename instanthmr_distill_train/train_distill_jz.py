@@ -171,6 +171,11 @@ class PairIndex:
     def __len__(self):
         return len(self._stem)
 
+    def first_per_subfolder(self):
+        """Index of the first pair in each sub-folder (one np.unique over the
+        byte array; no Path objects)."""
+        return [int(k) for k in np.unique(self._sub, return_index=True)[1]]
+
     def __getitem__(self, i):
         if isinstance(i, slice):
             # Stay compact through --max_images too, or the one configuration
@@ -390,7 +395,9 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 cliff_focal=cfg.cliff_focal,
                 occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
-                image_size=cfg.image_size)
+                image_size=cfg.image_size,
+                context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
+                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift)
 
     # Rank 0 builds the index (or reads the cache) while the others wait, then
     # everyone loads the same cache. Building on all ranks at once would put
@@ -701,7 +708,8 @@ def train(args, cfg, rank, local_rank, world):
             "lr": cfg.lr, "lr_arg": args.lr, "lr_scaling": args.lr_scaling,
             "mix": args.mix, "steps_per_epoch": steps_per_epoch,
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
-            "image_size": cfg.image_size,
+            "image_size": cfg.image_size, "context_crops": cfg.context_crops,
+            "v3_box": [cfg.v3_box_min, cfg.v3_box_max], "v3_shift": cfg.v3_shift,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
@@ -1154,10 +1162,13 @@ def parse_args():
                    help="Skip the timm download. Compute nodes have no internet, "
                         "so run --warm-cache once on a login node instead.")
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--preset", choices=["baseline", "v2"], default="baseline",
+    p.add_argument("--preset", choices=["baseline", "v2", "v3"], default="baseline",
                    help="'v2' enables the wave-1 bundle: truncation, occlusion "
                         "and JPEG augmentation with the SimCC-mask and CLIFF "
                         "prerequisites, plus absolute-pose supervision. "
+                        "'v3' is v2 with every crop sampled from a context-crop "
+                        "split over a wide range of framings (needs --data_root "
+                        "of build_split.py --context splits). "
                         "'baseline' reproduces the pre-v2 trainer exactly.")
     p.add_argument("--w_reproj", type=float, default=None)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
@@ -1257,8 +1268,10 @@ def build_cfg(args):
             raise SystemExit(f"--image-size {args.image_size} is not a multiple of 32")
         cfg.image_size = args.image_size
 
-    if args.preset == "v2":
+    if args.preset in ("v2", "v3"):
         apply_v2_preset(cfg)
+    if args.preset == "v3":
+        apply_v3_preset(cfg)
     # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
     # --losses is the loss budget. Applied second so it owns w_keypoints3d.
     if args.losses == "rebalanced":
@@ -1298,6 +1311,26 @@ def apply_v2_preset(cfg) -> None:
     cfg.w_reproj = 0.5                # was 0.01, i.e. effectively off
     cfg.reproj_all_samples = True     # the flipped half now contributes
     cfg.cam_loss = "euclid"
+
+
+def apply_v3_preset(cfg) -> None:
+    """v2 plus framing robustness: every crop is sampled from a context crop
+    (build_split.py --context 2.0 --body-size 448) over a wide range of
+    framings -- loose and off-centre like EMDB's and a phone detector's boxes,
+    tight and truncated like a person close to the camera -- always surrounded
+    by real scene. Applied on top of apply_v2_preset: v2's occlusion, JPEG,
+    rotation, flip and absolute-pose terms are kept; its zoom/shift (which can
+    only zoom INTO a 1.2x crop) are replaced by the context window.
+
+    Measured motivation (2026-09-25): g8h loses 12-15 mm on EMDB under EMDB's
+    own boxes, and 16 mm when our boxes are enlarged to 1.6x -- the loosest
+    framing the 1.2x corpus can show, and only with black margins."""
+    cfg.context_crops = True
+    cfg.v3_box_min, cfg.v3_box_max = 0.6, 2.0
+    cfg.v3_shift = 0.15
+    # The window's CLIFF vector is built in the perspective-correct form; the
+    # pixel form is ambiguous on this corpus's real focals. Mandatory, not a flag.
+    cfg.cliff_focal = True
 
 
 def main():
