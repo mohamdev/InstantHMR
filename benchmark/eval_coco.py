@@ -58,6 +58,9 @@ def parse_args():
     p.add_argument("--mhr-script", default=None)
     p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--hmr2-subset",
+                   default="benchmark/data/hmr2_evaluation_data/coco_val.npz",
+                   help="4D-Humans' coco_val.npz; enables the HMR2.0 / SAM 3D Body PCK")
     p.add_argument("--out", default="benchmark/results/coco.json")
     return p.parse_args()
 
@@ -144,6 +147,30 @@ def main():
         "PCK@0.2_bboxdiag": M.pck2d(pred_kp, gt_xy, valid, diag, 0.2),
         "NME_bboxdiag": M.nme2d(pred_kp, gt_xy, valid, diag),
     }
+    # --- the published protocol: HMR2.0 Table 2, SAM 3D Body Table 2 -----
+    # 4D-Humans' EvaluatorPCK, reproduced: only the 4,648 persons listed in
+    # their coco_val.npz (no simple rule selects them -- >=6 keypoints alone
+    # gives 5,430), distance / max(w, h) of the tight GT box, PCK per keypoint
+    # then averaged over the 17 (mmpose's avg_acc, not a pooled mean).
+    hmr2 = Path(args.hmr2_subset)
+    if hmr2.is_file():
+        z = np.load(hmr2)
+        listed = {}
+        for n, c in zip(z["imgname"], z["center"]):
+            listed.setdefault(Path(str(n)).name, []).append(c)
+        sub = np.array([
+            any(np.abs(np.array([s.bbox[0] + s.bbox[2], s.bbox[1] + s.bbox[3]]) / 2 - c).max() < 0.02
+                for c in listed.get(Path(s.image_path).name, []))
+            for s in kept])
+        side = np.array([max(s.meta["bbox_wh"]) for s in kept])[sub]
+        d = np.linalg.norm(pred_kp[sub] - gt_xy[sub], axis=-1) / side[:, None]
+        v = valid[sub]
+        summary["hmr2_protocol"] = {"num_samples": int(sub.sum()),
+                                    "num_listed": int(len(z["imgname"]))}
+        for t in (0.05, 0.1):
+            summary["hmr2_protocol"][f"PCK@{t}"] = float(np.mean(
+                [(d[v[:, j], j] < t).mean() for j in range(17) if v[:, j].any()]))
+
     per_kp = {}
     for i, name in enumerate(J.COCO17_NAMES):
         v = valid[:, i]
@@ -190,6 +217,10 @@ def main():
           f"PCK@0.1 {summary['PCK@0.1_bboxdiag']*100:6.2f} %   "
           f"PCK@0.2 {summary['PCK@0.2_bboxdiag']*100:6.2f} %")
     print(f"  NME         {summary['NME_bboxdiag']:6.4f}  (bbox-diagonal units)")
+    if "hmr2_protocol" in summary:
+        h = summary["hmr2_protocol"]
+        print(f"  HMR2.0 / SAM 3D Body protocol ({h['num_samples']}/{h['num_listed']} persons):"
+              f"  PCK@0.05 {h['PCK@0.05']*100:6.2f} %   PCK@0.1 {h['PCK@0.1']*100:6.2f} %")
     print("=" * 68)
     print(f"written to {out}")
 

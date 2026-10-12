@@ -367,6 +367,17 @@ def main():
         # the entire (N, 6890, 3) array to a 5.9 GB float64 intermediate.
         Jreg = np.load(args.h36m_regressor).astype(np.float32)     # (17, 6890)
         sel = J.J14_FROM_H36M17
+        # The root the published PVE uses (WHAM's evaluate_3dpw / _emdb, which
+        # SAM 3D Body's table follows). 3DPW: mid-hip of the H36M-regressed J14
+        # -- the root below, unchanged. EMDB: mid-hip of SMPL joints 1/2. The
+        # prediction's surface has no kinematic chain, so SMPL's own
+        # J_regressor rows 1/2 stand in on BOTH sides (4.9 mm from the
+        # kinematic hips on GT; scoring GT at its kinematic hips instead moves
+        # PVE by 0.05 mm). The H36M root reads ~4.4 mm low on EMDB.
+        hipreg = ({g: SMPLModel(args.smpl_dir, g, device).m["J_regressor"][1:3]
+                   .float().cpu().numpy() for g in set(genders)}
+                  if args.dataset == "emdb" else None)
+        pve_pub_sum = 0.0
         CH = 256
         pve_sum = pve_n = pa_pve_sum = 0.0
         pve_d_sum = pa_pve_d_sum = 0.0
@@ -381,8 +392,13 @@ def main():
             a_d = Vd[i:i + CH].numpy() * MM
             h_pd = np.einsum("jv,nvc->njc", Jreg, a_d)[:, sel]
             h_gd = np.einsum("jv,nvc->njc", Jreg, b)[:, sel]
-            pve_d_sum += float(M.mpjpe(a_d, b,
-                                       root=(J.pelvis(h_pd), J.pelvis(h_gd))).sum())
+            e_d = M.mpjpe(a_d, b, root=(J.pelvis(h_pd), J.pelvis(h_gd)))
+            pve_d_sum += float(e_d.sum())
+            if hipreg is not None:
+                R = np.stack([hipreg[g] for g in genders[i:i + n]])
+                mid = lambda v: np.einsum("njv,nvc->njc", R, v).mean(1)
+                e_d = M.mpjpe(a_d, b, root=(mid(a_d), mid(b)))
+            pve_pub_sum += float(e_d.sum())
             pa_pve_d_sum += float(M.pa_mpjpe(a_d, b).sum())
             pve_n += a_d.shape[0] * a_d.shape[1]
             hpd_parts.append(h_pd)
@@ -410,6 +426,9 @@ def main():
             # *_mm keys below keep their old meaning -- the FITTED mesh -- so
             # rows recorded before 2026-09-22 stay comparable.
             PVE_direct_mm=pve_d_sum / pve_n,
+            # The PVE to put beside a published table: fit-free surface, the
+            # benchmark's own root (see `hipreg`). Equal to PVE_direct on 3DPW.
+            PVE_published_mm=pve_pub_sum / pve_n,
             PA_PVE_direct_mm=pa_pve_d_sum / pve_n,
             J14_h36m_direct_MPJPE_mm=float(
                 M.mpjpe(h_pd, h_g, root=(hpd_r, hg_r)).mean()),
@@ -442,7 +461,8 @@ def main():
             for n in sorted({s["sequence"] for s in kept})}
         report[ck_path] = res
         print(f"\n  {Path(ck_path).parts[-3]:<10s} fit-free: PVE "
-              f"{res['PVE_direct_mm']:6.2f}  PA-PVE {res['PA_PVE_direct_mm']:6.2f}"
+              f"{res['PVE_direct_mm']:6.2f}  PVE(published root) "
+              f"{res['PVE_published_mm']:6.2f}  PA-PVE {res['PA_PVE_direct_mm']:6.2f}"
               f"  | J14/H36M: MPJPE {res['J14_h36m_direct_MPJPE_mm']:6.2f}  "
               f"PA {res['J14_h36m_direct_PA_MPJPE_mm']:6.2f}", flush=True)
         if fitting:
