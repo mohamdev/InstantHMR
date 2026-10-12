@@ -344,6 +344,13 @@ def main() -> None:
                     continue
                 relpath = resolved
             if image not in img_cache:
+                # Bounded: a parquet shard's rows for one photo are adjacent, so
+                # a few entries keep every photo decoded once. Unbounded, the
+                # cache held every decoded frame of the shard -- ~10 MB each on
+                # SA-1B -- and 10 builder processes per job ran out of memory
+                # after ~40 min (Jean Zay 2026-10-04, OUT_OF_MEMORY).
+                if len(img_cache) >= 8:
+                    img_cache.clear()
                 bgr = cv2.imread(str(args.image_dir / relpath))
                 img_cache[image] = (cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                                     if bgr is not None else None)

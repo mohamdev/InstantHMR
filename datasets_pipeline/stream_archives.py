@@ -59,6 +59,13 @@ def undistort_harmony4d(raw: Path, undist: Path, scene_rel: str,
     the script appends `exo/` to whatever it is given. See undistort.md.
     """
     scene_dir = raw / scene_rel
+    # The zips unpack as <scene>/, without the train/ or test/ prefix that the
+    # annotations' image paths and --seqs carry (verified 2026-10-04 on
+    # train/01_hugging.zip), so move the scene under its split folder.
+    flat = raw / Path(scene_rel).name
+    if not scene_dir.exists() and flat.is_dir():
+        scene_dir.parent.mkdir(parents=True, exist_ok=True)
+        flat.rename(scene_dir)
     takes = sorted(d.name for d in scene_dir.iterdir() if d.is_dir())
     if not takes:
         raise SystemExit(f"no takes under {scene_dir}")

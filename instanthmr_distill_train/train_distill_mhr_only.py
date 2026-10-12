@@ -843,7 +843,30 @@ class SAM3DStudentDataset(Dataset):
     def __len__(self):
         return len(self.pairs)
 
+    MAX_BAD_SAMPLES = 1000
+
     def __getitem__(self, idx):
+        """Load sample `idx`; if its files are unreadable, log the path and
+        substitute a random other sample instead of killing the run.
+
+        One unreadable file out of millions (an npz left empty by a builder
+        killed mid-write) stopped all four generation-9 runs twice, each time
+        at the same step because the seed fixes the sample order. On healthy
+        data the except branch never runs, so samples are bit-identical to
+        before. More than MAX_BAD_SAMPLES failures in one worker still raise:
+        that is a broken corpus, not a stray file."""
+        try:
+            return self._load_sample(idx)
+        except Exception as e:  # noqa: BLE001
+            self._n_bad = getattr(self, "_n_bad", 0) + 1
+            bad = self.pairs[idx]
+            print(f"[dataset] unreadable sample skipped ({self._n_bad} in this worker): "
+                  f"{bad[1]} / {bad[0]}: {type(e).__name__}: {e}", flush=True)
+            if self._n_bad > self.MAX_BAD_SAMPLES:
+                raise
+            return self[random.randrange(len(self))]
+
+    def _load_sample(self, idx):
         img_path, npz_path = self.pairs[idx]
         W = H = self.image_size
 

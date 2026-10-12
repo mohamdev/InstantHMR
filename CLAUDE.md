@@ -382,6 +382,15 @@ early generations and no longer applies. A seed sweep buys ~0.2 mm, so it is
 not a way to gain accuracy; keep 2 seeds per arm only to tell a >0.5 mm change
 from noise.
 
+**Two corpora, two data roots, never mixed.** `$SCRATCH/instanthmr/data` holds
+the 224 px crops (baseline / v2 presets); `$SCRATCH/instanthmr/data_ctx` holds the
+context crops (2.0x box, 448 px, `build_split.py --context`) that only
+`--preset v3` can read. Each root has its own pair index. The builder refuses a
+context build without `--output-dir`, and the v3 dataset refuses any root that
+contains a standard split. Generation 9 is the first to train on `data_ctx`; see
+STATUS.md. When `prepost` has no free node, `datasets_pipeline/jeanzay/21_build_gpu.slurm`
+builds on the 2 h GPU dev queue instead.
+
 **You cannot reach Jean Zay.** No SSH, no Slurm. Print commands for the user and
 read the logs they paste back. Files reach the cluster by `rsync` of *specific
 files* — never the whole tree, since some files are edited on both sides.
